@@ -18,7 +18,7 @@ import tkinter as tk
 import tempfile
 import urllib.request
 import zipfile
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw
@@ -32,7 +32,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -613,6 +613,13 @@ def audio_files(paths):
     exts = tuple("." + v[0] for v in AUDIO_FORMATS.values())
     result = []
     for p in paths:
+        if not os.path.exists(p):
+            # Windows обрезает пробелы и точки по краям имени — ищем файл с «чистым» именем
+            folder, name = os.path.split(p)
+            stem, ext = os.path.splitext(name)
+            alt = os.path.join(folder, stem.strip(" .") + ext)
+            if os.path.exists(alt):
+                p = alt
         if os.path.isdir(p):
             result += [os.path.join(p, f) for f in sorted(os.listdir(p))
                        if f.lower().endswith(exts)]
@@ -682,6 +689,72 @@ def postprocess_audio(paths, opts, status=None):
                 notes.append(f"громкость не выровнена ({os.path.basename(f)}): {e}")
         notes.append(f"громкость выровнена: {len(files)}")
     return notes
+
+
+def send_to_trash(path):
+    """Отправляет файл или папку в Корзину Windows (можно восстановить)."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                        ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p),
+                        ("lpszProgressTitle", wintypes.LPCWSTR)]
+        FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = \
+            3, 0x4, 0x10, 0x40, 0x400
+        op = SHFILEOPSTRUCTW(wFunc=FO_DELETE, pFrom=os.path.abspath(path) + "\0",
+                             fFlags=FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT |
+                             FOF_NOERRORUI)
+        if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) != 0 or \
+                op.fAnyOperationsAborted:
+            raise OSError(f"не удалось удалить {path}")
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def companion_files(path):
+    """Файлы, которые относятся к треку: текст песни .lrc рядом."""
+    if not path or os.path.isdir(path):
+        return []
+    lrc = os.path.splitext(path)[0] + ".lrc"
+    return [lrc] if os.path.isfile(lrc) else []
+
+
+def delete_download(app, path, title):
+    """Спрашивает и удаляет файл (или папку с главами) в Корзину. True — удалён."""
+    if not path or not os.path.exists(path):
+        app.set_main_status("Файл уже удалён или перемещён", ACCENT)
+        return False
+    what = "папку с главами" if os.path.isdir(path) else "файл"
+    if not messagebox.askyesno(
+            "Удалить файл",
+            f"Удалить {what} в Корзину?\n\n{title}\n{path}", parent=app):
+        return False
+    try:
+        for p in [path] + companion_files(path):
+            send_to_trash(p)
+    except OSError as e:
+        app.set_main_status(f"Не удалось удалить: {e}", ACCENT)
+        return False
+    app.set_main_status(f"🗑 Удалено в Корзину: {os.path.basename(path)}")
+    return True
+
+
+def bind_right_click(widget, handler):
+    """ПКМ по карточке и по всему, что внутри неё."""
+    stack = [widget]
+    while stack:
+        w = stack.pop()
+        try:
+            tk.Misc.bind(w, "<Button-3>", handler, add="+")
+        except tk.TclError:
+            pass
+        stack.extend(w.winfo_children())
 
 
 def finalize_chapters(files):
@@ -779,6 +852,7 @@ class QueueItem(ctk.CTkFrame):
         self.pbtn.grid(row=0, column=2, rowspan=4, padx=(8, 0))
         self.btn = ctk.CTkButton(self, text="✕", command=self.on_button, **small)
         self.btn.grid(row=0, column=3, rowspan=4, padx=(0, 8))
+        self.after(100, lambda: bind_right_click(self, self.show_menu))
         self.pause_requested = False     # пауза нажата во время скачивания
         self.user_paused = False         # поставлена на паузу вручную (кнопкой ⏸)
 
@@ -826,10 +900,59 @@ class QueueItem(ctk.CTkFrame):
                 self.pbtn.grid()
 
     def on_button(self):
-        if self.st == "done" and self.file_path:
+        if self.st == "done" and self.file_path and os.path.exists(self.file_path):
             self.app.show_in_folder(self.file_path)
         elif self.st != "run":
             self.app.remove_item(self)
+
+    def show_menu(self, event):
+        exists = bool(self.file_path) and os.path.exists(self.file_path)
+        done = self.st == "done"
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="▶  Открыть", state="normal" if done and exists else "disabled",
+                      command=lambda: os.startfile(self.file_path))
+        m.add_command(label="📂  Показать в папке",
+                      state="normal" if done and exists else "disabled",
+                      command=lambda: self.app.show_in_folder(self.file_path))
+        m.add_separator()
+        if self.st == "run":
+            m.add_command(label="⏸  Пауза", command=lambda: self.app.toggle_pause(self))
+        elif self.st in ("paused", "error"):
+            m.add_command(label="▶  Продолжить", command=lambda: self.app.toggle_pause(self))
+        elif self.st == "wait":
+            m.add_command(label="⏸  Поставить на паузу",
+                          command=lambda: self.app.toggle_pause(self))
+        if done:
+            m.add_command(label="⟳  Скачать снова", command=self.redownload)
+        m.add_command(label="🔗  Копировать ссылку", command=self.copy_url)
+        m.add_separator()
+        m.add_command(label="Убрать из списка", state="disabled" if self.st == "run" else "normal",
+                      command=lambda: self.app.remove_item(self))
+        m.add_command(label="🗑  Удалить файл…", state="normal" if done and exists else "disabled",
+                      command=self.delete_file)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def copy_url(self):
+        self.app.clipboard_clear()
+        self.app.clipboard_append(self.url)
+        self.app._last_clip = self.url        # чтобы перехват буфера не добавил её снова
+        self.app.set_main_status("Ссылка скопирована")
+
+    def redownload(self):
+        opts = dict(self.opts)
+        opts["cookies"] = self.app.cookie_args()
+        self.app.add_item(self.url, opts)
+
+    def delete_file(self):
+        if delete_download(self.app, self.file_path, self.full_title or self.url):
+            self.file_path = None
+            self.set_status("🗑 Файл удалён в Корзину", GRAY_TEXT)
+            self.btn.configure(text="✕")
+            self.app.refresh_history_window()
 
 
 # ================================================================ окно истории
@@ -914,6 +1037,36 @@ class HistoryWindow(ctk.CTkToplevel):
         ctk.CTkButton(btns, text="⟳ Скачать снова", width=130, height=30,
                       command=lambda: self.redownload(rec)).pack(side="left", padx=(6, 4))
         ctk.CTkButton(btns, text="✕", command=lambda: self.remove(rec), **small).pack(side="left")
+        self.after(50, lambda: bind_right_click(row, lambda e: self.show_menu(e, rec)))
+
+    def show_menu(self, event, rec):
+        path = rec.get("file")
+        exists = bool(path) and os.path.exists(path)
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="▶  Открыть", state="normal" if exists else "disabled",
+                      command=lambda: os.startfile(path))
+        m.add_command(label="📂  Показать в папке",
+                      command=lambda: self.app.show_in_folder(path or ""))
+        m.add_command(label="⟳  Скачать снова", command=lambda: self.redownload(rec))
+        m.add_command(label="🔗  Копировать ссылку", command=lambda: self.copy_url(rec))
+        m.add_separator()
+        m.add_command(label="Убрать из истории", command=lambda: self.remove(rec))
+        m.add_command(label="🗑  Удалить файл…", state="normal" if exists else "disabled",
+                      command=lambda: self.delete_file(rec))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def copy_url(self, rec):
+        self.app.clipboard_clear()
+        self.app.clipboard_append(rec["url"])
+        self.app._last_clip = rec["url"]
+
+    def delete_file(self, rec):
+        if delete_download(self.app, rec.get("file"), rec.get("title") or rec["url"]):
+            self.refresh()
 
     def redownload(self, rec):
         opts = dict(rec.get("opts") or {})
@@ -2181,6 +2334,10 @@ class App(ctk.CTk):
         if self.history_win and self.history_win.winfo_exists():
             self.history_win.refresh()
 
+    def refresh_history_window(self):
+        if self.history_win and self.history_win.winfo_exists():
+            self.history_win.refresh()
+
     def open_history(self):
         if self.history_win and self.history_win.winfo_exists():
             self.history_win.deiconify()
@@ -2395,7 +2552,9 @@ def selftest(url, out_dir, page_url=None):
             out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
             files = [ln[3:] for ln in out.splitlines() if ln.startswith("[F]")]
             notes = postprocess_audio(files, opts) if p.returncode == 0 else []
-            mp3 = audio_files(files)
+            mp3 = audio_files(files) or audio_files([folder])
+            on_disk = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+            log(f"      файлы: {on_disk}")
             checks = []
             if p.returncode != 0 or not mp3:
                 checks.append(("скачивание", False, f"код {p.returncode}"))
