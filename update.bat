@@ -45,16 +45,17 @@ echo.
 echo Проверяю последнюю сборку на GitHub...
 set "RUN="
 set "WHEN="
-for /f "tokens=1,* delims= " %%a in ('""%GH%" run list --repo %REPO% --workflow build.yml --status success --limit 1 --json databaseId,createdAt --template "{{range .}}{{.databaseId}} {{timeago .createdAt}}{{end}}""') do (
-    set "RUN=%%a"
-    set "WHEN=%%b"
-)
+:: номер сборки берём через --jq: в шаблоне gh большие числа превращаются в 4.02e+10
+for /f "delims=" %%a in ('""%GH%" run list --repo %REPO% --workflow build.yml --status success --limit 1 --json databaseId --jq ".[0].databaseId""') do set "RUN=%%a"
+for /f "tokens=1 delims=T" %%a in ('""%GH%" run list --repo %REPO% --workflow build.yml --status success --limit 1 --json createdAt --jq ".[0].createdAt""') do set "WHEN=%%a"
+:: защита: номер сборки должен состоять только из цифр
+if defined RUN echo %RUN%| findstr /r "^[0-9][0-9]*$" >nul || set "RUN="
 if not defined RUN (
     echo Не найдено ни одной удачной сборки в %REPO%.
     echo Запустите сборку: вкладка Actions - Сборка Downloader - Run workflow.
     goto fail
 )
-echo   Сборка №%RUN%, собрана %WHEN%
+echo   Сборка №%RUN% от %WHEN%
 
 set "HAVE="
 if exist "%INFO%" set /p HAVE=<"%INFO%"
