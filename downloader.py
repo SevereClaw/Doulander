@@ -30,7 +30,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -90,6 +90,7 @@ DENO = find_tool("deno.exe") or next(
      if os.path.isfile(p)), None)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
 HISTORY_LIMIT = 2000
 DEFAULT_FOLDER = os.path.join(BASE_DIR, "Downloads")
 
@@ -140,6 +141,29 @@ COOKIE_SOURCES = {
 }
 PARALLEL_CHOICES = ["1", "2", "3", "4", "5"]
 
+# раскладка по папкам: название -> (шаблон папки yt-dlp, пример для подсказки)
+ORGANIZE = {
+    "Не раскладывать": ("", ""),
+    "По каналу": ("%(uploader,channel|Без автора)s/", "Канал\\"),
+    "По сайту": ("%(extractor_key|Другое)s/", "Youtube\\"),
+    "По сайту и каналу": ("%(extractor_key|Другое)s/%(uploader,channel|Без автора)s/",
+                          "Youtube\\Канал\\"),
+    "По месяцу": ("%(upload_date>%Y-%m|Без даты)s/", "2026-10\\"),
+}
+# имя файла: название -> (шаблон yt-dlp, пример)
+NAME_TEMPLATES = {
+    "Название": ("%(title)s", "Название видео"),
+    "Канал - Название": ("%(uploader,channel&{} - |)s%(title)s", "Канал - Название видео"),
+    "Дата - Название": ("%(upload_date>%Y-%m-%d&{} - |)s%(title)s", "2026-10-26 - Название видео"),
+    "Номер - Название": ("%(playlist_index&{:02d} - |)s%(title)s", "01 - Название видео"),
+    "Название [id]": ("%(title)s [%(id)s]", "Название видео [dQw4w9WgXcQ]"),
+    "Свой шаблон": (None, None),
+}
+EXAMPLE_FIELDS = {"title": "Название видео", "uploader": "Канал", "channel": "Канал",
+                  "upload_date": "20261026", "id": "dQw4w9WgXcQ", "playlist_index": "1",
+                  "playlist_title": "Плейлист", "extractor_key": "Youtube", "ext": "mp4"}
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
 DEFAULTS = {
     "folder": DEFAULT_FOLDER,
     "mode": "Видео",
@@ -160,6 +184,10 @@ DEFAULTS = {
     "check_updates": True,  # проверять обновления при запуске
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
+    "autostart": False,     # запускать вместе с Windows (свёрнутой в трей)
+    "organize": "Не раскладывать",
+    "name_template": "Название",
+    "custom_template": "%(uploader)s - %(title)s",
     "sponsorblock": False,  # вырезать рекламные вставки (YouTube)
     "chapters": False,      # разбивать на отдельные файлы по главам
 }
@@ -205,6 +233,66 @@ def describe_opts(opts):
     if opts.get("mode") == "Аудио":
         return opts.get("fmt", "MP3")
     return f"{opts.get('quality', '').split(' ')[0]} {opts.get('fmt', 'MP4')}".strip()
+
+
+def clean_custom_template(text):
+    """Свой шаблон имени: убираем расширение и попытки выйти за пределы папки."""
+    text = (text or "").strip().replace("\\", "/")
+    text = re.sub(r"\.?%\(ext\)s$", "", text)
+    parts = [p for p in text.split("/") if p not in ("", ".", "..") and ":" not in p]
+    return "/".join(parts) or None
+
+
+def output_stem(opts):
+    """Путь файла без расширения (относительно папки загрузок) — шаблон yt-dlp."""
+    lay = opts.get("layout") or {}
+    folder = ORGANIZE.get(lay.get("org"), ("", ""))[0]
+    if opts.get("playlist"):
+        folder += "%(playlist_title&{}/|)s"
+    name = NAME_TEMPLATES.get(lay.get("name"), (None, None))[0]
+    if lay.get("name") == "Свой шаблон":
+        name = clean_custom_template(lay.get("custom"))
+    return folder + (name or "%(title)s")
+
+
+def example_path(org, name, custom, ext="mp4"):
+    folder = ORGANIZE.get(org, ("", ""))[1]
+    if name == "Свой шаблон":
+        tpl = clean_custom_template(custom) or "%(title)s"
+        sample = re.sub(r"%\((\w+)[^)]*\)[sd]",
+                        lambda m: EXAMPLE_FIELDS.get(m.group(1), "…"), tpl).replace("/", "\\")
+    else:
+        sample = NAME_TEMPLATES.get(name, ("", "Название видео"))[1]
+    return f"{folder}{sample}.{ext}"
+
+
+def set_autostart(enabled):
+    """Добавляет/убирает программу из автозагрузки Windows. True — получилось."""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, "Downloader", 0, winreg.REG_SZ,
+                                  f'"{sys.executable}" --tray')
+            else:
+                try:
+                    winreg.DeleteValue(key, "Downloader")
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+
+def load_queue():
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 def parse_time(text):
@@ -292,11 +380,9 @@ def build_command(url, opts, folder, fragments=8):
         "--retries", "10", "--fragment-retries", "10",
         "--socket-timeout", "15",
     ]
-    if opts["playlist"]:
-        # плейлист складывается в отдельную папку с его названием
-        cmd += ["--yes-playlist", "-o", "%(playlist_title&{}/|)s%(title)s.%(ext)s"]
-    else:
-        cmd += ["--no-playlist", "-o", "%(title)s.%(ext)s"]
+    # плейлист складывается в отдельную папку с его названием (см. output_stem)
+    cmd += ["--yes-playlist" if opts["playlist"] else "--no-playlist",
+            "-o", output_stem(opts) + ".%(ext)s"]
 
     cmd += format_args(opts)
     if opts["mode"] == "Аудио":
@@ -323,9 +409,9 @@ def build_command(url, opts, folder, fragments=8):
             cats += ",music_offtopic"
         cmd += ["--sponsorblock-remove", cats]
     if opts.get("chapters"):
-        chapter_dir = ("%(playlist_title&{}/|)s%(title)s" if opts["playlist"] else "%(title)s")
-        cmd += ["--split-chapters",
-                "-o", f"chapter:{chapter_dir}/%(section_number)02d - %(section_title)s.%(ext)s"]
+        # главы — в папку с тем же именем, что и целый файл (см. finalize_chapters)
+        cmd += ["--split-chapters", "-o",
+                f"chapter:{output_stem(opts)}/%(section_number)02d - %(section_title)s.%(ext)s"]
     if opts.get("cut"):
         start, end = opts["cut"]
         cmd += ["--download-sections",
@@ -524,12 +610,15 @@ class QueueItem(ctk.CTkFrame):
         self.bar.grid(row=3, column=1, sticky="ew", pady=(2, 8))
         self.bar.grid_remove()
 
-        self.btn = ctk.CTkButton(self, text="✕", width=30, height=30,
-                                 fg_color="transparent",
-                                 hover_color=("gray80", "gray28"),
-                                 text_color=("gray30", "gray70"),
-                                 command=self.on_button)
-        self.btn.grid(row=0, column=2, rowspan=4, padx=8)
+        small = dict(width=30, height=30, fg_color="transparent",
+                     hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"))
+        self.pbtn = ctk.CTkButton(self, text="⏸", command=lambda: self.app.toggle_pause(self),
+                                  **small)
+        self.pbtn.grid(row=0, column=2, rowspan=4, padx=(8, 0))
+        self.btn = ctk.CTkButton(self, text="✕", command=self.on_button, **small)
+        self.btn.grid(row=0, column=3, rowspan=4, padx=(0, 8))
+        self.pause_requested = False     # пауза нажата во время скачивания
+        self.user_paused = False         # поставлена на паузу вручную (кнопкой ⏸)
 
     def set_title(self, text):
         if text:
@@ -556,15 +645,23 @@ class QueueItem(ctk.CTkFrame):
         self.st = state
         if state == "run":
             self.btn.configure(state="disabled")
+            self.pbtn.configure(text="⏸", state="normal")
+            self.pbtn.grid()
             self.bar.grid()
-            self.set_progress(0)
+        elif state == "paused":
+            self.btn.configure(state="normal", text="✕")
+            self.pbtn.configure(text="▶", state="normal")
+            self.pbtn.grid()
+            if self.frac > 0:
+                self.bar.grid()
         else:
             self.bar.grid_remove()
             self.btn.configure(state="normal", text="📂" if state == "done" else "✕")
-            if state in ("done", "error"):
-                self.frac = 1.0
-            elif state == "wait":
-                self.frac = 0.0
+            if state == "done":
+                self.pbtn.grid_remove()
+            else:
+                self.pbtn.configure(text="▶" if state == "error" else "⏸", state="normal")
+                self.pbtn.grid()
 
     def on_button(self):
         if self.st == "done" and self.file_path:
@@ -674,6 +771,125 @@ class HistoryWindow(ctk.CTkToplevel):
         self.refresh()
 
 
+# ================================================================ окно настроек
+class SettingsWindow(ctk.CTkToplevel):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Настройки")
+        self.geometry("620x680")
+        self.minsize(520, 420)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        body = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        self.body = body
+        self.row = 0
+
+        # --- внешний вид и поведение
+        self.section("Программа")
+        self.switch("Тёмная тема", app.v_theme, app.toggle_theme)
+        self.switch("Ловить ссылки из буфера обмена", app.v_clip, app.toggle_clip_watch)
+        self.switch("Крестик сворачивает в трей", app.v_tray, app._save,
+                    None if app.tray else "Значок в трее недоступен на этом компьютере")
+        self.switch("Звук и уведомление, когда всё скачано", app.v_sound, app._toggle_sound)
+        self.switch("Запускать вместе с Windows (свёрнутой в трей)", app.v_autostart,
+                    app.toggle_autostart,
+                    None if getattr(sys, "frozen", False) else "Доступно только в Downloader.exe")
+        self.switch("Проверять обновления при запуске", app.v_check_updates, app._save)
+
+        # --- скачивание
+        self.section("Скачивание")
+        line = self.line()
+        ctk.CTkLabel(line, text="Скачивать одновременно:").pack(side="left")
+        ctk.CTkOptionMenu(line, values=PARALLEL_CHOICES, width=70, variable=app.v_parallel,
+                          command=lambda _: app._save()).pack(side="left", padx=8)
+        self.check("Субтитры (русские и английские) — вшивать в видео", app.v_subs)
+        self.check("Обложка и теги — вшивать в файл", app.v_embed)
+        self.check("Фрагмент — резать точно по секундам (медленнее)", app.v_exact)
+        line = self.line()
+        ctk.CTkLabel(line, text="🍪 Cookies для входа на сайты:").pack(side="left")
+        ctk.CTkOptionMenu(line, values=list(COOKIE_SOURCES), width=170, variable=app.v_cookies,
+                          command=app._on_cookies).pack(side="left", padx=8)
+        self.hint("Нужны для видео 18+, закрытых видео, Instagram и части VK. Надёжнее всего "
+                  "Firefox или файл cookies.txt (расширение «Get cookies.txt LOCALLY»).")
+
+        # --- папки и имена файлов
+        self.section("Папки и имена файлов")
+        line = self.line()
+        ctk.CTkLabel(line, text="Раскладывать:").pack(side="left")
+        ctk.CTkOptionMenu(line, values=list(ORGANIZE), width=190, variable=app.v_org,
+                          command=lambda _: self.update_layout()).pack(side="left", padx=8)
+        line = self.line()
+        ctk.CTkLabel(line, text="Имя файла:").pack(side="left")
+        ctk.CTkOptionMenu(line, values=list(NAME_TEMPLATES), width=190, variable=app.v_name,
+                          command=lambda _: self.update_layout()).pack(side="left", padx=8)
+        self.custom = ctk.CTkEntry(body, textvariable=app.v_custom, height=34,
+                                   font=ctk.CTkFont(family="Consolas", size=13))
+        self.custom.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=4)
+        self.custom.bind("<KeyRelease>", lambda e: self.update_layout())
+        self.custom_hint = self.hint(
+            "Поля: %(title)s — название, %(uploader)s — канал, %(upload_date)s — дата, "
+            "%(id)s — код видео, %(playlist_index)s — номер. Папки — через «/».")
+        self.example = ctk.CTkLabel(body, text="", anchor="w", justify="left",
+                                    font=ctk.CTkFont(family="Consolas", size=12),
+                                    text_color=("gray10", "gray90"), wraplength=540)
+        self.example.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(6, 4))
+        self.hint("Настройки применяются к ссылкам, которые добавлены после изменения.")
+
+        ctk.CTkButton(self, text="Готово", width=120, height=36, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, command=self.destroy).grid(
+            row=1, column=0, sticky="e", padx=20, pady=12)
+        self.update_layout()
+        self.after(150, self.lift)
+
+    # маленькие помощники для вёрстки
+    def next(self):
+        self.row += 1
+        return self.row
+
+    def section(self, text):
+        ctk.CTkLabel(self.body, text=text, anchor="w",
+                     font=ctk.CTkFont(size=16, weight="bold")).grid(
+            row=self.next(), column=0, sticky="ew", padx=16, pady=(16, 4))
+
+    def switch(self, text, var, command, disabled_reason=None):
+        w = ctk.CTkSwitch(self.body, text=text, variable=var, command=command)
+        w.grid(row=self.next(), column=0, sticky="w", padx=24, pady=4)
+        if disabled_reason:
+            w.configure(state="disabled")
+            self.hint(disabled_reason)
+
+    def check(self, text, var):
+        ctk.CTkCheckBox(self.body, text=text, variable=var, command=self.app._save).grid(
+            row=self.next(), column=0, sticky="w", padx=24, pady=4)
+
+    def line(self):
+        f = ctk.CTkFrame(self.body, fg_color="transparent")
+        f.grid(row=self.next(), column=0, sticky="w", padx=24, pady=4)
+        return f
+
+    def hint(self, text):
+        lbl = ctk.CTkLabel(self.body, text=text, anchor="w", justify="left", wraplength=540,
+                           text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
+        lbl.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(0, 4))
+        return lbl
+
+    def update_layout(self):
+        custom = self.app.v_name.get() == "Свой шаблон"
+        self.custom.configure(state="normal" if custom else "disabled")
+        ext = "mp3" if self.app.mode.get() == "Аудио" else "mp4"
+        sample = example_path(self.app.v_org.get(), self.app.v_name.get(),
+                              self.app.v_custom.get(), ext)
+        self.example.configure(text=f"Пример:  {self.app.settings['folder']}\\{sample}")
+        self.app._save()
+        self.app.refresh_folder_label()
+
+
 # ================================================================ главное окно
 class App(ctk.CTk):
     def __init__(self):
@@ -696,6 +912,7 @@ class App(ctk.CTk):
         self.events = queue.Queue()
         self.lock = threading.Lock()
         self.procs = set()
+        self.item_procs = {}
         self.workers_alive = 0
         self.batch_ok = self.batch_fail = 0
         self.cancel_flag = threading.Event()
@@ -707,6 +924,8 @@ class App(ctk.CTk):
         self._tray_hint_shown = False
         self._last_clip = self._read_clipboard()
 
+        self.settings_win = None
+        self._create_vars()
         self._build_ui()
         self._apply_mode()
         self._setup_clipboard_keys()
@@ -729,8 +948,38 @@ class App(ctk.CTk):
         if problems:
             self.set_main_status("⚠ Не найдено: " + ", ".join(problems) +
                                  " — положите рядом с Downloader.exe", ACCENT)
+        self.refresh_folder_label()
+        if not NO_SAVE:
+            self.restore_queue()
+            if self.v_autostart.get():
+                set_autostart(True)          # обновить путь, если папку с программой перенесли
+        if "--tray" in sys.argv:             # запуск вместе с Windows — сразу в трей
+            self.after(300, self.withdraw if self.tray else self.iconify)
 
     # ------------------------------------------------------------ интерфейс
+    def _create_vars(self):
+        """Все переключатели — в переменных: ими пользуются и главное окно, и окно настроек."""
+        s = self.settings
+        B, S = ctk.BooleanVar, ctk.StringVar
+        self.v_theme = B(value=s["theme"] == "dark")
+        self.v_clip = B(value=s["clip_watch"])
+        self.v_tray = B(value=s["tray"])
+        self.v_sound = B(value=s["sound"])
+        self.v_autostart = B(value=s["autostart"])
+        self.v_check_updates = B(value=s["check_updates"])
+        self.v_parallel = S(value=str(s["parallel"]))
+        self.v_playlist = B(value=s["playlist"])
+        self.v_subs = B(value=s["subs"])
+        self.v_embed = B(value=s["embed"])
+        self.v_sponsor = B(value=s["sponsorblock"])
+        self.v_chapters = B(value=s["chapters"])
+        self.v_exact = B(value=s["exact_cut"])
+        self.v_cookies = S(value=s["cookies"] if s["cookies"] in COOKIE_SOURCES else "Нет")
+        self.v_org = S(value=s["organize"] if s["organize"] in ORGANIZE else "Не раскладывать")
+        self.v_name = S(value=s["name_template"] if s["name_template"] in NAME_TEMPLATES
+                        else "Название")
+        self.v_custom = S(value=s["custom_template"])
+
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(5, weight=1)
@@ -754,21 +1003,9 @@ class App(ctk.CTk):
         version = f"v{APP_VERSION}" + (f"  ·  сборка {BUILD_ID}" if BUILD_ID else "  ·  локальная сборка")
         ctk.CTkLabel(head, text=f"YouTube, VK, TikTok и ещё 1000+ сайтов   ·   {version}",
                      text_color=GRAY_TEXT).grid(row=1, column=1, sticky="nw")
-        switches = ctk.CTkFrame(head, fg_color="transparent")
-        switches.grid(row=0, column=2, rowspan=2, sticky="e")
-        self.theme_switch = ctk.CTkSwitch(switches, text="Тёмная тема", command=self.toggle_theme)
-        self.theme_switch.pack(anchor="w", pady=1)
-        if self.settings["theme"] == "dark":
-            self.theme_switch.select()
-        self.v_clip = ctk.BooleanVar(value=self.settings["clip_watch"])
-        ctk.CTkSwitch(switches, text="Ловить ссылки из буфера", variable=self.v_clip,
-                      command=self.toggle_clip_watch).pack(anchor="w", pady=1)
-        self.v_tray = ctk.BooleanVar(value=self.settings["tray"])
-        ctk.CTkSwitch(switches, text="Сворачивать в трей", variable=self.v_tray,
-                      command=self._save).pack(anchor="w", pady=1)
-        self.v_sound = ctk.BooleanVar(value=self.settings["sound"])
-        ctk.CTkSwitch(switches, text="Звук и уведомление", variable=self.v_sound,
-                      command=self._toggle_sound).pack(anchor="w", pady=1)
+        ctk.CTkButton(head, text="⚙  Настройки", width=130, height=38, corner_radius=10,
+                      command=self.open_settings, **outline).grid(row=0, column=2, rowspan=2,
+                                                                  sticky="e")
 
         # --- плашка «вышла новая версия» (скрыта, пока не нужна)
         self.banner = ctk.CTkFrame(self, corner_radius=10, fg_color=("#FDECEC", "#3A1D1F"),
@@ -818,37 +1055,18 @@ class App(ctk.CTk):
                                      command=lambda _: self._remember_format())
         self.fmt.grid(row=0, column=4, pady=(14, 8), sticky="w")
 
-        par = ctk.CTkFrame(card, fg_color="transparent")
-        par.grid(row=0, column=5, sticky="e", padx=14, pady=(14, 8))
-        ctk.CTkLabel(par, text="Одновременно:").pack(side="left", padx=(0, 6))
-        self.parallel = ctk.CTkOptionMenu(par, values=PARALLEL_CHOICES, width=60,
-                                          command=lambda _: self._save())
-        self.parallel.set(str(self.settings["parallel"]))
-        self.parallel.pack(side="left")
-
         flags = ctk.CTkFrame(card, fg_color="transparent")
         flags.grid(row=1, column=0, columnspan=6, sticky="w", padx=14, pady=(0, 10))
-        self.v_playlist = ctk.BooleanVar(value=self.settings["playlist"])
-        self.v_subs = ctk.BooleanVar(value=self.settings["subs"])
-        self.v_embed = ctk.BooleanVar(value=self.settings["embed"])
-        self.v_sponsor = ctk.BooleanVar(value=self.settings["sponsorblock"])
-        self.v_chapters = ctk.BooleanVar(value=self.settings["chapters"])
         ctk.CTkCheckBox(flags, text="Весь плейлист", variable=self.v_playlist,
-                        command=self._save).pack(side="left", padx=(0, 16))
-        self.subs_box = ctk.CTkCheckBox(flags, text="Субтитры", variable=self.v_subs,
-                                        command=self._save)
-        self.subs_box.pack(side="left", padx=(0, 16))
-        ctk.CTkCheckBox(flags, text="Обложка и теги", variable=self.v_embed,
-                        command=self._save).pack(side="left", padx=(0, 16))
+                        command=self._save).pack(side="left", padx=(0, 18))
         ctk.CTkCheckBox(flags, text="Без рекламы", variable=self.v_sponsor,
-                        command=self._toggle_sponsor).pack(side="left", padx=(0, 16))
+                        command=self._toggle_sponsor).pack(side="left", padx=(0, 18))
         ctk.CTkCheckBox(flags, text="Разбить по главам", variable=self.v_chapters,
                         command=self._toggle_chapters).pack(side="left")
 
-        # фрагмент и cookies
+        # фрагмент
         extra = ctk.CTkFrame(card, fg_color="transparent")
-        extra.grid(row=2, column=0, columnspan=6, sticky="ew", padx=14, pady=(0, 10))
-        extra.grid_columnconfigure(6, weight=1)
+        extra.grid(row=2, column=0, columnspan=6, sticky="w", padx=14, pady=(0, 10))
         ctk.CTkLabel(extra, text="✂  Фрагмент с").grid(row=0, column=0, padx=(0, 6))
         self.cut_from = ctk.CTkEntry(extra, width=70, placeholder_text="0:00")
         self.cut_from.grid(row=0, column=1)
@@ -858,21 +1076,14 @@ class App(ctk.CTk):
         ctk.CTkButton(extra, text="✕", width=28, height=28, fg_color="transparent",
                       hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"),
                       command=self.clear_cut).grid(row=0, column=4, padx=(4, 8))
-        self.v_exact = ctk.BooleanVar(value=self.settings["exact_cut"])
-        ctk.CTkCheckBox(extra, text="точно по секундам", variable=self.v_exact,
-                        command=self._save).grid(row=0, column=5)
-        ctk.CTkLabel(extra, text="🍪 Cookies:").grid(row=0, column=7, padx=(12, 6))
-        self.cookies = ctk.CTkOptionMenu(extra, values=list(COOKIE_SOURCES), width=150,
-                                         command=self._on_cookies)
-        self.cookies.set(self.settings["cookies"] if self.settings["cookies"] in COOKIE_SOURCES
-                         else "Нет")
-        self.cookies.grid(row=0, column=8)
+        ctk.CTkLabel(extra, text="например 1:20 — 3:45", text_color=GRAY_TEXT).grid(
+            row=0, column=5)
 
         folder_row = ctk.CTkFrame(card, fg_color="transparent")
         folder_row.grid(row=3, column=0, columnspan=6, sticky="ew", padx=14, pady=(0, 14))
         folder_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(folder_row, text="📁").grid(row=0, column=0, padx=(0, 6))
-        self.folder_label = ctk.CTkLabel(folder_row, text=self.settings["folder"], anchor="w",
+        self.folder_label = ctk.CTkLabel(folder_row, text="", anchor="w",
                                          text_color=("gray30", "gray70"))
         self.folder_label.grid(row=0, column=1, sticky="ew")
         ctk.CTkButton(folder_row, text="Изменить", width=90,
@@ -921,7 +1132,7 @@ class App(ctk.CTk):
                                        font=ctk.CTkFont(size=15, weight="bold"),
                                        command=self.start)
         self.start_btn.grid(row=0, column=0)
-        self.cancel_btn = ctk.CTkButton(btns, text="Отмена", width=100, height=42,
+        self.cancel_btn = ctk.CTkButton(btns, text="⏸  Пауза", width=100, height=42,
                                         corner_radius=10, state="disabled",
                                         command=self.cancel, **secondary)
         self.cancel_btn.grid(row=0, column=1, padx=8)
@@ -1041,13 +1252,11 @@ class App(ctk.CTk):
             self.quality.set(self.settings["audio_quality"])
             self.fmt.configure(values=list(AUDIO_FORMATS))
             self.fmt.set(self.settings["audio_format"])
-            self.subs_box.configure(state="disabled")
         else:
             self.quality.configure(values=list(VIDEO_QUALITIES))
             self.quality.set(self.settings["video_quality"])
             self.fmt.configure(values=list(VIDEO_FORMATS))
             self.fmt.set(self.settings["video_format"])
-            self.subs_box.configure(state="normal")
         self._update_quality_state()
         self._save()
 
@@ -1074,7 +1283,7 @@ class App(ctk.CTk):
                 title="Файл cookies.txt (формат Netscape)",
                 filetypes=[("cookies.txt", "*.txt"), ("Все файлы", "*.*")])
             if not path:
-                self.cookies.set(self.settings["cookies"])
+                self.v_cookies.set(self.settings["cookies"])
                 return
             self.settings["cookies_file"] = os.path.normpath(path)
             self.set_main_status(f"Cookies из файла: {os.path.basename(path)}")
@@ -1087,7 +1296,7 @@ class App(ctk.CTk):
         self._save()
 
     def cookie_args(self):
-        src = COOKIE_SOURCES.get(self.cookies.get())
+        src = COOKIE_SOURCES.get(self.v_cookies.get())
         if not src:
             return None
         if src == "file":
@@ -1103,7 +1312,11 @@ class App(ctk.CTk):
     def _save(self):
         self.settings.update(mode=self.mode.get(), playlist=self.v_playlist.get(),
                              subs=self.v_subs.get(), embed=self.v_embed.get(),
-                             parallel=self.parallel.get(), clip_watch=self.v_clip.get(),
+                             parallel=self.v_parallel.get(), clip_watch=self.v_clip.get(),
+                             autostart=self.v_autostart.get(),
+                             check_updates=self.v_check_updates.get(),
+                             organize=self.v_org.get(), name_template=self.v_name.get(),
+                             custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
                              chapters=self.v_chapters.get())
@@ -1124,10 +1337,12 @@ class App(ctk.CTk):
                 "sponsor": self.v_sponsor.get(),
                 "chapters": self.v_chapters.get(),
                 "cut": cut, "exact": self.v_exact.get(),
+                "layout": {"org": self.v_org.get(), "name": self.v_name.get(),
+                           "custom": self.v_custom.get()},
                 "cookies": self.cookie_args()}
 
     def toggle_theme(self):
-        theme = "dark" if self.theme_switch.get() else "light"
+        theme = "dark" if self.v_theme.get() else "light"
         ctk.set_appearance_mode(theme)
         self.settings["theme"] = theme
         self._save()
@@ -1137,7 +1352,7 @@ class App(ctk.CTk):
                                        title="Папка для загрузок")
         if path:
             self.settings["folder"] = os.path.normpath(path)
-            self.folder_label.configure(text=self.settings["folder"])
+            self.refresh_folder_label()
             self._save()
 
     def open_folder(self):
@@ -1195,9 +1410,10 @@ class App(ctk.CTk):
             self.after(50, lambda: self._register_drop_tree(item))
         threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
         # если загрузка уже идёт, а свободные потоки закончились — запускаем ещё один
-        if self.workers_alive and self.workers_alive < int(self.parallel.get()):
+        if self.workers_alive and self.workers_alive < int(self.v_parallel.get()):
             self._spawn_worker()
-        return True
+        self.save_queue()
+        return item
 
     def remove_item(self, item):
         with self.lock:
@@ -1206,6 +1422,7 @@ class App(ctk.CTk):
             self.items.remove(item)
         item.destroy()
         self._regrid()
+        self.save_queue()
 
     def clear_finished(self):
         with self.lock:
@@ -1215,6 +1432,7 @@ class App(ctk.CTk):
         for item in gone:
             item.destroy()
         self._regrid()
+        self.save_queue()
 
     def _regrid(self):
         for n, item in enumerate(self.items):
@@ -1277,8 +1495,12 @@ class App(ctk.CTk):
         self.add_from_entry()
         if self.workers_alive:
             return
-        for item in self.items:              # повторить неудачные
-            if item.st in ("error", "cancel"):
+        for item in self.items:
+            # повторить неудачные и продолжить остановленные кнопкой «Пауза»
+            # (поставленные на паузу кнопкой ⏸ у самой ссылки — не трогаем)
+            if item.st == "error" or (item.st == "paused" and not item.user_paused):
+                if item.st == "error":
+                    item.set_progress(0)
                 item.set_state("wait")
                 item.set_status("В очереди")
         waiting = [i for i in self.items if i.st == "wait"]
@@ -1294,7 +1516,7 @@ class App(ctk.CTk):
         self.cancel_btn.configure(state="normal")
         self.update_btn.configure(state="disabled")
         self.progress.set(0)
-        for _ in range(min(int(self.parallel.get()), len(waiting))):
+        for _ in range(min(int(self.v_parallel.get()), len(waiting))):
             self._spawn_worker()
 
     def _spawn_worker(self):
@@ -1302,11 +1524,78 @@ class App(ctk.CTk):
         threading.Thread(target=self._work, daemon=True).start()
 
     def cancel(self):
+        """Кнопка «Пауза»: останавливает все загрузки, их можно продолжить кнопкой «Скачать»."""
         self.cancel_flag.set()
         with self.lock:
             procs = list(self.procs)
+            for item in self.item_procs:
+                item.pause_requested = True
         for p in procs:
             kill_tree(p)
+
+    def toggle_pause(self, item):
+        """Кнопка ⏸/▶ у одной ссылки."""
+        if item.st == "run":
+            item.user_paused = True
+            item.pause_requested = True
+            item.set_status("Ставлю на паузу…")
+            with self.lock:
+                proc = self.item_procs.get(item)
+            kill_tree(proc)
+        elif item.st == "wait":
+            item.user_paused = True
+            item.set_state("paused")
+            item.set_status("⏸ На паузе")
+        elif item.st in ("paused", "error"):
+            item.user_paused = False
+            if item.st == "error":
+                item.set_progress(0)
+            item.set_state("wait")
+            item.set_status("В очереди")
+            if not self.workers_alive:
+                self.start()
+            elif self.workers_alive < int(self.v_parallel.get()):
+                item.batch = True
+                self._spawn_worker()
+        self.save_queue()
+
+    # ------------------------------------------------------------ очередь между запусками
+    def save_queue(self):
+        if NO_SAVE:
+            return
+        data = [{"url": i.url, "title": i.full_title, "frac": i.frac,
+                 "user_paused": i.user_paused,
+                 "opts": {k: v for k, v in i.opts.items() if k != "cookies"}}
+                for i in self.items if i.st != "done"]
+        try:
+            if data:
+                with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1)
+            elif os.path.exists(QUEUE_FILE):
+                os.remove(QUEUE_FILE)
+        except OSError:
+            pass
+
+    def restore_queue(self):
+        """Возвращает недокачанное с прошлого запуска — на паузе, продолжить кнопкой «Скачать»."""
+        restored = 0
+        for rec in load_queue():
+            if not rec.get("url") or not isinstance(rec.get("opts"), dict):
+                continue
+            opts = dict(rec["opts"])
+            opts["cookies"] = self.cookie_args()
+            item = self.add_item(rec["url"], opts)
+            if not item:
+                continue
+            item.set_title(rec.get("title"))
+            item.set_progress(float(rec.get("frac") or 0))
+            item.user_paused = bool(rec.get("user_paused"))
+            item.set_state("paused")
+            item.set_status("⏸ На паузе — нажмите ▶ или «Скачать», чтобы продолжить")
+            restored += 1
+        if restored:
+            self.set_main_status(f"Недокачанное с прошлого раза: {restored} — "
+                                 "нажмите «Скачать», чтобы продолжить")
 
     def _take_item(self):
         with self.lock:
@@ -1344,6 +1633,7 @@ class App(ctk.CTk):
             return False
         with self.lock:
             self.procs.add(proc)
+            self.item_procs[item] = proc
 
         last_error = ""
         files = []
@@ -1375,10 +1665,13 @@ class App(ctk.CTk):
         code = proc.wait()
         with self.lock:
             self.procs.discard(proc)
+            self.item_procs.pop(item, None)
 
-        if self.cancel_flag.is_set():
-            ev(("state", item, "cancel"))
-            ev(("item_status", item, "Отменено", None))
+        if item.pause_requested or self.cancel_flag.is_set():
+            # недокачанный файл (.part) остаётся — yt-dlp продолжит с того же места
+            item.pause_requested = False
+            ev(("state", item, "paused"))
+            ev(("item_status", item, f"⏸ На паузе — {int(item.frac * 100)}%", None))
             return None
         if code == 0:
             if item.opts.get("chapters"):
@@ -1491,6 +1784,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------ события из потоков
     def _poll_events(self):
         changed = False
+        save_needed = False
         try:
             while True:
                 e = self.events.get_nowait()
@@ -1516,6 +1810,7 @@ class App(ctk.CTk):
                 elif kind == "state":
                     e[1].set_state(e[2])
                     changed = True
+                    save_needed = True
                 elif kind == "result":
                     if e[1] is True:
                         self.batch_ok += 1
@@ -1540,6 +1835,8 @@ class App(ctk.CTk):
             pass
         if changed and self.workers_alive:
             self._update_overall()
+        if save_needed:
+            self.save_queue()
         self.after(100, self._poll_events)
 
     def _update_overall(self):
@@ -1548,11 +1845,14 @@ class App(ctk.CTk):
             self.progress.set(sum(i.frac for i in batch) / len(batch))
         running = [i for i in self.items if i.st == "run"]
         waiting = sum(1 for i in self.items if i.st == "wait")
-        if len(running) == 1 and not waiting:
+        paused = sum(1 for i in self.items if i.st == "paused")
+        if len(running) == 1 and not waiting and not paused:
             self.set_main_status(running[0].last_text)
         else:
-            self.set_main_status(f"Качается: {len(running)}   •   в очереди: {waiting}"
-                                 f"   •   готово: {self.batch_ok}")
+            text = f"Качается: {len(running)}   •   в очереди: {waiting}"
+            if paused:
+                text += f"   •   на паузе: {paused}"
+            self.set_main_status(text + f"   •   готово: {self.batch_ok}")
 
     def _finish_batch(self):
         self.start_btn.configure(state="normal")
@@ -1565,8 +1865,9 @@ class App(ctk.CTk):
         msg = f"Скачано: {ok}"
         if fail:
             msg += f"   •   не удалось: {fail} (подробности в журнале)"
-        if self.cancel_flag.is_set():
-            msg += "   •   остановлено"
+        paused = sum(1 for i in self.items if i.st == "paused")
+        if paused:
+            msg += f"   •   на паузе: {paused}"
         self.set_main_status(msg, GREEN if ok and not fail else None)
         if self.v_sound.get():
             if not play_sound():
@@ -1588,6 +1889,7 @@ class App(ctk.CTk):
         self.quit_app()
 
     def quit_app(self):
+        self.save_queue()
         self.cancel()
         self._save()
         if self.tray:
@@ -1596,6 +1898,34 @@ class App(ctk.CTk):
             except Exception:
                 pass
         self.destroy()
+
+    # ------------------------------------------------------------ настройки
+    def open_settings(self):
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()
+            self.settings_win.lift()
+            return
+        self.settings_win = SettingsWindow(self)
+
+    def refresh_folder_label(self):
+        text = self.settings["folder"]
+        extra = []
+        if self.v_org.get() != "Не раскладывать":
+            extra.append(self.v_org.get().lower())
+        if self.v_name.get() != "Название":
+            extra.append("имя: " + self.v_name.get().lower())
+        if extra:
+            text += "   ·   " + ", ".join(extra)
+        self.folder_label.configure(text=text)
+
+    def toggle_autostart(self):
+        ok = set_autostart(self.v_autostart.get())
+        if not ok:
+            self.v_autostart.set(False)
+            self.set_main_status("Не удалось включить автозапуск", ACCENT)
+        elif self.v_autostart.get():
+            self.set_main_status("Downloader будет запускаться вместе с Windows (в трее)")
+        self._save()
 
     # ------------------------------------------------------------ история
     def _add_history(self, item):
@@ -1757,6 +2087,14 @@ def selftest(url, out_dir):
         ("audio-mp3", dict(base, mode="Аудио", quality="Лучшее", fmt="MP3"), ".mp3"),
         ("audio-flac-cut", dict(base, mode="Аудио", quality="Лучшее", fmt="FLAC", cut=(1, 3)),
          ".flac"),
+        # раскладка по каналу: у тестового видео нет автора -> папка «Без автора»
+        ("layout-channel", dict(base, mode="Видео", quality="720p", fmt="MP4",
+                                layout={"org": "По каналу", "name": "Канал - Название"}),
+         os.path.join("Без автора", "test.mp4")),
+        ("layout-custom", dict(base, mode="Аудио", quality="Лучшее", fmt="MP3",
+                               layout={"org": "Не раскладывать", "name": "Свой шаблон",
+                                       "custom": "Моя папка/%(title)s (%(id)s)"}),
+         os.path.join("Моя папка", "test (test).mp3")),
     ]
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     try:
@@ -1773,8 +2111,9 @@ def selftest(url, out_dir):
         try:
             p = subprocess.run(build_command(url, opts, folder), capture_output=True,
                                timeout=300, env=env, creationflags=NO_WINDOW)
-            files = [f for f in os.listdir(folder) if f.endswith(ext)] \
-                if os.path.isdir(folder) else []
+            files = sorted(os.path.relpath(os.path.join(root, f), folder)
+                           for root, _, names in os.walk(folder) for f in names)
+            files = [f for f in files if f.endswith(ext)]
             ok = p.returncode == 0 and files
             log(f"{'OK  ' if ok else 'FAIL'} {name}: код {p.returncode}, файлы {files}")
             if not ok:

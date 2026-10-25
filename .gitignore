@@ -11,4 +11,5 @@ __pycache__/
 *.zip
 settings.json
 history.json
+queue.json
 Downloads/
