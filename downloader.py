@@ -37,7 +37,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.11.1"
+APP_VERSION = "1.11.2"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -617,6 +617,39 @@ def clean_env():
             env.pop(key, None)
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     return env
+
+
+def cleanup_old_temp():
+    """Удаляет временные папки _MEI… от прошлых запусков программы, которые не удалились
+    сами (например, после старой ошибки перезапуска). Чужие папки не трогаем: свою
+    узнаём по нашим файлам внутри (sound.wav и icon.png)."""
+    if not getattr(sys, "frozen", False):
+        return 0
+    mine = os.path.normcase(os.path.abspath(getattr(sys, "_MEIPASS", "")))
+    tmp = tempfile.gettempdir()
+    removed = 0
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(tmp, name)
+        if not name.startswith("_MEI") or os.path.normcase(os.path.abspath(path)) == mine:
+            continue
+        try:
+            if not (os.path.isfile(os.path.join(path, "sound.wav")) and
+                    os.path.isfile(os.path.join(path, "icon.png"))):
+                continue
+            if time.time() - os.path.getmtime(path) < 600:    # могла запуститься только что
+                continue
+            # если копия программы ещё работает, Windows не даст переименовать папку
+            trash = path + "_old"
+            os.rename(path, trash)
+            shutil.rmtree(trash, ignore_errors=True)
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def restart_program(app):
@@ -1818,6 +1851,7 @@ class App(ctk.CTk):
             self._check_tools()
         self.refresh_folder_label()
         if not NO_SAVE:
+            threading.Thread(target=cleanup_old_temp, daemon=True).start()
             self.restore_queue()
             if self.v_autostart.get():
                 set_autostart(True)          # обновить путь, если папку с программой перенесли
