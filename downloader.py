@@ -37,7 +37,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -268,6 +268,7 @@ DEFAULTS = {
     "check_updates": True,  # проверять обновления при запуске
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
+    "anim": True,           # Phantom: вспышка «ГОТОВО!» по окончании
     "autostart": False,     # запускать вместе с Windows (свёрнутой в трей)
     "organize": "Не раскладывать",
     "name_template": "Название",
@@ -544,6 +545,18 @@ def title_font(size):
     return ctk.CTkFont(size=size, weight="bold")
 
 
+def title_widget(parent, text, size=16):
+    """Заголовок раздела: в Phantom — красная косая плашка (картинка), иначе текст."""
+    if PHANTOM:
+        img = phantom_style.make_title(text.upper(), size=size)
+        cimg = ctk.CTkImage(light_image=img, dark_image=img,
+                            size=(img.width // 2, img.height // 2))
+        lbl = ctk.CTkLabel(parent, text="", image=cimg)
+        lbl._title_img = cimg               # держим ссылку, иначе картинка пропадёт
+        return lbl
+    return ctk.CTkLabel(parent, text=text, anchor="w", font=title_font(size))
+
+
 def caps(text):
     return text.upper() if PHANTOM else text
 
@@ -655,7 +668,8 @@ def build_command(url, opts, folder, fragments=8):
     cmd += ["--yes-playlist" if opts["playlist"] else "--no-playlist",
             "-o", output_stem(opts) + ".%(ext)s"]
 
-    cmd += format_args(opts)
+    # вручную выбранное качество (кнопка 🎚) важнее настроек
+    cmd += ["-f", opts["format_id"]] if opts.get("format_id") else format_args(opts)
     if opts["mode"] == "Аудио":
         ext, lossless = AUDIO_FORMATS[opts["fmt"]]
         cmd += ["-x", "--audio-format", ext]
@@ -979,6 +993,70 @@ NET_ERRORS = ("timed out", "timeout", "connection", "unable to download webpage"
               "ssl", "remote end closed", "unreachable", "reset by peer", "proxy")
 
 
+CODEC_NAMES = {"avc1": "H.264", "avc": "H.264", "h264": "H.264", "vp09": "VP9", "vp9": "VP9",
+               "vp8": "VP8", "av01": "AV1", "hev1": "H.265", "hvc1": "H.265", "mp4a": "AAC",
+               "aac": "AAC", "opus": "Opus", "vorbis": "Vorbis", "mp3": "MP3", "flac": "FLAC"}
+
+
+def codec_name(codec):
+    if not codec or codec == "none":
+        return ""
+    key = codec.split(".")[0].lower()
+    return CODEC_NAMES.get(key, key.upper())
+
+
+def format_choices(info, mode, container="MP4"):
+    """Все варианты качества для ручного выбора: [{id, label, size, short}]."""
+    fmts = [f for f in (info.get("formats") or []) if f.get("format_id")
+            and f.get("ext") not in ("mhtml",) and "storyboard" not in (f.get("format_note") or "")]
+    dur = info.get("duration") or 0
+
+    def size(f):
+        return (f.get("filesize") or f.get("filesize_approx") or
+                ((f.get("tbr") or 0) * 125 * dur if dur else 0))
+
+    def has_audio(f):
+        return f.get("acodec") not in (None, "none")
+
+    def has_video(f):
+        return f.get("vcodec") not in (None, "none")
+
+    audios = [f for f in fmts if has_audio(f) and not has_video(f)]
+    audios.sort(key=lambda f: -(f.get("abr") or f.get("tbr") or 0))
+    choices, seen = [], set()
+    if mode == "Аудио":
+        for f in audios:
+            kbps = int(f.get("abr") or f.get("tbr") or 0)
+            label = f"{codec_name(f.get('acodec')) or f.get('ext')}  ·  {kbps} kbps" if kbps \
+                else f"{codec_name(f.get('acodec')) or f.get('ext')}"
+            if label in seen:
+                continue
+            seen.add(label)
+            choices.append({"id": f["format_id"], "label": label, "size": size(f),
+                            "short": f"{kbps}k" if kbps else "аудио"})
+        return choices
+    # для MP4 звук лучше брать в m4a, чтобы склейка не перекодировала
+    best_audio = next((a for a in audios if container == "MP4" and a.get("ext") == "m4a"), None) \
+        or (audios[0] if audios else None)
+    vids = [f for f in fmts if has_video(f) and f.get("height")]
+    vids.sort(key=lambda f: (-(f.get("height") or 0), -(f.get("fps") or 0), -(f.get("tbr") or 0)))
+    for f in vids:
+        fps = f.get("fps") or 0
+        res = f"{f['height']}p{int(fps) if fps > 30 else ''}"
+        label = f"{res}  ·  {codec_name(f.get('vcodec'))}  ·  {f.get('ext')}"
+        if label in seen:
+            continue
+        seen.add(label)
+        if has_audio(f):
+            fid, total = f["format_id"], size(f)
+        else:
+            audio_sel = "ba[ext=m4a]/ba" if container == "MP4" else "ba"
+            fid = f"{f['format_id']}+{audio_sel}".replace("/ba", f"/{f['format_id']}+ba")
+            total = size(f) + (size(best_audio) if best_audio else 0)
+        choices.append({"id": fid, "label": label, "size": total, "short": res})
+    return choices
+
+
 def explain_error(err, code, url="", proxy=None):
     """Короткое понятное описание ошибки yt-dlp."""
     low = err.lower()
@@ -1065,11 +1143,15 @@ class QueueItem(ctk.CTkFrame):
 
         small = dict(width=30, height=30, fg_color="transparent",
                      hover_color=C.ICON_HOVER, text_color=C.ICON_TEXT)
+        self.qbtn = ctk.CTkButton(self, text="🎚", state="disabled",
+                                  command=lambda: self.app.open_format_picker(self), **small)
+        self.qbtn.grid(row=0, column=2, rowspan=4, padx=(8, 0))
+        self.choices = []
         self.pbtn = ctk.CTkButton(self, text="⏸", command=lambda: self.app.toggle_pause(self),
                                   **small)
-        self.pbtn.grid(row=0, column=2, rowspan=4, padx=(8, 0))
+        self.pbtn.grid(row=0, column=3, rowspan=4)
         self.btn = ctk.CTkButton(self, text="✕", command=self.on_button, **small)
-        self.btn.grid(row=0, column=3, rowspan=4, padx=(0, 8))
+        self.btn.grid(row=0, column=4, rowspan=4, padx=(0, 8))
         self.after(100, lambda: bind_right_click(self, self.show_menu))
         self.pause_requested = False     # пауза нажата во время скачивания
         self.user_paused = False         # поставлена на паузу вручную (кнопкой ⏸)
@@ -1095,8 +1177,49 @@ class QueueItem(ctk.CTkFrame):
         self.frac = frac
         self.bar.set(frac)
 
+    def set_choices(self, choices):
+        self.choices = choices
+        self.update_qbtn()
+
+    def update_qbtn(self):
+        ok = bool(self.choices) and self.st in ("wait", "paused", "error")
+        self.qbtn.configure(state="normal" if ok else "disabled")
+        if self.st == "done":
+            self.qbtn.grid_remove()
+
+    def set_format(self, choice):
+        """Выбрано качество вручную (None — снова «как в настройках»)."""
+        if choice:
+            self.opts["format_id"] = choice["id"]
+            self.opts["format_label"] = choice["label"]
+            first = choice["short"]
+        else:
+            self.opts.pop("format_id", None)
+            self.opts.pop("format_label", None)
+            first = self.opts["fmt"] if self.opts["mode"] == "Аудио" else \
+                self.opts["quality"].split(" ")[0]
+        lines = self.tag.split("\n")
+        lines[0] = first + (" ✎" if choice else "")
+        self.tag = "\n".join(lines)
+        if not self.thumb_image:
+            self.thumb.configure(text=self.tag)
+        if choice:
+            size = human_size(choice["size"])
+            self.set_status(f"Выбрано: {choice['label']}" + (f"  —  ≈ {size}" if size else ""))
+        else:
+            self.set_status("В очереди")
+
+    def flash(self):
+        """Phantom: рамка коротко мигает белым, когда загрузка готова."""
+        if not PHANTOM:
+            return
+        for i, color in enumerate(["#FFFFFF", ACCENT, "#FFFFFF", ACCENT]):
+            self.after(i * 140, lambda c=color: self.winfo_exists() and
+                       self.configure(border_color=c))
+
     def set_state(self, state):
         self.st = state
+        self.after(0, self.update_qbtn)
         if state == "run":
             self.btn.configure(state="disabled")
             self.pbtn.configure(text="⏸", state="normal")
@@ -1304,6 +1427,58 @@ class HistoryWindow(ctk.CTkToplevel):
         self.refresh()
 
 
+# ================================================================ выбор качества
+class FormatPicker(ctk.CTkToplevel):
+    """Все варианты качества у одной ссылки, с размерами. Клик — выбрать."""
+
+    def __init__(self, app, item):
+        super().__init__(app)
+        self.app, self.item = app, item
+        self.title("Выбор качества")
+        self.geometry("560x520")
+        self.minsize(420, 300)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        title_widget(self, caps("Выбор качества"), 16).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 2))
+        name = item.full_title or display_url(item.url)
+        ctk.CTkLabel(self, text=name if len(name) < 70 else name[:67] + "…", anchor="w",
+                     text_color=GRAY_TEXT).grid(row=1, column=0, sticky="ew", padx=18,
+                                                pady=(0, 8))
+        lst = ctk.CTkScrollableFrame(self, corner_radius=R(12))
+        lst.grid(row=2, column=0, sticky="nsew", padx=16)
+        lst.grid_columnconfigure(0, weight=1)
+        current = item.opts.get("format_id")
+        auto = ("Авто — как в настройках: " +
+                (item.opts["fmt"] if item.opts["mode"] == "Аудио" else
+                 f"{item.opts['quality']}, {item.opts['fmt']}"))
+        self._row(lst, 0, auto, "", current is None, None)
+        for n, ch in enumerate(item.choices, 1):
+            self._row(lst, n, ch["label"], human_size(ch["size"]) or "", ch["id"] == current, ch)
+        hint = ("Размер примерный. Для видео в него уже входит звук."
+                if item.opts["mode"] != "Аудио" else
+                f"Размер исходной дорожки; после перевода в {item.opts['fmt']} он изменится.")
+        ctk.CTkLabel(self, text=hint, text_color=GRAY_TEXT, anchor="w").grid(
+            row=3, column=0, sticky="ew", padx=18, pady=10)
+        self.after(150, self.lift)
+
+    def _row(self, parent, n, label, size, selected, choice):
+        text = f"{label}" + (f"      ≈ {size}" if size else "")
+        style = dict(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF") \
+            if selected else dict(fg_color=C.BTN2, hover_color=C.BTN2_HOVER,
+                                  text_color=C.BTN2_TEXT)
+        ctk.CTkButton(parent, text=("✓  " if selected else "     ") + text, anchor="w",
+                      height=36, corner_radius=R(8), command=lambda: self.pick(choice),
+                      **style).grid(row=n, column=0, sticky="ew", pady=2, padx=2)
+
+    def pick(self, choice):
+        self.item.set_format(choice)
+        self.app.save_queue()
+        self.destroy()
+
+
 # ================================================================ окно «Список»
 class BulkWindow(ctk.CTkToplevel):
     """Большое поле: сразу много ссылок или названий песен, по одному на строку."""
@@ -1388,6 +1563,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.switch("Крестик сворачивает в трей", app.v_tray, app._save,
                     None if app.tray else "Значок в трее недоступен на этом компьютере")
         self.switch("Звук и уведомление, когда всё скачано", app.v_sound, app._toggle_sound)
+        self.switch("Вспышка «ГОТОВО!», когда всё скачано", app.v_anim, app._save,
+                    None if PHANTOM else "Только в оформлении Phantom")
         self.switch("Запускать вместе с Windows (свёрнутой в трей)", app.v_autostart,
                     app.toggle_autostart,
                     None if getattr(sys, "frozen", False) else "Доступно только в Downloader.exe")
@@ -1475,9 +1652,8 @@ class SettingsWindow(ctk.CTkToplevel):
         return self.row
 
     def section(self, text):
-        ctk.CTkLabel(self.body, text=text, anchor="w",
-                     font=title_font(16)).grid(
-            row=self.next(), column=0, sticky="ew", padx=16, pady=(16, 4))
+        title_widget(self.body, text, 15).grid(
+            row=self.next(), column=0, sticky="w", padx=16, pady=(16, 4))
 
     def switch(self, text, var, command, disabled_reason=None):
         w = ctk.CTkSwitch(self.body, text=text, variable=var, command=command)
@@ -1605,6 +1781,7 @@ class App(ctk.CTk):
         self.settings_win = None
         self._create_vars()
         self._build_ui()
+        self._add_shards()
         self._apply_mode()
         self._setup_clipboard_keys()
         self._setup_dnd()
@@ -1642,6 +1819,7 @@ class App(ctk.CTk):
         self.v_clip = B(value=s["clip_watch"])
         self.v_tray = B(value=s["tray"])
         self.v_sound = B(value=s["sound"])
+        self.v_anim = B(value=s["anim"])
         self.v_autostart = B(value=s["autostart"])
         self.v_check_updates = B(value=s["check_updates"])
         self.v_auto_ytdlp = B(value=s["auto_ytdlp"])
@@ -1788,8 +1966,7 @@ class App(ctk.CTk):
         qhead = ctk.CTkFrame(self, fg_color="transparent")
         qhead.grid(row=4, column=0, sticky="ew", pady=(8, 0), **pad)
         qhead.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(qhead, text=caps("Очередь"),
-                     font=title_font(15)).grid(row=0, column=0, sticky="w")
+        title_widget(qhead, "Очередь", 15).grid(row=0, column=0, sticky="w")
         ctk.CTkButton(qhead, text="🕘 История", width=100, height=26,
                       command=self.open_history, **outline).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(qhead, text="Убрать готовые", width=120, height=26,
@@ -1847,6 +2024,63 @@ class App(ctk.CTk):
                                       font=ctk.CTkFont(family="Consolas", size=12))
         self.log_box.configure(state="disabled")
         self.log_visible = False
+
+    def _add_shards(self):
+        """Phantom: красно-белые «осколки» в правом верхнем углу и полоса внизу окна."""
+        if not PHANTOM:
+            return
+        bg = phantom_style.BLACK
+        top = tk.Canvas(self, height=14, width=320, bg=bg, highlightthickness=0)
+        top.place(relx=1.0, x=-320, y=0)
+        top.bind("<Configure>", lambda e: phantom_style.draw_shards(top, e.width, e.height))
+        bottom = tk.Canvas(self, height=6, bg=bg, highlightthickness=0)
+        bottom.place(relx=0, rely=1.0, y=-6, relwidth=1.0)
+        bottom.bind("<Configure>",
+                    lambda e: phantom_style.draw_shards(bottom, e.width, e.height, "bottom"))
+
+    def flash_done(self, line2=""):
+        """Phantom: вспышка «ГОТОВО!» на всё окно — красный осколок влетает и исчезает."""
+        if not (PHANTOM and self.v_anim.get()) or self.state() != "normal":
+            return
+        ps = phantom_style
+        w, h = self.winfo_width(), self.winfo_height()
+        cv = tk.Canvas(self, bg=ps.BLACK, highlightthickness=0)
+        cv.place(x=0, y=0, relwidth=1, relheight=1)
+        big = ("Bahnschrift", max(28, w // 12), "bold italic")
+        small = ("Bahnschrift", max(12, w // 45), "bold italic")
+
+        def frame(i):
+            if not cv.winfo_exists():
+                return
+            cv.delete("all")
+            k = min(1.0, i / 6)                 # 0 → 1: осколок влетает слева
+            dx = -w * (1 - k) ** 2
+            cy = h * 0.5
+            cv.create_polygon(dx - 40, cy - h * 0.22, dx + w * 0.95, cy - h * 0.30,
+                              dx + w * 0.88, cy + h * 0.16, dx - 40, cy + h * 0.24,
+                              fill=ps.RED, outline="")
+            cv.create_polygon(dx + w * 0.10, cy + h * 0.27, dx + w * 0.97, cy + h * 0.19,
+                              dx + w * 0.96, cy + h * 0.22, dx + w * 0.09, cy + h * 0.30,
+                              fill=ps.WHITE, outline="")
+            for row in range(5):                # немного растра
+                for col in range(12):
+                    r = max(0, 6 - col * 0.5)
+                    x = dx + w * 0.70 + col * 18 + (row % 2) * 9
+                    y = cy - h * 0.25 + row * 16
+                    if r > 0.8:
+                        cv.create_oval(x - r, y - r, x + r, y + r, fill=ps.BLACK, outline="")
+            if k >= 1:
+                cv.create_text(w * 0.5 + 6, cy - h * 0.04 + 6, text="ГОТОВО!", font=big,
+                               fill=ps.BLACK)
+                cv.create_text(w * 0.5, cy - h * 0.04, text="ГОТОВО!", font=big, fill=ps.WHITE)
+                if line2:
+                    cv.create_text(w * 0.5, cy + h * 0.12, text=line2.upper(), font=small,
+                                   fill=ps.WHITE)
+            if i < 6:
+                self.after(30, lambda: frame(i + 1))
+            else:
+                self.after(1100, cv.destroy)
+        frame(0)
 
     def set_main_status(self, text, color=None):
         self.status.configure(text=text, text_color=color or GRAY_TEXT)
@@ -2014,6 +2248,7 @@ class App(ctk.CTk):
                              custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
+                             anim=self.v_anim.get(),
                              chapters=self.v_chapters.get(),
                              square_cover=self.v_square.get(),
                              normalize=self.v_normalize.get(), lyrics=self.v_lyrics.get(),
@@ -2102,6 +2337,14 @@ class App(ctk.CTk):
             self.set_main_status(f"Добавлено: {added}" +
                                  (f" (из них поиском по названию: {searches})" if searches else ""))
         return added
+
+    def open_format_picker(self, item):
+        if not item.choices:
+            self.set_main_status("Варианты качества ещё не загрузились — подождите пару секунд")
+            return
+        if getattr(self, "picker_win", None) and self.picker_win.winfo_exists():
+            self.picker_win.destroy()
+        self.picker_win = FormatPicker(self, item)
 
     def open_bulk(self):
         if getattr(self, "bulk_win", None) and self.bulk_win.winfo_exists():
@@ -2196,6 +2439,9 @@ class App(ctk.CTk):
                 self.events.put(("resolved", item, real))
             s = summarize(info, item.opts)
             self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
+            if info.get("_type") != "playlist":
+                self.events.put(("choices", item,
+                                 format_choices(info, item.opts["mode"], item.opts["fmt"])))
         if s.get("thumb"):
             try:
                 self.events.put(("thumb", item, load_thumbnail(s["thumb"],
@@ -2603,8 +2849,13 @@ class App(ctk.CTk):
                     changed = True
                 elif kind == "state":
                     e[1].set_state(e[2])
+                    if e[2] == "done":
+                        e[1].flash()
                     changed = True
                     save_needed = True
+                elif kind == "choices":
+                    if e[1].winfo_exists():
+                        e[1].set_choices(e[2])
                 elif kind == "result":
                     if e[1] is True:
                         self.batch_ok += 1
@@ -2669,6 +2920,8 @@ class App(ctk.CTk):
         if paused:
             msg += f"   •   на паузе: {paused}"
         self.set_main_status(msg, GREEN if ok and not fail else None)
+        if ok:
+            self.flash_done(f"скачано: {ok}" + (f"   не удалось: {fail}" if fail else ""))
         if self.v_sound.get():
             if not play_sound():
                 self.bell()
@@ -2968,6 +3221,11 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             app.open_settings()
             app.open_history()
             app.open_bulk()
+            app.add_item("https://example.com/test-video")
+            app.items[-1].set_choices(SAMPLE_CHOICES)
+            app.open_format_picker(app.items[-1])
+            app.picker_win.pick(SAMPLE_CHOICES[2])
+            app.flash_done("проверка")
             app.update()
             app.quit_app()
             log(f"OK   окно программы ({style})")
@@ -3088,9 +3346,19 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     return 1 if failed else 0
 
 
+SAMPLE_CHOICES = [      # пример вариантов качества — для снимков и самопроверки
+    {"id": "401+ba", "label": "2160p60  ·  AV1  ·  mp4", "size": 905e6, "short": "2160p60"},
+    {"id": "299+ba", "label": "1080p60  ·  H.264  ·  mp4", "size": 185e6, "short": "1080p60"},
+    {"id": "303+ba", "label": "1080p60  ·  VP9  ·  webm", "size": 145e6, "short": "1080p60"},
+    {"id": "136+ba", "label": "720p  ·  H.264  ·  mp4", "size": 65e6, "short": "720p"},
+    {"id": "18", "label": "360p  ·  H.264  ·  mp4", "size": 16e6, "short": "360p"},
+]
+
+
 def screenshot(out_path, style, urls):
     """Downloader.exe --screenshot ФАЙЛ.png СТИЛЬ ССЫЛКА... — снимок окна для проверки дизайна."""
     global NO_SAVE, FORCE_STYLE
+    style, _, extra = style.partition("-")      # phantom-picker, phantom-flash
     NO_SAVE, FORCE_STYLE = True, style
     from PIL import ImageGrab
     app = App()
@@ -3109,11 +3377,27 @@ def screenshot(out_path, style, urls):
 
     def grab():
         app.update()
-        x, y = app.winfo_rootx(), app.winfo_rooty()
-        w, h = app.winfo_width(), app.winfo_height()
+        win = app
+        if extra == "picker" and getattr(app, "picker_win", None):
+            win = app.picker_win
+            win.update()
+        x, y = win.winfo_rootx(), win.winfo_rooty()
+        w, h = win.winfo_width(), win.winfo_height()
         ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).save(out_path)
         app.quit_app()
-    app.after(9000, grab)          # ждём превью и обложки
+
+    def prepare():
+        if extra == "picker" and app.items:
+            item = app.items[-1]
+            item.set_state("wait")
+            item.set_choices(SAMPLE_CHOICES)
+            item.set_format(SAMPLE_CHOICES[1])
+            app.open_format_picker(item)
+            app.picker_win.geometry("560x420+40+60")
+        elif extra == "flash":
+            app.flash_done("скачано: 2")
+        app.after(1500 if extra == "picker" else 400, grab)
+    app.after(8500, prepare)       # ждём превью и обложки
     app.mainloop()
     return 0
 

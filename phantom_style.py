@@ -128,6 +128,53 @@ def make_banner(title="DOWNLOADER", subtitle="", logo_path=None, scale=2, seed=7
     return img
 
 
+def make_title(text, size=17, scale=2):
+    """Заголовок раздела: белый наклонный текст на красной косой плашке с белой «тенью»."""
+    font = _text_font(size * scale)
+    l, t, r, b = font.getbbox(text)
+    tw, th = r - l, b - t
+    h = th + 14 * scale
+    skew = int(h * 0.38)
+    pad = 14 * scale
+    w = tw + pad * 2 + skew
+    off = 4 * scale
+    img = Image.new("RGBA", (w + off, h + off), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    shape = lambda dx, dy: [(skew + dx, dy), (w + dx, dy), (w - skew + dx, h + dy), (dx, h + dy)]  # noqa
+    d.polygon(shape(off, off), fill=WHITE)
+    d.polygon(shape(0, 0), fill=RED)
+    # текст наклоняем как курсив
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((pad + skew // 2 - l, (h - th) // 2 - t), text, font=font,
+                               fill=WHITE)
+    k = 0.22
+    layer = layer.transform(layer.size, Image.AFFINE, (1, k, -k * h * 0.5, 0, 1, 0),
+                            resample=Image.BICUBIC)
+    img.alpha_composite(layer, (0, 0))
+    return img
+
+
+def draw_shards(canvas, width, height, corner="right"):
+    """Красно-белые «осколки» на полоске-холсте (перерисовываются при изменении размера)."""
+    canvas.delete("all")
+    if width < 10:
+        return
+    if corner == "right":
+        x = width
+        for i, (w, col) in enumerate([(120, RED), (10, WHITE), (60, RED), (6, WHITE), (26, RED)]):
+            canvas.create_polygon(x - w, 0, x, 0, x - height * 0.9, height,
+                                  x - w - height * 0.9, height, fill=col, outline="")
+            x -= w + 8 + i * 2
+    else:   # тонкая полоса снизу: слева красный клин, справа белый штрих
+        canvas.create_polygon(0, 0, width * 0.42, 0, width * 0.42 - height * 1.5, height,
+                              0, height, fill=RED, outline="")
+        canvas.create_polygon(width * 0.42 + 10, 0, width * 0.42 + 26, 0,
+                              width * 0.42 + 26 - height * 1.5, height,
+                              width * 0.42 + 10 - height * 1.5, height, fill=WHITE, outline="")
+        canvas.create_polygon(width - 160, 0, width, 0, width, height,
+                              width - 160 - height * 1.5, height, fill=RED, outline="")
+
+
 def theme_overrides(font_family="Bahnschrift SemiBold"):
     """Цвета и формы для всех виджетов CustomTkinter."""
     R, RH, K, K2, K3, W = RED, RED_HOVER, BLACK, BLACK2, BLACK3, WHITE
@@ -185,10 +232,16 @@ def apply_theme(theme):
                 target[key] = value
 
 
-if __name__ == "__main__":        # предпросмотр шапки: python phantom_style.py out.png
+if __name__ == "__main__":        # предпросмотр: python phantom_style.py out.png
     import sys
-    banner = make_banner(subtitle="ВИДЕО · МУЗЫКА · 1000+ САЙТОВ   v1.10.0",
+    banner = make_banner(subtitle="ВИДЕО · МУЗЫКА · 1000+ САЙТОВ   v1.11.0",
                          logo_path=os.path.join(os.path.dirname(__file__), "icon.png"))
-    bg = Image.new("RGBA", banner.size, BLACK)
+    titles = [make_title(t) for t in ("ОЧЕРЕДЬ", "ПРОГРАММА", "СЕТЬ — ЕСЛИ YOUTUBE С VPN")]
+    H = banner.height + sum(t.height + 20 for t in titles) + 20
+    bg = Image.new("RGBA", (banner.width, H), BLACK)
     bg.alpha_composite(banner)
+    y = banner.height + 20
+    for t in titles:
+        bg.alpha_composite(t, (40, y))
+        y += t.height + 20
     bg.save(sys.argv[1] if len(sys.argv) > 1 else "banner_preview.png")

@@ -184,7 +184,7 @@ jobs:
           $srv = Start-Process python -ArgumentList 'tests/range_server.py','testdata','8765' -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 2
           New-Item -ItemType Directory -Force shots | Out-Null
-          foreach ($style in 'phantom','classic') {
+          foreach ($style in 'phantom','classic','phantom-picker','phantom-flash') {
             Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\$style.png",$style,'http://127.0.0.1:8765/clip.html','http://127.0.0.1:8765/test.mp4' -Wait
           }
           Stop-Process $srv -ErrorAction SilentlyContinue
