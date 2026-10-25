@@ -20,7 +20,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -99,6 +99,31 @@ AUDIO_QUALITIES = {          # качество для yt-dlp и примерн�
     "192 kbps": ("192K", 192),
     "128 kbps": ("128K", 128),
 }
+VIDEO_FORMATS = {           # формат: (контейнер для склейки, предпочтения по расширению)
+    "MP4": ("mp4", "ext:mp4:m4a"),
+    "MKV": ("mkv", None),
+    "WEBM": ("webm/mkv", "ext:webm:webm"),
+}
+AUDIO_FORMATS = {           # формат: (расширение, битрейт без потерь для оценки размера)
+    "MP3": ("mp3", None),
+    "M4A": ("m4a", None),
+    "OPUS": ("opus", None),
+    "FLAC": ("flac", 900),
+    "WAV": ("wav", 1411),
+}
+NO_THUMB_FORMATS = {"WEBM", "WAV"}      # в эти форматы обложку не вшить
+LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+COOKIE_SOURCES = {
+    "Нет": None,
+    "Firefox": "firefox",
+    "Chrome": "chrome",
+    "Edge": "edge",
+    "Яндекс": "chromium:" + os.path.join(LOCALAPPDATA, "Yandex", "YandexBrowser",
+                                          "User Data", "Default"),
+    "Opera": "opera",
+    "Brave": "brave",
+    "Файл cookies.txt…": "file",
+}
 PARALLEL_CHOICES = ["1", "2", "3", "4", "5"]
 
 DEFAULTS = {
@@ -106,6 +131,11 @@ DEFAULTS = {
     "mode": "Видео",
     "video_quality": "1080p",
     "audio_quality": "Лучшее",
+    "video_format": "MP4",
+    "audio_format": "MP3",
+    "cookies": "Нет",
+    "cookies_file": "",
+    "exact_cut": True,
     "playlist": False,
     "subs": False,
     "embed": True,
@@ -124,6 +154,29 @@ THUMB_W, THUMB_H = 128, 72
 
 # Коды клавиш Windows не зависят от раскладки: V=86, C=67, X=88, A=65
 CTRL_KEYCODES = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+
+
+def parse_time(text):
+    """'1:20', '01:02:03', '80', '1:20.5' -> секунды. Пусто -> None. Ошибка -> ValueError."""
+    text = text.strip().replace(",", ".")
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) > 3 or not all(re.fullmatch(r"\d+(\.\d+)?", p) for p in parts):
+        raise ValueError(text)
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60 + float(p)
+    return sec
+
+
+def fmt_time(sec):
+    sec = float(sec)
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    frac = sec - int(sec)
+    tail = f"{s:02d}" + (f"{frac:.1f}"[1:] if frac >= 0.05 else "")
+    return f"{h}:{m:02d}:{tail}" if h else f"{m}:{tail}"
 
 
 def load_settings():
@@ -149,12 +202,17 @@ def format_args(opts):
     if opts["mode"] == "Аудио":
         return ["-f", "ba/b"]
     h = VIDEO_QUALITIES[opts["quality"]]
-    sort = f"res:{h},ext:mp4:m4a" if h else "res,ext:mp4:m4a"
-    return ["-f", "bv*+ba/b", "-S", sort]
+    sort = [f"res:{h}" if h else "res"]
+    ext_pref = VIDEO_FORMATS[opts["fmt"]][1]
+    if ext_pref:
+        sort.append(ext_pref)
+    return ["-f", "bv*+ba/b", "-S", ",".join(sort)]
 
 
-def common_args():
+def common_args(opts=None):
     args = []
+    if opts and opts.get("cookies"):
+        args += opts["cookies"]
     if FFMPEG:
         args += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
     if DENO:
@@ -186,15 +244,25 @@ def build_command(url, opts, folder, fragments=8):
 
     cmd += format_args(opts)
     if opts["mode"] == "Аудио":
-        cmd += ["-x", "--audio-format", "mp3",
-                "--audio-quality", AUDIO_QUALITIES[opts["quality"]][0]]
+        ext, lossless = AUDIO_FORMATS[opts["fmt"]]
+        cmd += ["-x", "--audio-format", ext]
+        if not lossless:
+            cmd += ["--audio-quality", AUDIO_QUALITIES[opts["quality"]][0]]
     else:
-        cmd += ["--merge-output-format", "mp4"]
+        cmd += ["--merge-output-format", VIDEO_FORMATS[opts["fmt"]][0]]
         if opts["subs"]:
             cmd += ["--write-subs", "--sub-langs", "ru.*,en.*", "--embed-subs"]
     if opts["embed"]:
-        cmd += ["--embed-thumbnail", "--embed-metadata"]
-    return cmd + common_args()
+        if opts["fmt"] not in NO_THUMB_FORMATS:
+            cmd += ["--embed-thumbnail"]
+        cmd += ["--embed-metadata"]
+    if opts.get("cut"):
+        start, end = opts["cut"]
+        cmd += ["--download-sections",
+                f"*{fmt_time(start or 0)}-{fmt_time(end) if end else 'inf'}"]
+        if opts.get("exact"):
+            cmd += ["--force-keyframes-at-cuts"]     # точно по секундам, но медленнее
+    return cmd + common_args(opts)
 
 
 def preview_command(url, opts):
@@ -204,7 +272,7 @@ def preview_command(url, opts):
         cmd += ["--yes-playlist", "--flat-playlist"]
     else:
         cmd += ["--no-playlist"]
-    return cmd + format_args(opts) + common_args()
+    return cmd + format_args(opts) + common_args(opts)
 
 
 # ---------------------------------------------------------------- превью
@@ -248,16 +316,23 @@ def summarize(info, opts):
 
     duration = info.get("duration")
     if opts["mode"] == "Аудио":
-        kbps = AUDIO_QUALITIES[opts["quality"]][1]
+        kbps = AUDIO_FORMATS[opts["fmt"]][1] or AUDIO_QUALITIES[opts["quality"]][1]
         size = duration * kbps * 125 if duration else None
-        quality = "MP3"
+        quality = opts["fmt"]
     else:
         formats = info.get("requested_formats") or [info]
         size = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in formats)
         h = info.get("height") or max((f.get("height") or 0) for f in formats)
-        quality = f"{h}p" if h else None
+        quality = f"{h}p {opts['fmt']}" if h else opts["fmt"]
+    dur_text = human_duration(duration)
+    if opts.get("cut") and duration:
+        start, end = opts["cut"]
+        part = max(0, min(end or duration, duration) - (start or 0))
+        if size:
+            size = size * part / duration
+        dur_text = f"фрагмент {human_duration(part) or '0:00'} из {dur_text}"
     size_text = human_size(size)
-    parts = [info.get("uploader") or info.get("channel"), human_duration(duration),
+    parts = [info.get("uploader") or info.get("channel"), dur_text,
              f"≈ {size_text}" if size_text else None, quality]
     return {"title": info.get("title"),
             "meta": "   •   ".join(p for p in parts if p),
@@ -282,6 +357,22 @@ def load_thumbnail(url):
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=16, fill=255)
     img.putalpha(mask)
     return img
+
+
+def explain_error(err, code):
+    """Короткое понятное описание ошибки yt-dlp."""
+    low = err.lower()
+    if "cookie" in low:
+        return ("Не удалось взять cookies: закройте браузер полностью "
+                "или выберите Firefox / файл cookies.txt")
+    if "sign in" in low or "age" in low and "confirm" in low or "login" in low \
+            or "private" in low or "members-only" in low:
+        return "Нужен вход в аккаунт: выберите браузер в «Cookies», где вы залогинены"
+    if "unsupported url" in low:
+        return "Этот сайт не поддерживается"
+    if "http error 429" in low:
+        return "Сайт временно ограничил скачивание — попробуйте позже"
+    return "Ошибка: " + (err[:80] or f"код {code}")
 
 
 def kill_tree(proc):
@@ -310,9 +401,15 @@ class QueueItem(ctk.CTkFrame):
 
         self.grid_columnconfigure(1, weight=1)
 
-        self.tag = "MP3" if opts["mode"] == "Аудио" else opts["quality"].split(" ")[0]
+        if opts["mode"] == "Аудио":
+            self.tag = opts["fmt"]
+        else:
+            self.tag = opts["quality"].split(" ")[0] + "\n" + opts["fmt"]
         if opts["playlist"]:
-            self.tag += " · плейлист"
+            self.tag += "\nплейлист"
+        if opts.get("cut"):
+            start, end = opts["cut"]
+            self.tag += f"\n✂ {fmt_time(start or 0)}–{fmt_time(end) if end else 'конец'}"
         self.thumb = ctk.CTkLabel(self, text=self.tag, width=THUMB_W, height=THUMB_H,
                                   corner_radius=8, fg_color=("gray80", "gray25"),
                                   font=ctk.CTkFont(size=12, weight="bold"))
@@ -393,8 +490,8 @@ class App(ctk.CTk):
 
         build = f" (сборка {BUILD_ID})" if BUILD_ID else ""
         self.title(f"Downloader {APP_VERSION}{build}")
-        self.geometry("840x760")
-        self.minsize(780, 620)
+        self.geometry("880x800")
+        self.minsize(840, 640)
         if os.path.isfile(ICON_ICO):
             try:
                 self.iconbitmap(ICON_ICO)
@@ -496,7 +593,7 @@ class App(ctk.CTk):
         # --- настройки
         card = ctk.CTkFrame(self, corner_radius=14)
         card.grid(row=3, column=0, sticky="ew", pady=8, **pad)
-        card.grid_columnconfigure(3, weight=1)
+        card.grid_columnconfigure(5, weight=1)
 
         self.mode = ctk.CTkSegmentedButton(card, values=["Видео", "Аудио"], height=34,
                                            command=lambda _: self._apply_mode())
@@ -504,12 +601,17 @@ class App(ctk.CTk):
         self.mode.grid(row=0, column=0, padx=14, pady=(14, 8), sticky="w")
 
         ctk.CTkLabel(card, text="Качество:").grid(row=0, column=1, padx=(10, 6), pady=(14, 8))
-        self.quality = ctk.CTkOptionMenu(card, values=list(VIDEO_QUALITIES), width=130,
+        self.quality = ctk.CTkOptionMenu(card, values=list(VIDEO_QUALITIES), width=120,
                                          command=lambda _: self._remember_quality())
         self.quality.grid(row=0, column=2, pady=(14, 8), sticky="w")
 
+        ctk.CTkLabel(card, text="Формат:").grid(row=0, column=3, padx=(14, 6), pady=(14, 8))
+        self.fmt = ctk.CTkOptionMenu(card, values=list(VIDEO_FORMATS), width=90,
+                                     command=lambda _: self._remember_format())
+        self.fmt.grid(row=0, column=4, pady=(14, 8), sticky="w")
+
         par = ctk.CTkFrame(card, fg_color="transparent")
-        par.grid(row=0, column=3, sticky="e", padx=14, pady=(14, 8))
+        par.grid(row=0, column=5, sticky="e", padx=14, pady=(14, 8))
         ctk.CTkLabel(par, text="Одновременно:").pack(side="left", padx=(0, 6))
         self.parallel = ctk.CTkOptionMenu(par, values=PARALLEL_CHOICES, width=60,
                                           command=lambda _: self._save())
@@ -517,7 +619,7 @@ class App(ctk.CTk):
         self.parallel.pack(side="left")
 
         flags = ctk.CTkFrame(card, fg_color="transparent")
-        flags.grid(row=1, column=0, columnspan=4, sticky="w", padx=14, pady=(0, 10))
+        flags.grid(row=1, column=0, columnspan=6, sticky="w", padx=14, pady=(0, 10))
         self.v_playlist = ctk.BooleanVar(value=self.settings["playlist"])
         self.v_subs = ctk.BooleanVar(value=self.settings["subs"])
         self.v_embed = ctk.BooleanVar(value=self.settings["embed"])
@@ -529,8 +631,31 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(flags, text="Обложка и теги", variable=self.v_embed,
                         command=self._save).pack(side="left")
 
+        # фрагмент и cookies
+        extra = ctk.CTkFrame(card, fg_color="transparent")
+        extra.grid(row=2, column=0, columnspan=6, sticky="ew", padx=14, pady=(0, 10))
+        extra.grid_columnconfigure(6, weight=1)
+        ctk.CTkLabel(extra, text="✂  Фрагмент с").grid(row=0, column=0, padx=(0, 6))
+        self.cut_from = ctk.CTkEntry(extra, width=70, placeholder_text="0:00")
+        self.cut_from.grid(row=0, column=1)
+        ctk.CTkLabel(extra, text="до").grid(row=0, column=2, padx=6)
+        self.cut_to = ctk.CTkEntry(extra, width=70, placeholder_text="конец")
+        self.cut_to.grid(row=0, column=3)
+        ctk.CTkButton(extra, text="✕", width=28, height=28, fg_color="transparent",
+                      hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"),
+                      command=self.clear_cut).grid(row=0, column=4, padx=(4, 8))
+        self.v_exact = ctk.BooleanVar(value=self.settings["exact_cut"])
+        ctk.CTkCheckBox(extra, text="точно по секундам", variable=self.v_exact,
+                        command=self._save).grid(row=0, column=5)
+        ctk.CTkLabel(extra, text="🍪 Cookies:").grid(row=0, column=7, padx=(12, 6))
+        self.cookies = ctk.CTkOptionMenu(extra, values=list(COOKIE_SOURCES), width=150,
+                                         command=self._on_cookies)
+        self.cookies.set(self.settings["cookies"] if self.settings["cookies"] in COOKIE_SOURCES
+                         else "Нет")
+        self.cookies.grid(row=0, column=8)
+
         folder_row = ctk.CTkFrame(card, fg_color="transparent")
-        folder_row.grid(row=2, column=0, columnspan=4, sticky="ew", padx=14, pady=(0, 14))
+        folder_row.grid(row=3, column=0, columnspan=6, sticky="ew", padx=14, pady=(0, 14))
         folder_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(folder_row, text="📁").grid(row=0, column=0, padx=(0, 6))
         self.folder_label = ctk.CTkLabel(folder_row, text=self.settings["folder"], anchor="w",
@@ -685,8 +810,7 @@ class App(ctk.CTk):
                 self._last_clip = text
                 known = {i.url for i in self.items}
                 urls = [u for u in text.split() if URL_RE.match(u) and u not in known]
-                for url in urls:
-                    self.add_item(url)
+                urls = [u for u in urls if self.add_item(u)]
                 if urls:
                     self.set_main_status(f"Добавлено из буфера: {len(urls)}")
                     if self.state() == "iconic":
@@ -698,12 +822,61 @@ class App(ctk.CTk):
         if self.mode.get() == "Аудио":
             self.quality.configure(values=list(AUDIO_QUALITIES))
             self.quality.set(self.settings["audio_quality"])
+            self.fmt.configure(values=list(AUDIO_FORMATS))
+            self.fmt.set(self.settings["audio_format"])
             self.subs_box.configure(state="disabled")
         else:
             self.quality.configure(values=list(VIDEO_QUALITIES))
             self.quality.set(self.settings["video_quality"])
+            self.fmt.configure(values=list(VIDEO_FORMATS))
+            self.fmt.set(self.settings["video_format"])
             self.subs_box.configure(state="normal")
+        self._update_quality_state()
         self._save()
+
+    def _remember_format(self):
+        key = "audio_format" if self.mode.get() == "Аудио" else "video_format"
+        self.settings[key] = self.fmt.get()
+        self._update_quality_state()
+        self._save()
+
+    def _update_quality_state(self):
+        # у FLAC и WAV нет битрейта — качество всегда максимальное
+        lossless = self.mode.get() == "Аудио" and AUDIO_FORMATS[self.fmt.get()][1]
+        self.quality.configure(state="disabled" if lossless else "normal")
+
+    def clear_cut(self):
+        for entry, hint in ((self.cut_from, "0:00"), (self.cut_to, "конец")):
+            entry.delete(0, "end")
+            entry.configure(placeholder_text=hint)
+        self.focus_set()
+
+    def _on_cookies(self, choice):
+        if COOKIE_SOURCES[choice] == "file":
+            path = filedialog.askopenfilename(
+                title="Файл cookies.txt (формат Netscape)",
+                filetypes=[("cookies.txt", "*.txt"), ("Все файлы", "*.*")])
+            if not path:
+                self.cookies.set(self.settings["cookies"])
+                return
+            self.settings["cookies_file"] = os.path.normpath(path)
+            self.set_main_status(f"Cookies из файла: {os.path.basename(path)}")
+        elif choice in ("Chrome", "Edge", "Яндекс"):
+            self.set_main_status(f"{choice}: если cookies не возьмутся — закройте браузер "
+                                 "полностью или используйте Firefox / файл cookies.txt")
+        elif choice != "Нет":
+            self.set_main_status(f"Cookies берутся из {choice}")
+        self.settings["cookies"] = choice
+        self._save()
+
+    def cookie_args(self):
+        src = COOKIE_SOURCES.get(self.cookies.get())
+        if not src:
+            return None
+        if src == "file":
+            path = self.settings.get("cookies_file")
+            return ["--cookies", path] if path and os.path.isfile(path) else None
+        return ["--cookies-from-browser", src]
 
     def _remember_quality(self):
         key = "audio_quality" if self.mode.get() == "Аудио" else "video_quality"
@@ -713,14 +886,24 @@ class App(ctk.CTk):
     def _save(self):
         self.settings.update(mode=self.mode.get(), playlist=self.v_playlist.get(),
                              subs=self.v_subs.get(), embed=self.v_embed.get(),
-                             parallel=self.parallel.get(), clip_watch=self.v_clip.get())
+                             parallel=self.parallel.get(), clip_watch=self.v_clip.get(),
+                             exact_cut=self.v_exact.get())
         save_settings(self.settings)
 
     def current_opts(self):
+        """Настройки для новой ссылки. Неверное время фрагмента -> ValueError."""
+        start = parse_time(self.cut_from.get())
+        end = parse_time(self.cut_to.get())
+        if start is not None and end is not None and end <= start:
+            raise ValueError("конец раньше начала")
+        cut = (start, end) if (start or end) else None
         return {"mode": self.mode.get(), "quality": self.quality.get(),
+                "fmt": self.fmt.get(),
                 "playlist": self.v_playlist.get(),
                 "subs": self.v_subs.get() and self.mode.get() == "Видео",
-                "embed": self.v_embed.get()}
+                "embed": self.v_embed.get(),
+                "cut": cut, "exact": self.v_exact.get(),
+                "cookies": self.cookie_args()}
 
     def toggle_theme(self):
         theme = "dark" if self.theme_switch.get() else "light"
@@ -766,7 +949,8 @@ class App(ctk.CTk):
         # можно вставить сразу несколько ссылок через пробел или с новой строки
         for url in self.url_entry.get().split():
             if url.startswith("http"):
-                self.add_item(url)
+                if not self.add_item(url):
+                    return False
                 added = True
         if added:
             self.url_entry.delete(0, "end")
@@ -774,8 +958,14 @@ class App(ctk.CTk):
         return added
 
     def add_item(self, url):
+        try:
+            opts = self.current_opts()
+        except ValueError:
+            self.set_main_status("⚠ Неверное время фрагмента. Пишите так: 1:20 или 0:01:20 "
+                                 "или 80 (секунды)", ACCENT)
+            return False
         self.empty_label.grid_remove()
-        item = QueueItem(self.queue_frame, self, url, self.current_opts())
+        item = QueueItem(self.queue_frame, self, url, opts)
         item.batch = self.workers_alive > 0
         item.grid(row=len(self.items) + 1, column=0, sticky="ew", pady=4, padx=4)
         with self.lock:
@@ -784,6 +974,7 @@ class App(ctk.CTk):
         # если загрузка уже идёт, а свободные потоки закончились — запускаем ещё один
         if self.workers_alive and self.workers_alive < int(self.parallel.get()):
             self._spawn_worker()
+        return True
 
     def remove_item(self, item):
         with self.lock:
@@ -969,7 +1160,7 @@ class App(ctk.CTk):
             ev(("item_status", item, "✓ Готово", GREEN))
             return True
         ev(("state", item, "error"))
-        ev(("item_status", item, "Ошибка: " + (last_error[:80] or f"код {code}"), ACCENT))
+        ev(("item_status", item, explain_error(last_error, code), ACCENT))
         return False
 
     def update_ytdlp(self):
