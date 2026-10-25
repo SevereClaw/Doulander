@@ -4,6 +4,7 @@ Downloader — графическая оболочка для yt-dlp на Custom
 Лежит в одной папке с yt-dlp.exe, ffmpeg.exe и deno.exe.
 Настройки хранятся в settings.json рядом с программой.
 """
+import datetime
 import io
 import json
 import os
@@ -20,7 +21,16 @@ from tkinter import filedialog
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
-APP_VERSION = "1.2.0"
+try:                                # звук уведомления (только Windows)
+    import winsound
+except ImportError:
+    winsound = None
+try:                                # значок в трее
+    import pystray
+except Exception:
+    pystray = None
+
+APP_VERSION = "1.3.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -32,6 +42,7 @@ else:                                       # запущено как .py
 RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)   # где лежат вшитые в exe файлы (иконка)
 ICON_ICO = os.path.join(RES_DIR, "icon.ico")
 ICON_PNG = os.path.join(RES_DIR, "icon.png")
+SOUND_WAV = os.path.join(RES_DIR, "sound.wav")
 
 
 def find_tool(name):
@@ -78,6 +89,8 @@ DENO = find_tool("deno.exe") or next(
     (p for p in [os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe")]
      if os.path.isfile(p)), None)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+HISTORY_LIMIT = 2000
 DEFAULT_FOLDER = os.path.join(BASE_DIR, "Downloads")
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0   # не показывать чёрные окна консоли
@@ -144,6 +157,8 @@ DEFAULTS = {
     "fragments": 8,         # сколько кусков одного видео качать параллельно
     "clip_watch": False,    # ловить ссылки из буфера обмена
     "check_updates": True,  # проверять обновления при запуске
+    "tray": True,           # крестик сворачивает в трей
+    "sound": True,          # звук и уведомление по окончании
 }
 
 ACCENT = "#E5484D"
@@ -154,6 +169,39 @@ THUMB_W, THUMB_H = 128, 72
 
 # Коды клавиш Windows не зависят от раскладки: V=86, C=67, X=88, A=65
 CTRL_KEYCODES = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(items):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(items[:HISTORY_LIMIT], f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def play_sound():
+    if winsound and os.path.isfile(SOUND_WAV):
+        try:
+            winsound.PlaySound(SOUND_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return True
+        except RuntimeError:
+            pass
+    return False
+
+
+def describe_opts(opts):
+    if opts.get("mode") == "Аудио":
+        return opts.get("fmt", "MP3")
+    return f"{opts.get('quality', '').split(' ')[0]} {opts.get('fmt', 'MP4')}".strip()
 
 
 def parse_time(text):
@@ -398,6 +446,7 @@ class QueueItem(ctk.CTkFrame):
         self.last_text = ""
         self.file_path = None
         self.thumb_image = None
+        self.full_title = None
 
         self.grid_columnconfigure(1, weight=1)
 
@@ -441,6 +490,7 @@ class QueueItem(ctk.CTkFrame):
 
     def set_title(self, text):
         if text:
+            self.full_title = text
             self.title_lbl.configure(text=text if len(text) < 64 else text[:61] + "…")
 
     def set_meta(self, text, color=None):
@@ -480,6 +530,107 @@ class QueueItem(ctk.CTkFrame):
             self.app.remove_item(self)
 
 
+# ================================================================ окно истории
+class HistoryWindow(ctk.CTkToplevel):
+    SHOW_MAX = 150          # сколько строк показывать за раз (иначе окно тормозит)
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("История загрузок")
+        self.geometry("760x560")
+        self.minsize(560, 360)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        top.grid_columnconfigure(0, weight=1)
+        self.search = ctk.CTkEntry(top, height=36, placeholder_text="🔍  Поиск по названию или ссылке…")
+        self.search.grid(row=0, column=0, sticky="ew")
+        self.search.bind("<KeyRelease>", lambda e: self._schedule_refresh())
+        ctk.CTkButton(top, text="Очистить историю", width=140, height=36,
+                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
+                      command=self.clear_all).grid(row=0, column=1, padx=(8, 0))
+
+        self.list = ctk.CTkScrollableFrame(self, corner_radius=12)
+        self.list.grid(row=1, column=0, sticky="nsew", padx=16)
+        self.list.grid_columnconfigure(0, weight=1)
+        self.info = ctk.CTkLabel(self, text="", text_color=GRAY_TEXT, anchor="w")
+        self.info.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 12))
+        self._job = None
+        self.refresh()
+        self.after(150, self.lift)
+        self.after(200, self.search.focus_set)
+
+    def _schedule_refresh(self):
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(250, self.refresh)
+
+    def refresh(self):
+        self._job = None
+        for w in self.list.winfo_children():
+            w.destroy()
+        q = self.search.get().strip().lower()
+        rows = [h for h in self.app.history
+                if not q or q in (h.get("title") or "").lower() or q in h.get("url", "").lower()]
+        for n, rec in enumerate(rows[:self.SHOW_MAX]):
+            self._row(n, rec)
+        if not rows:
+            ctk.CTkLabel(self.list, text="Ничего не найдено" if q else "История пока пуста",
+                         text_color=("gray50", "gray50")).grid(row=0, column=0, pady=30)
+        more = f" (показаны первые {self.SHOW_MAX})" if len(rows) > self.SHOW_MAX else ""
+        self.info.configure(text=f"Записей: {len(rows)}{more}")
+
+    def _row(self, n, rec):
+        row = ctk.CTkFrame(self.list, corner_radius=8, fg_color=("gray90", "gray17"))
+        row.grid(row=n, column=0, sticky="ew", pady=3, padx=2)
+        row.grid_columnconfigure(0, weight=1)
+        title = rec.get("title") or rec.get("url")
+        ctk.CTkLabel(row, text=title if len(title) < 70 else title[:67] + "…", anchor="w",
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="ew",
+                                                                   padx=12, pady=(6, 0))
+        path = rec.get("file")
+        exists = bool(path) and os.path.exists(path)
+        meta = [rec.get("date", ""), describe_opts(rec.get("opts") or {}),
+                None if exists else "файл удалён или перемещён"]
+        ctk.CTkLabel(row, text="   •   ".join(m for m in meta if m), anchor="w",
+                     text_color=GRAY_TEXT if exists else ACCENT,
+                     font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="ew",
+                                                    padx=12, pady=(0, 6))
+        btns = ctk.CTkFrame(row, fg_color="transparent")
+        btns.grid(row=0, column=1, rowspan=2, padx=8)
+        small = dict(width=34, height=30, fg_color="transparent",
+                     hover_color=("gray80", "gray28"), text_color=("gray20", "gray80"))
+        ctk.CTkButton(btns, text="▶", state="normal" if exists else "disabled",
+                      command=lambda: os.startfile(path), **small).pack(side="left")
+        ctk.CTkButton(btns, text="📂", command=lambda: self.app.show_in_folder(path or ""),
+                      **small).pack(side="left")
+        ctk.CTkButton(btns, text="⟳ Скачать снова", width=130, height=30,
+                      command=lambda: self.redownload(rec)).pack(side="left", padx=(6, 4))
+        ctk.CTkButton(btns, text="✕", command=lambda: self.remove(rec), **small).pack(side="left")
+
+    def redownload(self, rec):
+        opts = dict(rec.get("opts") or {})
+        opts["cookies"] = self.app.cookie_args()     # cookies берём текущие
+        if self.app.add_item(rec["url"], opts):
+            self.app.set_main_status("Добавлено из истории: " + (rec.get("title") or rec["url"]))
+
+    def remove(self, rec):
+        if rec in self.app.history:
+            self.app.history.remove(rec)
+            save_history(self.app.history)
+        self.refresh()
+
+    def clear_all(self):
+        self.app.history.clear()
+        save_history(self.app.history)
+        self.refresh()
+
+
 # ================================================================ главное окно
 class App(ctk.CTk):
     def __init__(self):
@@ -506,11 +657,18 @@ class App(ctk.CTk):
         self.batch_ok = self.batch_fail = 0
         self.cancel_flag = threading.Event()
         self.preview_slots = threading.Semaphore(3)   # не больше 3 превью одновременно
+        self.history = load_history()
+        self.history_win = None
+        self.tray = None
+        self.dnd_ready = False
+        self._tray_hint_shown = False
         self._last_clip = self._read_clipboard()
 
         self._build_ui()
         self._apply_mode()
         self._setup_clipboard_keys()
+        self._setup_dnd()
+        self._setup_tray()
         self.after(100, self._poll_events)
         self.after(300, self._autopaste)
         self.after(700, self._watch_clipboard)
@@ -550,17 +708,24 @@ class App(ctk.CTk):
                                                               padx=(0, 12))
         ctk.CTkLabel(head, text="Downloader",
                      font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=1, sticky="sw")
-        ctk.CTkLabel(head, text="YouTube, VK, TikTok и ещё 1000+ сайтов",
+        version = f"v{APP_VERSION}" + (f"  ·  сборка {BUILD_ID}" if BUILD_ID else "  ·  локальная сборка")
+        ctk.CTkLabel(head, text=f"YouTube, VK, TikTok и ещё 1000+ сайтов   ·   {version}",
                      text_color=GRAY_TEXT).grid(row=1, column=1, sticky="nw")
         switches = ctk.CTkFrame(head, fg_color="transparent")
         switches.grid(row=0, column=2, rowspan=2, sticky="e")
         self.theme_switch = ctk.CTkSwitch(switches, text="Тёмная тема", command=self.toggle_theme)
-        self.theme_switch.pack(anchor="w", pady=2)
+        self.theme_switch.pack(anchor="w", pady=1)
         if self.settings["theme"] == "dark":
             self.theme_switch.select()
         self.v_clip = ctk.BooleanVar(value=self.settings["clip_watch"])
         ctk.CTkSwitch(switches, text="Ловить ссылки из буфера", variable=self.v_clip,
-                      command=self.toggle_clip_watch).pack(anchor="w", pady=2)
+                      command=self.toggle_clip_watch).pack(anchor="w", pady=1)
+        self.v_tray = ctk.BooleanVar(value=self.settings["tray"])
+        ctk.CTkSwitch(switches, text="Сворачивать в трей", variable=self.v_tray,
+                      command=self._save).pack(anchor="w", pady=1)
+        self.v_sound = ctk.BooleanVar(value=self.settings["sound"])
+        ctk.CTkSwitch(switches, text="Звук и уведомление", variable=self.v_sound,
+                      command=self._toggle_sound).pack(anchor="w", pady=1)
 
         # --- плашка «вышла новая версия» (скрыта, пока не нужна)
         self.banner = ctk.CTkFrame(self, corner_radius=10, fg_color=("#FDECEC", "#3A1D1F"),
@@ -672,14 +837,17 @@ class App(ctk.CTk):
         qhead.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(qhead, text="Очередь",
                      font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(qhead, text="🕘 История", width=100, height=26,
+                      command=self.open_history, **outline).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(qhead, text="Убрать готовые", width=120, height=26,
-                      command=self.clear_finished, **outline).grid(row=0, column=1)
+                      command=self.clear_finished, **outline).grid(row=0, column=2)
 
         self.queue_frame = ctk.CTkScrollableFrame(self, corner_radius=14)
         self.queue_frame.grid(row=5, column=0, sticky="nsew", pady=6, **pad)
         self.queue_frame.grid_columnconfigure(0, weight=1)
         self.empty_label = ctk.CTkLabel(self.queue_frame,
-                                        text="Здесь появятся ссылки для скачивания",
+                                        text="Здесь появятся ссылки для скачивания\n"
+                                             "Можно перетащить ссылку из браузера прямо в окно",
                                         text_color=("gray50", "gray50"))
         self.empty_label.grid(row=0, column=0, pady=30)
 
@@ -887,7 +1055,8 @@ class App(ctk.CTk):
         self.settings.update(mode=self.mode.get(), playlist=self.v_playlist.get(),
                              subs=self.v_subs.get(), embed=self.v_embed.get(),
                              parallel=self.parallel.get(), clip_watch=self.v_clip.get(),
-                             exact_cut=self.v_exact.get())
+                             exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
+                             sound=self.v_sound.get())
         save_settings(self.settings)
 
     def current_opts(self):
@@ -957,9 +1126,9 @@ class App(ctk.CTk):
             self._last_clip = self._read_clipboard()   # чтобы перехват не добавил её ещё раз
         return added
 
-    def add_item(self, url):
+    def add_item(self, url, opts=None):
         try:
-            opts = self.current_opts()
+            opts = opts or self.current_opts()
         except ValueError:
             self.set_main_status("⚠ Неверное время фрагмента. Пишите так: 1:20 или 0:01:20 "
                                  "или 80 (секунды)", ACCENT)
@@ -970,6 +1139,8 @@ class App(ctk.CTk):
         item.grid(row=len(self.items) + 1, column=0, sticky="ew", pady=4, padx=4)
         with self.lock:
             self.items.append(item)
+        if self.dnd_ready:
+            self.after(50, lambda: self._register_drop_tree(item))
         threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
         # если загрузка уже идёт, а свободные потоки закончились — запускаем ещё один
         if self.workers_alive and self.workers_alive < int(self.parallel.get()):
@@ -1156,6 +1327,7 @@ class App(ctk.CTk):
             ev(("item_status", item, "Отменено", None))
             return None
         if code == 0:
+            ev(("history", item))
             ev(("state", item, "done"))
             ev(("item_status", item, "✓ Готово", GREEN))
             return True
@@ -1255,7 +1427,7 @@ class App(ctk.CTk):
         # update.bat закроет программу, заменит exe и запустит новую версию
         subprocess.Popen(f'start "Обновление Downloader" "{path}" /auto',
                          shell=True, cwd=BASE_DIR)
-        self.on_close()
+        self.quit_app()
 
     # ------------------------------------------------------------ события из потоков
     def _poll_events(self):
@@ -1299,6 +1471,12 @@ class App(ctk.CTk):
                     self.set_main_status(e[1])
                 elif kind == "update_check":
                     self._on_update_check(e[1], e[2], e[3])
+                elif kind == "history":
+                    self._add_history(e[1])
+                elif kind == "tray_show":
+                    self.show_window()
+                elif kind == "tray_quit":
+                    self.quit_app()
         except queue.Empty:
             pass
         if changed and self.workers_alive:
@@ -1331,12 +1509,137 @@ class App(ctk.CTk):
         if self.cancel_flag.is_set():
             msg += "   •   остановлено"
         self.set_main_status(msg, GREEN if ok and not fail else None)
-        self.bell()
+        if self.v_sound.get():
+            if not play_sound():
+                self.bell()
+            hidden = self.state() in ("withdrawn", "iconic") or self.focus_displayof() is None
+            if hidden and (ok or fail):
+                title = "Всё скачано" if ok and not fail else "Скачивание завершено"
+                self.notify(title, msg.replace("   •   ", ", "))
 
     def on_close(self):
+        """Крестик: сворачивает в трей (если включено), иначе закрывает программу."""
+        if self.tray and self.v_tray.get():
+            self.withdraw()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.notify("Downloader работает в фоне",
+                            "Значок в трее: двойной щелчок — открыть, правый — выход")
+            return
+        self.quit_app()
+
+    def quit_app(self):
         self.cancel()
         self._save()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         self.destroy()
+
+    # ------------------------------------------------------------ история
+    def _add_history(self, item):
+        rec = {"url": item.url, "title": item.full_title or item.url,
+               "file": item.file_path,
+               "date": datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
+               "opts": {k: v for k, v in item.opts.items() if k != "cookies"}}
+        self.history.insert(0, rec)
+        save_history(self.history)
+        if self.history_win and self.history_win.winfo_exists():
+            self.history_win.refresh()
+
+    def open_history(self):
+        if self.history_win and self.history_win.winfo_exists():
+            self.history_win.deiconify()
+            self.history_win.lift()
+            self.history_win.refresh()
+            return
+        self.history_win = HistoryWindow(self)
+
+    # ------------------------------------------------------------ перетаскивание
+    def _setup_dnd(self):
+        try:
+            from tkinterdnd2 import TkinterDnD
+            TkinterDnD._require(self)
+        except Exception as e:
+            self.log(f"Перетаскивание недоступно: {e}")
+            return
+        self.dnd_ready = True
+        self._drop_cmd = self.register(self._on_drop)
+        self._register_drop_tree(self)
+
+    def _register_drop_tree(self, root):
+        stack = [root]
+        while stack:
+            w = stack.pop()
+            try:
+                self.tk.call("tkdnd::drop_target", "register", w._w, ("DND_Text", "DND_Files"))
+                self.tk.call("bind", w._w, "<<Drop>>", f"{self._drop_cmd} %D")
+            except tk.TclError:
+                pass
+            stack.extend(w.winfo_children())
+
+    def _on_drop(self, data):
+        """Что-то бросили в окно: ссылку из браузера, ярлык .url или .txt со ссылками."""
+        texts = [data]
+        if not re.match(r"\s*https?://", data):
+            try:
+                paths = self.tk.splitlist(data)
+            except tk.TclError:
+                paths = []
+            for path in paths:
+                if os.path.isfile(path) and path.lower().endswith((".url", ".txt")):
+                    try:
+                        with open(path, encoding="utf-8", errors="replace") as f:
+                            texts.append(f.read())
+                    except OSError:
+                        pass
+        known = {i.url for i in self.items}
+        urls = []
+        for text in texts:
+            for url in re.findall(r"https?://[^\s\"'<>]+", text):
+                if url not in known and url not in urls:
+                    urls.append(url)
+        added = [u for u in urls if self.add_item(u)]
+        self.set_main_status(f"Добавлено перетаскиванием: {len(added)}" if added
+                             else "В перетащенном не нашлось ссылок")
+        return "copy"
+
+    # ------------------------------------------------------------ трей и уведомления
+    def _setup_tray(self):
+        if not pystray:
+            return
+        try:
+            image = Image.open(ICON_PNG) if os.path.isfile(ICON_PNG) else \
+                Image.new("RGB", (64, 64), ACCENT)
+            menu = pystray.Menu(
+                pystray.MenuItem("Открыть Downloader",
+                                 lambda: self.events.put(("tray_show",)), default=True),
+                pystray.MenuItem("Выход", lambda: self.events.put(("tray_quit",))))
+            build = f" (сборка {BUILD_ID})" if BUILD_ID else ""
+            self.tray = pystray.Icon("Downloader", image, f"Downloader {APP_VERSION}{build}", menu)
+            threading.Thread(target=self.tray.run, daemon=True).start()
+        except Exception as e:
+            self.tray = None
+            self.log(f"Значок в трее недоступен: {e}")
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def notify(self, title, text):
+        if self.tray:
+            try:
+                self.tray.notify(text, title)
+            except Exception:
+                pass
+
+    def _toggle_sound(self):
+        self._save()
+        if self.v_sound.get():
+            play_sound()
 
 
 if __name__ == "__main__":

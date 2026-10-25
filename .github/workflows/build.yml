@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Установить библиотеки
-        run: pip install customtkinter pillow pyinstaller
+        run: pip install customtkinter pillow tkinterdnd2 pystray pyinstaller
 
       - name: Вписать номер сборки
         shell: pwsh
@@ -32,7 +32,7 @@ jobs:
           Select-String -Path downloader.py -Pattern '^BUILD_ID'
 
       - name: Собрать Downloader.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --collect-data customtkinter downloader.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --collect-data customtkinter downloader.py
 
       - name: Скачать yt-dlp, ffmpeg и deno
         shell: pwsh
