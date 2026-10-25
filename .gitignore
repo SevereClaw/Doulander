@@ -1,0 +1,13 @@
+# результаты сборки
+Downloader/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# скачанные программы и личные файлы
+*.exe
+*.zip
+settings.json
+Downloads/
