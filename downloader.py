@@ -15,7 +15,9 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import tempfile
 import urllib.request
+import zipfile
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -30,7 +32,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -47,8 +49,9 @@ SOUND_WAV = os.path.join(RES_DIR, "sound.wav")
 
 def find_tool(name):
     """Ищет exe рядом с программой, в текущей папке, в подпапках и в PATH."""
-    places = [BASE_DIR, os.getcwd(),
-              os.path.join(BASE_DIR, "Downloader"), os.path.join(BASE_DIR, "bin")]
+    # сначала — папка самой программы
+    places = [BASE_DIR, os.path.join(BASE_DIR, "tools"), os.path.join(BASE_DIR, "bin"),
+              os.path.join(BASE_DIR, "Downloader"), os.getcwd()]
     for folder in places:
         path = os.path.join(folder, name)
         if os.path.isfile(path):
@@ -82,12 +85,73 @@ def launch_error_text(err):
     return str(err)
 
 
-YTDLP = find_tool("yt-dlp.exe") or os.path.join(BASE_DIR, "yt-dlp.exe")
-FFMPEG = find_tool("ffmpeg.exe")
-# deno нужен YouTube для расшифровки ссылок; официальный установщик кладёт его в ~/.deno/bin
-DENO = find_tool("deno.exe") or next(
-    (p for p in [os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe")]
-     if os.path.isfile(p)), None)
+YTDLP = FFMPEG = DENO = None
+
+
+def refresh_tools():
+    """Ищет yt-dlp, ffmpeg и deno заново (например, после докачки)."""
+    global YTDLP, FFMPEG, DENO
+    YTDLP = find_tool("yt-dlp.exe") or os.path.join(BASE_DIR, "yt-dlp.exe")
+    FFMPEG = find_tool("ffmpeg.exe")
+    # deno нужен YouTube для расшифровки ссылок; его установщик кладёт его в ~/.deno/bin
+    DENO = find_tool("deno.exe") or next(
+        (p for p in [os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe")]
+         if os.path.isfile(p)), None)
+
+
+refresh_tools()
+
+# откуда докачивать недостающие компоненты (официальные страницы на GitHub)
+TOOL_SOURCES = {
+    "yt-dlp": ("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+               None),
+    "ffmpeg": ("https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/"
+               "ffmpeg-master-latest-win64-gpl.zip", ("ffmpeg.exe", "ffprobe.exe")),
+    "deno": ("https://github.com/denoland/deno/releases/latest/download/"
+             "deno-x86_64-pc-windows-msvc.zip", ("deno.exe",)),
+}
+
+
+def missing_tools():
+    return [name for name, ok in (("yt-dlp", os.path.isfile(YTDLP)), ("ffmpeg", FFMPEG),
+                                  ("deno", DENO)) if not ok]
+
+
+def download_to(url, dest, progress=None):
+    """Скачивает файл во временный и только потом подменяет — чтобы не оставить битый exe."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Downloader"})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+    os.replace(tmp, dest)
+
+
+def install_tool(name, progress=None):
+    """Скачивает компонент в папку программы."""
+    url, members = TOOL_SOURCES[name]
+    if not members:
+        download_to(url, os.path.join(BASE_DIR, name + ".exe"), progress)
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = os.path.join(tmp, name + ".zip")
+        download_to(url, archive, progress)
+        with zipfile.ZipFile(archive) as z:
+            for info in z.infolist():
+                base = os.path.basename(info.filename)
+                if base in members:
+                    target = os.path.join(BASE_DIR, base)
+                    with z.open(info) as src, open(target + ".part", "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    os.replace(target + ".part", target)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
@@ -943,11 +1007,8 @@ class App(ctk.CTk):
         self.log(f"yt-dlp: {YTDLP if os.path.isfile(YTDLP) else 'НЕ НАЙДЕН'}")
         self.log(f"ffmpeg: {FFMPEG or 'НЕ НАЙДЕН (MP3 и склейка видео работать не будут)'}")
         self.log(f"deno:   {DENO or 'НЕ НАЙДЕН (YouTube может отдавать не все форматы)'}")
-        problems = [name for name, ok in (("yt-dlp.exe", os.path.isfile(YTDLP)),
-                                          ("ffmpeg.exe", FFMPEG), ("deno.exe", DENO)) if not ok]
-        if problems:
-            self.set_main_status("⚠ Не найдено: " + ", ".join(problems) +
-                                 " — положите рядом с Downloader.exe", ACCENT)
+        if not NO_SAVE:
+            self._check_tools()
         self.refresh_folder_label()
         if not NO_SAVE:
             self.restore_queue()
@@ -1139,7 +1200,7 @@ class App(ctk.CTk):
         self.log_btn = ctk.CTkButton(btns, text="Журнал ▾", width=100, height=42,
                                      corner_radius=10, command=self.toggle_log, **outline)
         self.log_btn.grid(row=0, column=2)
-        self.update_btn = ctk.CTkButton(btns, text="Обновить yt-dlp", width=130, height=42,
+        self.update_btn = ctk.CTkButton(btns, text="Обновить компоненты", width=170, height=42,
                                         corner_radius=10, command=self.update_ytdlp, **outline)
         self.update_btn.grid(row=0, column=4, padx=(0, 8))
         self.app_update_btn = ctk.CTkButton(btns, text="Проверить обновления", width=170,
@@ -1688,32 +1749,80 @@ class App(ctk.CTk):
         return False
 
     def update_ytdlp(self):
-        if self.workers_alive:
+        """Обновляет yt-dlp и deno на месте, недостающее докачивает в папку программы.
+        ffmpeg обновлять не нужно — если он есть, его не трогаем."""
+        if self.workers_alive or getattr(self, "_tools_busy", False):
             return
+        self._tools_busy = True
         self.update_btn.configure(state="disabled")
-        self.set_main_status("Обновляю yt-dlp…")
+        self.hide_banner()
+        self.set_main_status("Обновляю компоненты…")
         if not self.log_visible:
             self.toggle_log()
 
         def run():
-            try:
-                p = subprocess.run([YTDLP, "-U"], capture_output=True, cwd=BASE_DIR,
-                                   creationflags=NO_WINDOW)
-                out = (p.stdout + p.stderr).decode("utf-8", "replace")
-            except OSError as e:
-                out = f"Не удалось запустить yt-dlp: {e}"
-            out = ANSI.sub("", out)
-            for line in out.splitlines():
-                self.events.put(("log", line))
-            ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
-            ver = ver.group(0) if ver else ""
-            if "up to date" in out:
-                msg = f"✓ У вас уже последняя версия yt-dlp ({ver})"
-            elif "Updated yt-dlp" in out:
-                msg = f"✓ yt-dlp обновлён до {ver}"
-            else:
-                msg = "Не удалось обновить yt-dlp — подробности в журнале"
-            self.events.put(("updated", msg))
+            ev = self.events.put
+            results = []
+
+            def progress(name):
+                last = [0]
+
+                def cb(done, total):
+                    pct = int(done * 100 / total) if total else 0
+                    if pct != last[0]:
+                        last[0] = pct
+                        ev(("tools_progress", done / total if total else 0,
+                            f"Скачиваю {name}: {pct}%   ({human_size(done) or '0 Б'} из {human_size(total) or '?'})"))
+                return cb
+
+            def run_tool(cmd):
+                try:
+                    p = subprocess.run(cmd, capture_output=True, cwd=BASE_DIR, timeout=600,
+                                       creationflags=NO_WINDOW)
+                    out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    out = str(e)
+                for line in out.splitlines():
+                    if line.strip():
+                        ev(("log", line))
+                return out
+
+            # yt-dlp: обновляется сам
+            if os.path.isfile(YTDLP):
+                ev(("tools_progress", 0, "Обновляю yt-dlp…"))
+                out = run_tool([YTDLP, "-U"])
+                ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
+                ver = ver.group(0) if ver else ""
+                if "up to date" in out:
+                    results.append(f"yt-dlp — последняя версия {ver}".strip())
+                elif "Updated yt-dlp" in out:
+                    results.append(f"yt-dlp обновлён до {ver}".strip())
+                else:
+                    results.append("yt-dlp — не удалось обновить (см. журнал)")
+            # deno: тоже умеет обновляться сам
+            if DENO:
+                ev(("tools_progress", 0, "Обновляю deno…"))
+                out = run_tool([DENO, "upgrade"])
+                ver = re.search(r"\b(\d+\.\d+\.\d+)\b", out)
+                if "most recent" in out or "already" in out.lower():
+                    results.append("deno — последняя версия")
+                elif "Upgraded successfully" in out or "upgraded" in out.lower():
+                    results.append(f"deno обновлён{(' до ' + ver.group(1)) if ver else ''}")
+                else:
+                    results.append("deno — не удалось обновить (см. журнал)")
+            if FFMPEG:
+                results.append("ffmpeg на месте")
+            # чего нет — докачиваем в папку программы
+            for name in missing_tools():
+                try:
+                    install_tool(name, progress(name))
+                    results.append(f"{name} скачан")
+                    ev(("log", f"✓ {name} скачан в {BASE_DIR}"))
+                except Exception as e:
+                    results.append(f"{name} — не удалось скачать")
+                    ev(("log", f"Не удалось скачать {name}: {e}"))
+            refresh_tools()
+            ev(("updated", "✓ " + "   •   ".join(results)))
         threading.Thread(target=run, daemon=True).start()
 
     # ------------------------------------------------------------ обновление программы
@@ -1821,8 +1930,14 @@ class App(ctk.CTk):
                     if self.workers_alive == 0:
                         self._finish_batch()
                 elif kind == "updated":
+                    self._tools_busy = False
                     self.update_btn.configure(state="normal")
-                    self.set_main_status(e[1])
+                    self.progress.set(0)
+                    self.set_main_status(e[1], ACCENT if "не удалось" in e[1] else GREEN)
+                    self._check_tools()
+                elif kind == "tools_progress":
+                    self.progress.set(e[1])
+                    self.set_main_status(e[2])
                 elif kind == "update_check":
                     self._on_update_check(e[1], e[2], e[3])
                 elif kind == "history":
@@ -1898,6 +2013,14 @@ class App(ctk.CTk):
             except Exception:
                 pass
         self.destroy()
+
+    def _check_tools(self):
+        """Если в папке программы чего-то не хватает — предлагает докачать."""
+        missing = missing_tools()
+        if missing:
+            self.show_banner("В папке программы не хватает: " + ", ".join(missing) +
+                             ". Без них скачивание работать не будет.",
+                             "Скачать", self.update_ytdlp)
 
     # ------------------------------------------------------------ настройки
     def open_settings(self):

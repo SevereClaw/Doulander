@@ -97,25 +97,39 @@ if errorlevel 1 (
 echo   Downloader.exe обновлён
 
 :: ------------------------------------------------ 6. yt-dlp, ffmpeg, deno
+:: Что уже есть в папке — обновляется на месте, заново скачивается только недостающее.
 :tools
 echo.
-echo Проверяю yt-dlp, ffmpeg и deno...
-if not exist "%~dp0yt-dlp.exe" (
-    echo   Скачиваю yt-dlp...
-    curl.exe -L --fail --progress-bar -o "%~dp0yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-) else (
-    "%~dp0yt-dlp.exe" -U
-)
-if exist "%~dp0ffmpeg.exe" if exist "%~dp0ffprobe.exe" goto ffmpeg_ok
+echo Компоненты в папке программы:
+
+if exist "%~dp0yt-dlp.exe" goto ytdlp_update
+echo   yt-dlp — нет, скачиваю...
+curl.exe -L --fail --progress-bar -o "%~dp0yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+goto ffmpeg
+:ytdlp_update
+echo   yt-dlp — есть, обновляю на месте:
+"%~dp0yt-dlp.exe" -U
+
+:ffmpeg
+:: ffmpeg обновлять не нужно: если он есть, его не трогаем
+if not exist "%~dp0ffmpeg.exe" goto ffmpeg_get
+echo   ffmpeg — есть, обновлять не нужно
+goto deno
+:ffmpeg_get
 if not exist "%TMPD%" mkdir "%TMPD%"
-echo   Скачиваю ffmpeg...
+echo   ffmpeg — нет, скачиваю (около 150 МБ)...
 curl.exe -L --fail --progress-bar -o "%TMPD%\ffmpeg.zip" "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
 powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath (Join-Path $env:TMPD 'ffmpeg.zip') -DestinationPath (Join-Path $env:TMPD 'ffmpeg')"
 for /r "%TMPD%\ffmpeg" %%F in (ffmpeg.exe ffprobe.exe) do if exist "%%F" copy /y "%%F" "%~dp0" >nul
-:ffmpeg_ok
-if exist "%~dp0deno.exe" goto deno_ok
+
+:deno
+if not exist "%~dp0deno.exe" goto deno_get
+echo   deno — есть, обновляю на месте:
+"%~dp0deno.exe" upgrade
+goto deno_ok
+:deno_get
 if not exist "%TMPD%" mkdir "%TMPD%"
-echo   Скачиваю deno...
+echo   deno — нет, скачиваю...
 curl.exe -L --fail --progress-bar -o "%TMPD%\deno.zip" "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
 powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath (Join-Path $env:TMPD 'deno.zip') -DestinationPath (Join-Path $env:TMPD 'deno')"
 copy /y "%TMPD%\deno\deno.exe" "%~dp0deno.exe" >nul
