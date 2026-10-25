@@ -17,6 +17,7 @@
 |---|---|
 | `downloader.py` | Код программы |
 | `build.bat` | Сборка у себя на компьютере |
+| `update.bat` | Обновление программы из GitHub |
 | `.github/workflows/build.yml` | Автосборка на GitHub |
 
 ## Как получить готовую программу
@@ -40,3 +41,14 @@
 
 Нужен Python с галочкой «Add python.exe to PATH». Запусти `build.bat` —
 рядом появится папка `Downloader` с `Downloader.exe`, `yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe` и `deno.exe`.
+
+## Обновление
+
+Запусти `update.bat` из папки с программой. Он:
+
+1. скачает `Downloader.exe` из последней удачной сборки на GitHub (только его, ~15 МБ);
+2. обновит yt-dlp и докачает ffmpeg и deno, если их нет;
+3. при необходимости обновит и сам себя.
+
+Репозиторий закрытый, поэтому нужен [GitHub CLI](https://cli.github.com/).
+`update.bat` сам предложит его установить и один раз попросит войти в GitHub через браузер.

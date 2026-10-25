@@ -41,6 +41,7 @@ echo [2/5] Собираю Downloader.exe (минута-две)...
 if errorlevel 1 goto fail
 copy /y "%TMPD%\dist\Downloader.exe" "%OUT%\Downloader.exe" >nul
 if errorlevel 1 goto fail
+if exist "update.bat" copy /y "update.bat" "%OUT%\update.bat" >nul
 
 :: ------------------------------------------------ yt-dlp
 echo.
