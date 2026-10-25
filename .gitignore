@@ -2,6 +2,7 @@
 Downloader/
 build/
 dist/
+dist-setup/
 *.spec
 __pycache__/
 *.pyc

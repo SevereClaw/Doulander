@@ -11,11 +11,13 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import tkinter as tk
 import tempfile
+import urllib.parse
 import urllib.request
 import zipfile
 from tkinter import filedialog, messagebox
@@ -32,7 +34,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -156,7 +158,10 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
 HISTORY_LIMIT = 2000
-DEFAULT_FOLDER = os.path.join(BASE_DIR, "Downloads")
+# по умолчанию — «Загрузки\Downloader» пользователя (после установки программа лежит в AppData)
+_user_downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+DEFAULT_FOLDER = os.path.join(_user_downloads, "Downloader") if os.path.isdir(_user_downloads) \
+    else os.path.join(BASE_DIR, "Downloads")
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0   # не показывать чёрные окна консоли
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -228,6 +233,17 @@ EXAMPLE_FIELDS = {"title": "Название видео", "uploader": "Кана�
                   "playlist_title": "Плейлист", "extractor_key": "Youtube", "ext": "mp4"}
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
+# ---------- прокси (например, от VPN-программы)
+PROXY_MODES = ["Нет", "Только YouTube", "Все сайты"]
+YOUTUBE_HOST = re.compile(r"(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com|ytimg\.com|"
+                          r"googlevideo\.com)$", re.I)
+# порты, на которых обычно открывают локальный прокси VPN-программы
+PROXY_PORTS = [
+    (10808, "v2rayN"), (10809, "v2rayN"), (2080, "Nekoray / Nekobox"), (12334, "Hiddify"),
+    (7890, "Clash"), (7897, "Clash Verge"), (7891, "Clash"), (20170, "v2rayA"),
+    (20171, "v2rayA"), (1080, "прокси"), (1081, "прокси"), (8889, "прокси"), (9050, "Tor"),
+]
+
 DEFAULTS = {
     "folder": DEFAULT_FOLDER,
     "mode": "Видео",
@@ -257,6 +273,8 @@ DEFAULTS = {
     "square_cover": True,   # музыка: квадратная обложка
     "normalize": False,     # музыка: выравнивать громкость
     "lyrics": False,        # музыка: тексты песен (.lrc рядом с треком)
+    "proxy_mode": "Нет",    # Нет / Только YouTube / Все сайты
+    "proxy": "",            # например socks5://127.0.0.1:10808
 }
 
 ACCENT = "#E5484D"
@@ -362,6 +380,77 @@ def load_queue():
         return []
 
 
+def normalize_proxy(text):
+    """«127.0.0.1:10808» -> «socks5://127.0.0.1:10808». Пусто -> ""."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "socks5://" + text
+    return text
+
+
+def is_youtube(url):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return bool(YOUTUBE_HOST.search(host))
+
+
+def detect_local_proxy():
+    """Ищет запущенный локальный прокси VPN-программы. Возвращает (адрес, название) или None."""
+    for port, name in PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3) as c:
+                c.settimeout(1)
+                c.sendall(b"\x05\x01\x00")                 # приветствие SOCKS5
+                if c.recv(2) == b"\x05\x00":
+                    return f"socks5://127.0.0.1:{port}", name
+        except OSError:
+            pass
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3) as c:
+                c.settimeout(2)
+                c.sendall(b"CONNECT www.youtube.com:443 HTTP/1.1\r\n"
+                          b"Host: www.youtube.com:443\r\n\r\n")
+                if c.recv(64).startswith(b"HTTP/1."):
+                    return f"http://127.0.0.1:{port}", name
+        except OSError:
+            pass
+    return None
+
+
+def url_opener(proxy=None):
+    """urllib с прокси (http или socks) — для обложек и проверки связи."""
+    if not proxy:
+        return urllib.request.build_opener()
+    parts = urllib.parse.urlsplit(proxy)
+    if parts.scheme.startswith("socks"):
+        try:
+            import socks
+            from sockshandler import SocksiPyHandler
+        except ImportError:
+            return urllib.request.build_opener()
+        kind = socks.SOCKS4 if parts.scheme.startswith("socks4") else socks.SOCKS5
+        return urllib.request.build_opener(SocksiPyHandler(
+            kind, parts.hostname, parts.port or 1080, rdns=True,
+            username=parts.username, password=parts.password))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+
+
+def check_youtube(proxy=None):
+    """Открывается ли YouTube (через прокси или напрямую). Возвращает (ok, текст)."""
+    try:
+        req = urllib.request.Request("https://www.youtube.com/generate_204",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        with url_opener(proxy).open(req, timeout=10) as r:
+            ok = r.status in (200, 204)
+            return ok, "YouTube открывается" if ok else f"ответ {r.status}"
+    except Exception as e:
+        return False, str(getattr(e, "reason", e))[:120]
+
+
 def parse_time(text):
     """'1:20', '01:02:03', '80', '1:20.5' -> секунды. Пусто -> None. Ошибка -> ValueError."""
     text = text.strip().replace(",", ".")
@@ -424,6 +513,8 @@ def common_args(opts=None):
     args = []
     if opts and opts.get("cookies"):
         args += opts["cookies"]
+    if opts and opts.get("proxy_url"):
+        args += ["--proxy", opts["proxy_url"]]
     if FFMPEG:
         args += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
     if DENO:
@@ -578,10 +669,10 @@ def summarize(info, opts):
             "thumb": pick_thumbnail(info)}
 
 
-def load_thumbnail(url):
+def load_thumbnail(url, proxy=None):
     """Скачивает обложку и делает из неё картинку 16:9 со скруглёнными углами."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with url_opener(proxy).open(req, timeout=10) as r:
         img = Image.open(io.BytesIO(r.read())).convert("RGB")
     w, h = THUMB_W * 2, THUMB_H * 2            # вдвое больше — чётче на экранах с масштабом
     src_ratio, dst_ratio = img.width / img.height, w / h
@@ -771,9 +862,19 @@ def finalize_chapters(files):
     return result
 
 
-def explain_error(err, code):
+NET_ERRORS = ("timed out", "timeout", "connection", "unable to download webpage", "getaddrinfo",
+              "ssl", "remote end closed", "unreachable", "reset by peer", "proxy")
+
+
+def explain_error(err, code, url="", proxy=None):
     """Короткое понятное описание ошибки yt-dlp."""
     low = err.lower()
+    if any(k in low for k in NET_ERRORS):
+        if proxy:
+            return "Прокси не отвечает — проверьте, что VPN-программа запущена (⚙ → Сеть)"
+        if is_youtube(url):
+            return "YouTube не открывается напрямую — включите прокси: ⚙ Настройки → Сеть"
+        return "Нет связи с сайтом — проверьте интернет"
     if "cookie" in low:
         return ("Не удалось взять cookies: закройте браузер полностью "
                 "или выберите Firefox / файл cookies.txt")
@@ -1142,6 +1243,27 @@ class SettingsWindow(ctk.CTkToplevel):
         self.hint("Тексты берутся из субтитров клипа — они есть не у всех видео. "
                   "Выравнивание громкости заново кодирует трек, это занимает несколько секунд.")
 
+        self.section("Сеть — если YouTube открывается только с VPN")
+        line = self.line()
+        ctk.CTkLabel(line, text="Прокси:").pack(side="left")
+        ctk.CTkOptionMenu(line, values=PROXY_MODES, width=160, variable=app.v_proxy_mode,
+                          command=lambda _: app._save()).pack(side="left", padx=8)
+        line = self.line()
+        self.proxy_entry = ctk.CTkEntry(line, textvariable=app.v_proxy, width=250, height=32,
+                                        placeholder_text="socks5://127.0.0.1:10808")
+        self.proxy_entry.pack(side="left")
+        self.proxy_entry.bind("<FocusOut>", lambda e: app._save())
+        ctk.CTkButton(line, text="Найти", width=80, height=32,
+                      command=self.find_proxy).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(line, text="Проверить", width=100, height=32, fg_color="transparent",
+                      border_width=1, text_color=("gray20", "gray80"),
+                      command=self.test_proxy).pack(side="left", padx=(8, 0))
+        self.proxy_result = self.hint("")
+        self.hint("VPN-программы (v2rayN, Hiddify, Nekoray, Clash и др.) открывают на компьютере "
+                  "локальный прокси. Через него программа будет качать с YouTube, а остальные "
+                  "сайты — напрямую. VPN-программа должна быть запущена, но включать VPN для "
+                  "всего компьютера не обязательно. «Найти» ищет такой прокси сама.")
+
         self.section("Папки и имена файлов")
         line = self.line()
         ctk.CTkLabel(line, text="Раскладывать:").pack(side="left")
@@ -1201,6 +1323,48 @@ class SettingsWindow(ctk.CTkToplevel):
                            text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
         lbl.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(0, 4))
         return lbl
+
+    def find_proxy(self):
+        self.proxy_result.configure(text="Ищу прокси VPN-программы…", text_color=GRAY_TEXT)
+
+        def run():
+            found = detect_local_proxy()
+            self.after(0, lambda: self._proxy_found(found))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _proxy_found(self, found):
+        if not self.winfo_exists():
+            return
+        if not found:
+            self.proxy_result.configure(
+                text="Не нашёл. Запустите VPN-программу и посмотрите в её настройках порт "
+                     "«SOCKS» или «Mixed» — впишите его, например 127.0.0.1:10808.",
+                text_color=ACCENT)
+            return
+        addr, name = found
+        self.app.v_proxy.set(addr)
+        if self.app.v_proxy_mode.get() == "Нет":
+            self.app.v_proxy_mode.set("Только YouTube")
+        self.app._save()
+        self.proxy_result.configure(text=f"Найден: {addr} ({name}). Проверяю YouTube…",
+                                    text_color=GRAY_TEXT)
+        self.test_proxy()
+
+    def test_proxy(self):
+        self.app._save()
+        proxy = self.app.settings.get("proxy")
+        self.proxy_result.configure(text="Проверяю, открывается ли YouTube…", text_color=GRAY_TEXT)
+
+        def run():
+            ok, text = check_youtube(proxy or None)
+            msg = ("✓ " if ok else "✕ ") + text + \
+                (f" через {proxy}" if proxy else " напрямую, без прокси")
+            self.after(0, lambda: self._show_proxy_result(msg, ok))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_proxy_result(self, msg, ok):
+        if self.winfo_exists():
+            self.proxy_result.configure(text=msg, text_color=GREEN if ok else ACCENT)
 
     def update_layout(self):
         custom = self.app.v_name.get() == "Свой шаблон"
@@ -1297,6 +1461,8 @@ class App(ctk.CTk):
         self.v_square = B(value=s["square_cover"])
         self.v_normalize = B(value=s["normalize"])
         self.v_lyrics = B(value=s["lyrics"])
+        self.v_proxy_mode = S(value=s["proxy_mode"] if s["proxy_mode"] in PROXY_MODES else "Нет")
+        self.v_proxy = S(value=s["proxy"])
         self.v_cookies = S(value=s["cookies"] if s["cookies"] in COOKIE_SOURCES else "Нет")
         self.v_org = S(value=s["organize"] if s["organize"] in ORGANIZE else "Не раскладывать")
         self.v_name = S(value=s["name_template"] if s["name_template"] in NAME_TEMPLATES
@@ -1644,7 +1810,9 @@ class App(ctk.CTk):
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
                              chapters=self.v_chapters.get(),
                              square_cover=self.v_square.get(),
-                             normalize=self.v_normalize.get(), lyrics=self.v_lyrics.get())
+                             normalize=self.v_normalize.get(), lyrics=self.v_lyrics.get(),
+                             proxy_mode=self.v_proxy_mode.get(),
+                             proxy=normalize_proxy(self.v_proxy.get()))
         save_settings(self.settings)
 
     def current_opts(self):
@@ -1776,7 +1944,8 @@ class App(ctk.CTk):
                 return
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
             try:
-                p = subprocess.run(preview_command(item.url, item.opts), capture_output=True,
+                opts = dict(item.opts, proxy_url=self.proxy_for(item.url))
+                p = subprocess.run(preview_command(item.url, opts), capture_output=True,
                                    cwd=BASE_DIR, env=env, timeout=90,
                                    creationflags=NO_WINDOW)
                 info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
@@ -1798,7 +1967,8 @@ class App(ctk.CTk):
             self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
         if s.get("thumb"):
             try:
-                self.events.put(("thumb", item, load_thumbnail(s["thumb"])))
+                self.events.put(("thumb", item, load_thumbnail(s["thumb"],
+                                                                self.proxy_for(s["thumb"]))))
             except Exception as e:
                 self.events.put(("log", f"Обложка {item.url}: {e}"))
 
@@ -1946,7 +2116,8 @@ class App(ctk.CTk):
         ev = self.events.put
         ev(("state", item, "run"))
         ev(("item_status", item, "Подготовка…", None))
-        cmd = build_command(item.url, item.opts, self.settings["folder"],
+        proxy = self.proxy_for(item.url)
+        cmd = build_command(item.url, dict(item.opts, proxy_url=proxy), self.settings["folder"],
                             self.settings.get("fragments", 8))
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         try:
@@ -2018,7 +2189,7 @@ class App(ctk.CTk):
             ev(("item_status", item, "✓ Готово", GREEN))
             return True
         ev(("state", item, "error"))
-        ev(("item_status", item, explain_error(last_error, code), ACCENT))
+        ev(("item_status", item, explain_error(last_error, code, item.url, proxy), ACCENT))
         return False
 
     def update_ytdlp(self):
@@ -2287,6 +2458,15 @@ class App(ctk.CTk):
                 pass
         self.destroy()
 
+    def proxy_for(self, url):
+        """Адрес прокси для этой ссылки или None."""
+        mode, proxy = self.settings.get("proxy_mode"), self.settings.get("proxy")
+        if not proxy or mode == "Нет":
+            return None
+        if mode == "Все сайты" or is_youtube(url):
+            return proxy
+        return None
+
     def _check_tools(self):
         """Если в папке программы чего-то не хватает — предлагает докачать."""
         missing = missing_tools()
@@ -2460,7 +2640,7 @@ def measure_loudness(path):
     return float(vals[-1]) if vals else None
 
 
-def selftest(url, out_dir, page_url=None):
+def selftest(url, out_dir, page_url=None, proxy_url=None):
     """Downloader.exe --selftest URL ПАПКА [СТРАНИЦА] — проверка сборки на GitHub.
     Открывает окно, затем качает URL в разных форматах. СТРАНИЦА — «клип» с обложкой
     и субтитрами для проверки музыкальных функций. Код выхода 0 — всё хорошо."""
@@ -2541,6 +2721,25 @@ def selftest(url, out_dir, page_url=None):
             failed += 1
             log(f"FAIL {name}: {e!r}")
 
+    # 2б. скачивание через прокси (как у пользователей с VPN-программой)
+    if proxy_url:
+        folder = os.path.join(out_dir, "proxy")
+        opts = dict(base, mode="Видео", quality="720p", fmt="MP4", proxy_url=proxy_url)
+        try:
+            p = subprocess.run(build_command(url, opts, folder), capture_output=True,
+                               timeout=300, env=env, creationflags=NO_WINDOW)
+            files = os.listdir(folder) if os.path.isdir(folder) else []
+            ok = p.returncode == 0 and any(f.endswith(".mp4") for f in files)
+            failed += 0 if ok else 1
+            log(f"{'OK  ' if ok else 'FAIL'} через прокси {proxy_url}: код {p.returncode}, "
+                f"файлы {files}")
+            if not ok:
+                out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+                log("\n".join("      " + ln for ln in out.splitlines()[-15:]))
+        except Exception as e:
+            failed += 1
+            log(f"FAIL через прокси: {e!r}")
+
     # 3. музыка: квадратная обложка, громкость, тексты
     if page_url:
         opts = dict(base, mode="Аудио", quality="Лучшее", fmt="MP3",
@@ -2588,5 +2787,6 @@ def selftest(url, out_dir, page_url=None):
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":
-        sys.exit(selftest(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None))
+        extra = sys.argv[4:] + [None, None]
+        sys.exit(selftest(sys.argv[2], sys.argv[3], extra[0] or None, extra[1] or None))
     App().mainloop()

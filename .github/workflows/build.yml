@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Установить библиотеки
-        run: pip install customtkinter pillow tkinterdnd2 pystray pyinstaller
+        run: pip install customtkinter pillow tkinterdnd2 pystray pysocks pyinstaller
 
       - name: Вписать номер сборки
         shell: pwsh
@@ -32,7 +32,7 @@ jobs:
           Select-String -Path downloader.py -Pattern '^BUILD_ID'
 
       - name: Собрать Downloader.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --collect-data customtkinter downloader.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter downloader.py
 
       - name: Скачать yt-dlp, ffmpeg и deno
         shell: pwsh
@@ -68,10 +68,15 @@ jobs:
           Downloader/ffmpeg.exe -loglevel error -f lavfi -i testsrc=size=1280x720 -frames:v 1 -y testdata/thumb.jpg
           Copy-Item tests/clip.html, tests/lyrics.vtt testdata/
           $srv = Start-Process python -ArgumentList 'tests/range_server.py','testdata','8765' -PassThru -WindowStyle Hidden
+          $prx = Start-Process python -ArgumentList 'tests/proxy_server.py','8899',"$PWD\proxy-hits.log" -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 2
-          $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','http://127.0.0.1:8765/test.mp4',"$PWD\selftest",'http://127.0.0.1:8765/clip.html' -Wait -PassThru
-          Stop-Process $srv -ErrorAction SilentlyContinue
-          ./tests/report.ps1 selftest/selftest.log "Самопроверка" $p.ExitCode
+          $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','http://127.0.0.1:8765/test.mp4',"$PWD\selftest",'http://127.0.0.1:8765/clip.html','http://127.0.0.1:8899' -Wait -PassThru
+          Stop-Process $srv, $prx -ErrorAction SilentlyContinue
+          $hits = @(Get-Content proxy-hits.log -ErrorAction SilentlyContinue).Count
+          Add-Content selftest/selftest.log "Запросов через тестовый прокси: $hits"
+          $code = $p.ExitCode
+          if ($hits -eq 0) { Add-Content selftest/selftest.log "FAIL прокси не использовался"; $code = 1 }
+          ./tests/report.ps1 selftest/selftest.log "Самопроверка" $code
 
       # YouTube иногда не пускает серверы GitHub, поэтому эта проверка только для информации.
       - name: Проверка YouTube (необязательная)
@@ -81,6 +86,41 @@ jobs:
         run: |
           $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','https://www.youtube.com/watch?v=jNQXAC9IVRw',"$PWD\selftest-yt" -Wait -PassThru
           ./tests/report.ps1 selftest-yt/selftest.log "Проверка YouTube" $p.ExitCode
+
+      - name: Собрать установщик
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y | Out-Null
+          $ver = (Select-String -Path downloader.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" installer/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Установщик не собрался" }
+          Get-Item dist-setup/DownloaderSetup.exe | Format-List Name, Length
+
+      # Ставим программу «как пользователь», проверяем файлы, ярлык и запись в
+      # «Установка и удаление программ», затем удаляем.
+      - name: Проверить установщик
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process dist-setup/DownloaderSetup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Downloader'
+          $ok = $p.ExitCode -eq 0
+          $report = @("Установка в $app : код $($p.ExitCode)")
+          function Check($name, $cond) { $script:ok = $script:ok -and $cond; $script:report += "$(if ($cond) {'OK  '} else {'FAIL'}) $name" }
+          foreach ($f in 'Downloader.exe','yt-dlp.exe','ffmpeg.exe','deno.exe','update.bat','unins000.exe') { Check $f (Test-Path (Join-Path $app $f)) }
+          Check 'запись в «Установка и удаление программ»' (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A1E-5B7D-4E9A-9C1B-D0A1E2F3B4C5}_is1')
+          Check 'ярлык в «Пуске»' (Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'Downloader.lnk'))
+          Start-Process (Join-Path $app 'unins000.exe') -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $app 'Downloader.exe')); $i++) { Start-Sleep -Seconds 1 }
+          Check 'удаление программы' (-not (Test-Path (Join-Path $app 'Downloader.exe')))
+          $report | Set-Content setup-test.log -Encoding utf8
+          ./tests/report.ps1 setup-test.log "Проверка установщика" $(if ($ok) { 0 } else { 1 })
+
+      - name: Сохранить установщик
+        uses: actions/upload-artifact@v5
+        with:
+          name: DownloaderSetup
+          path: dist-setup/DownloaderSetup.exe
 
       - name: Сохранить полную сборку (вкладка Actions → Artifacts)
         uses: actions/upload-artifact@v5
@@ -99,6 +139,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist-setup/DownloaderSetup.exe
             Downloader.zip
             app/Downloader.exe
             app/update.bat
