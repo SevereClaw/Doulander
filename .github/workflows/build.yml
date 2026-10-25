@@ -15,9 +15,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -68,8 +68,7 @@ jobs:
           Start-Sleep -Seconds 2
           $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','http://127.0.0.1:8765/test.mp4',"$PWD\selftest" -Wait -PassThru
           Stop-Process $srv -ErrorAction SilentlyContinue
-          Get-Content selftest/selftest.log
-          if ($p.ExitCode -ne 0) { throw "Самопроверка не прошла (код $($p.ExitCode))" }
+          ./tests/report.ps1 selftest/selftest.log "Самопроверка" $p.ExitCode
 
       # YouTube иногда не пускает серверы GitHub, поэтому эта проверка только для информации.
       - name: Проверка YouTube (необязательная)
@@ -78,8 +77,7 @@ jobs:
         timeout-minutes: 8
         run: |
           $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','https://www.youtube.com/watch?v=jNQXAC9IVRw',"$PWD\selftest-yt" -Wait -PassThru
-          Get-Content selftest-yt/selftest.log
-          if ($p.ExitCode -ne 0) { throw "YouTube не скачался — подробности выше" }
+          ./tests/report.ps1 selftest-yt/selftest.log "Проверка YouTube" $p.ExitCode
 
       - name: Сохранить полную сборку (вкладка Actions → Artifacts)
         uses: actions/upload-artifact@v4
