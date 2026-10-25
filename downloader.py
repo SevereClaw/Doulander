@@ -37,7 +37,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -1058,7 +1058,9 @@ class QueueItem(ctk.CTkFrame):
 
         self.bar = ctk.CTkProgressBar(self, height=4, progress_color=ACCENT)
         self.bar.set(0)
-        self.bar.grid(row=3, column=1, sticky="ew", pady=(2, 8))
+        self.bar.grid(row=3, column=1, sticky="ew", pady=(2, 0))
+        # отступ снизу — чтобы текст не закрывал рамку карточки, когда полоски нет
+        self.grid_rowconfigure(4, minsize=10)
         self.bar.grid_remove()
 
         small = dict(width=30, height=30, fg_color="transparent",
