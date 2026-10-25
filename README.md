@@ -1,4 +1,4 @@
-# Downloader
+# Doulander (Downloader)
 
 Программа с окном для скачивания видео и музыки с YouTube, VK, TikTok и ещё 1000+ сайтов.
 Работает на [yt-dlp](https://github.com/yt-dlp/yt-dlp), интерфейс — [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter).
