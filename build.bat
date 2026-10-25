@@ -32,12 +32,12 @@ if not defined PY (
 
 echo.
 echo [1/5] Устанавливаю библиотеки Python...
-%PY% -m pip install --upgrade customtkinter pyinstaller
+%PY% -m pip install --upgrade customtkinter pillow pyinstaller
 if errorlevel 1 goto fail
 
 echo.
 echo [2/5] Собираю Downloader.exe (минута-две)...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --name Downloader --collect-data customtkinter --distpath "%TMPD%\dist" --workpath "%TMPD%\build" --specpath "%TMPD%" downloader.py
+%PY% -m PyInstaller --noconfirm --onefile --windowed --name Downloader --icon "%~dp0icon.ico" --add-data "%~dp0icon.ico;." --add-data "%~dp0icon.png;." --collect-data customtkinter --distpath "%TMPD%\dist" --workpath "%TMPD%\build" --specpath "%TMPD%" downloader.py
 if errorlevel 1 goto fail
 copy /y "%TMPD%\dist\Downloader.exe" "%OUT%\Downloader.exe" >nul
 if errorlevel 1 goto fail

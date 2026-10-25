@@ -2,6 +2,7 @@
 title Обновление Downloader
 chcp 65001 >nul
 cd /d "%~dp0"
+:: Запуск из программы: update.bat /auto — без вопросов, в конце сразу открывает Downloader
 
 set "REPO=SevereClaw/Doulander"
 set "TMPD=%TEMP%\downloader_update"
@@ -124,8 +125,10 @@ echo.
 echo ==========================================
 echo  Готово!
 echo ==========================================
+if /i "%~1"=="/auto" goto launch
 choice /c YN /m "Запустить Downloader"
 if errorlevel 2 goto selfupdate
+:launch
 start "" "%~dp0Downloader.exe"
 
 :selfupdate

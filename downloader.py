@@ -4,6 +4,7 @@ Downloader — графическая оболочка для yt-dlp на Custom
 Лежит в одной папке с yt-dlp.exe, ffmpeg.exe и deno.exe.
 Настройки хранятся в settings.json рядом с программой.
 """
+import io
 import json
 import os
 import queue
@@ -13,15 +14,24 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.request
 from tkinter import filedialog
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw
+
+APP_VERSION = "1.1.0"
+BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
+REPO = "SevereClaw/Doulander"
 
 # ---------------------------------------------------------------- пути
 if getattr(sys, "frozen", False):           # запущено как .exe
     BASE_DIR = os.path.dirname(sys.executable)
 else:                                       # запущено как .py
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)   # где лежат вшитые в exe файлы (иконка)
+ICON_ICO = os.path.join(RES_DIR, "icon.ico")
+ICON_PNG = os.path.join(RES_DIR, "icon.png")
 
 
 def find_tool(name):
@@ -33,6 +43,18 @@ def find_tool(name):
         if os.path.isfile(path):
             return path
     return shutil.which(name)
+
+
+def find_gh():
+    path = shutil.which("gh")
+    if path:
+        return path
+    for root in (os.environ.get("ProgramFiles", ""), os.environ.get("LOCALAPPDATA", "")):
+        for sub in ("GitHub CLI", os.path.join("Programs", "GitHub CLI")):
+            p = os.path.join(root, sub, "gh.exe")
+            if root and os.path.isfile(p):
+                return p
+    return None
 
 
 def launch_error_text(err):
@@ -60,6 +82,7 @@ DEFAULT_FOLDER = os.path.join(BASE_DIR, "Downloads")
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0   # не показывать чёрные окна консоли
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+URL_RE = re.compile(r"^https?://[^\s/]+\.[^\s]+$")
 
 VIDEO_QUALITIES = {
     "Лучшее": None,
@@ -70,11 +93,11 @@ VIDEO_QUALITIES = {
     "480p": 480,
     "360p": 360,
 }
-AUDIO_QUALITIES = {
-    "Лучшее": "0",
-    "320 kbps": "320K",
-    "192 kbps": "192K",
-    "128 kbps": "128K",
+AUDIO_QUALITIES = {          # качество для yt-dlp и примерный битрейт для оценки размера
+    "Лучшее": ("0", 245),
+    "320 kbps": ("320K", 320),
+    "192 kbps": ("192K", 192),
+    "128 kbps": ("128K", 128),
 }
 PARALLEL_CHOICES = ["1", "2", "3", "4", "5"]
 
@@ -89,14 +112,15 @@ DEFAULTS = {
     "theme": "dark",
     "parallel": "3",        # сколько ссылок качать одновременно
     "fragments": 8,         # сколько кусков одного видео качать параллельно
+    "clip_watch": False,    # ловить ссылки из буфера обмена
+    "check_updates": True,  # проверять обновления при запуске
 }
-
-APP_VERSION = "1.0.0"
 
 ACCENT = "#E5484D"
 ACCENT_HOVER = "#C93C41"
 GREEN = ("#1a7f37", "#3fb950")
 GRAY_TEXT = ("gray40", "gray60")
+THUMB_W, THUMB_H = 128, 72
 
 # Коды клавиш Windows не зависят от раскладки: V=86, C=67, X=88, A=65
 CTRL_KEYCODES = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
@@ -120,8 +144,26 @@ def save_settings(s):
         pass
 
 
+# ---------------------------------------------------------------- команды yt-dlp
+def format_args(opts):
+    if opts["mode"] == "Аудио":
+        return ["-f", "ba/b"]
+    h = VIDEO_QUALITIES[opts["quality"]]
+    sort = f"res:{h},ext:mp4:m4a" if h else "res,ext:mp4:m4a"
+    return ["-f", "bv*+ba/b", "-S", sort]
+
+
+def common_args():
+    args = []
+    if FFMPEG:
+        args += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
+    if DENO:
+        args += ["--js-runtimes", f"deno:{DENO}"]
+    return args
+
+
 def build_command(url, opts, folder, fragments=8):
-    """Собирает команду yt-dlp для одной ссылки."""
+    """Команда для скачивания одной ссылки."""
     cmd = [
         YTDLP, url,
         "-P", folder,
@@ -136,31 +178,110 @@ def build_command(url, opts, folder, fragments=8):
         "--retries", "10", "--fragment-retries", "10",
         "--socket-timeout", "15",
     ]
-
     if opts["playlist"]:
         # плейлист складывается в отдельную папку с его названием
-        cmd += ["--yes-playlist",
-                "-o", "%(playlist_title&{}/|)s%(title)s.%(ext)s"]
+        cmd += ["--yes-playlist", "-o", "%(playlist_title&{}/|)s%(title)s.%(ext)s"]
     else:
         cmd += ["--no-playlist", "-o", "%(title)s.%(ext)s"]
 
+    cmd += format_args(opts)
     if opts["mode"] == "Аудио":
         cmd += ["-x", "--audio-format", "mp3",
-                "--audio-quality", AUDIO_QUALITIES[opts["quality"]]]
+                "--audio-quality", AUDIO_QUALITIES[opts["quality"]][0]]
     else:
-        h = VIDEO_QUALITIES[opts["quality"]]
-        sort = f"res:{h},ext:mp4:m4a" if h else "res,ext:mp4:m4a"
-        cmd += ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
+        cmd += ["--merge-output-format", "mp4"]
         if opts["subs"]:
             cmd += ["--write-subs", "--sub-langs", "ru.*,en.*", "--embed-subs"]
-
     if opts["embed"]:
         cmd += ["--embed-thumbnail", "--embed-metadata"]
-    if FFMPEG:
-        cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
-    if DENO:
-        cmd += ["--js-runtimes", f"deno:{DENO}"]
-    return cmd
+    return cmd + common_args()
+
+
+def preview_command(url, opts):
+    """Команда, которая только получает информацию о видео (без скачивания)."""
+    cmd = [YTDLP, url, "-J", "--no-warnings", "--socket-timeout", "15"]
+    if opts["playlist"]:
+        cmd += ["--yes-playlist", "--flat-playlist"]
+    else:
+        cmd += ["--no-playlist"]
+    return cmd + format_args(opts) + common_args()
+
+
+# ---------------------------------------------------------------- превью
+def human_size(n):
+    if not n:
+        return None
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.0f} {unit}" if unit in ("Б", "КБ") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def human_duration(sec):
+    if not sec:
+        return None
+    sec = int(sec)
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def pick_thumbnail(info):
+    thumbs = [t for t in (info.get("thumbnails") or []) if t.get("url")]
+    sized = sorted((t for t in thumbs if t.get("width")), key=lambda t: t["width"])
+    for t in sized:
+        if t["width"] >= 320:
+            return t["url"]
+    if sized:
+        return sized[-1]["url"]
+    return info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+
+
+def summarize(info, opts):
+    """Достаёт из ответа yt-dlp то, что показываем в карточке."""
+    if info.get("_type") == "playlist":
+        n = info.get("playlist_count") or len(info.get("entries") or [])
+        parts = ["Плейлист", f"{n} видео", info.get("uploader") or info.get("channel")]
+        entries = info.get("entries") or [{}]
+        return {"title": info.get("title") or "Плейлист",
+                "meta": "   •   ".join(p for p in parts if p),
+                "thumb": pick_thumbnail(info) or pick_thumbnail(entries[0] or {})}
+
+    duration = info.get("duration")
+    if opts["mode"] == "Аудио":
+        kbps = AUDIO_QUALITIES[opts["quality"]][1]
+        size = duration * kbps * 125 if duration else None
+        quality = "MP3"
+    else:
+        formats = info.get("requested_formats") or [info]
+        size = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in formats)
+        h = info.get("height") or max((f.get("height") or 0) for f in formats)
+        quality = f"{h}p" if h else None
+    size_text = human_size(size)
+    parts = [info.get("uploader") or info.get("channel"), human_duration(duration),
+             f"≈ {size_text}" if size_text else None, quality]
+    return {"title": info.get("title"),
+            "meta": "   •   ".join(p for p in parts if p),
+            "thumb": pick_thumbnail(info)}
+
+
+def load_thumbnail(url):
+    """Скачивает обложку и делает из неё картинку 16:9 со скруглёнными углами."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        img = Image.open(io.BytesIO(r.read())).convert("RGB")
+    w, h = THUMB_W * 2, THUMB_H * 2            # вдвое больше — чётче на экранах с масштабом
+    src_ratio, dst_ratio = img.width / img.height, w / h
+    if src_ratio > dst_ratio:                  # обрезаем лишнее по краям
+        nw = int(img.height * dst_ratio)
+        img = img.crop(((img.width - nw) // 2, 0, (img.width + nw) // 2, img.height))
+    else:
+        nh = int(img.width / dst_ratio)
+        img = img.crop((0, (img.height - nh) // 2, img.width, (img.height + nh) // 2))
+    img = img.resize((w, h), Image.LANCZOS).convert("RGBA")
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=16, fill=255)
+    img.putalpha(mask)
+    return img
 
 
 def kill_tree(proc):
@@ -185,28 +306,33 @@ class QueueItem(ctk.CTkFrame):
         self.batch = False           # входит в текущую пачку загрузок
         self.last_text = ""
         self.file_path = None
+        self.thumb_image = None
 
         self.grid_columnconfigure(1, weight=1)
 
-        tag = "MP3" if opts["mode"] == "Аудио" else opts["quality"].split(" ")[0]
+        self.tag = "MP3" if opts["mode"] == "Аудио" else opts["quality"].split(" ")[0]
         if opts["playlist"]:
-            tag += " · плейлист"
-        self.badge = ctk.CTkLabel(self, text=tag, width=86, corner_radius=6,
-                                  fg_color=("gray80", "gray25"),
+            self.tag += " · плейлист"
+        self.thumb = ctk.CTkLabel(self, text=self.tag, width=THUMB_W, height=THUMB_H,
+                                  corner_radius=8, fg_color=("gray80", "gray25"),
                                   font=ctk.CTkFont(size=12, weight="bold"))
-        self.badge.grid(row=0, column=0, rowspan=3, padx=(10, 10), pady=8)
+        self.thumb.grid(row=0, column=0, rowspan=4, padx=(8, 12), pady=8)
 
         self.title_lbl = ctk.CTkLabel(self, text=url, anchor="w",
-                                      font=ctk.CTkFont(size=13))
+                                      font=ctk.CTkFont(size=13, weight="bold"))
         self.title_lbl.grid(row=0, column=1, sticky="ew", pady=(8, 0))
+
+        self.meta_lbl = ctk.CTkLabel(self, text="Получаю информацию…", anchor="w",
+                                     text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
+        self.meta_lbl.grid(row=1, column=1, sticky="ew")
 
         self.status_lbl = ctk.CTkLabel(self, text="В очереди", anchor="w",
                                        text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
-        self.status_lbl.grid(row=1, column=1, sticky="ew")
+        self.status_lbl.grid(row=2, column=1, sticky="ew")
 
         self.bar = ctk.CTkProgressBar(self, height=4, progress_color=ACCENT)
         self.bar.set(0)
-        self.bar.grid(row=2, column=1, sticky="ew", pady=(2, 10))
+        self.bar.grid(row=3, column=1, sticky="ew", pady=(2, 8))
         self.bar.grid_remove()
 
         self.btn = ctk.CTkButton(self, text="✕", width=30, height=30,
@@ -214,10 +340,19 @@ class QueueItem(ctk.CTkFrame):
                                  hover_color=("gray80", "gray28"),
                                  text_color=("gray30", "gray70"),
                                  command=self.on_button)
-        self.btn.grid(row=0, column=2, rowspan=3, padx=8)
+        self.btn.grid(row=0, column=2, rowspan=4, padx=8)
 
     def set_title(self, text):
-        self.title_lbl.configure(text=text if len(text) < 70 else text[:67] + "…")
+        if text:
+            self.title_lbl.configure(text=text if len(text) < 64 else text[:61] + "…")
+
+    def set_meta(self, text, color=None):
+        self.meta_lbl.configure(text=text, text_color=color or GRAY_TEXT)
+
+    def set_thumb(self, pil_image):
+        self.thumb_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image,
+                                        size=(THUMB_W, THUMB_H))
+        self.thumb.configure(image=self.thumb_image, text="", fg_color="transparent")
 
     def set_status(self, text, color=None):
         self.last_text = text
@@ -256,9 +391,15 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
         super().__init__()
 
-        self.title(f"Downloader {APP_VERSION}")
-        self.geometry("800x700")
-        self.minsize(660, 580)
+        build = f" (сборка {BUILD_ID})" if BUILD_ID else ""
+        self.title(f"Downloader {APP_VERSION}{build}")
+        self.geometry("840x760")
+        self.minsize(780, 620)
+        if os.path.isfile(ICON_ICO):
+            try:
+                self.iconbitmap(ICON_ICO)
+            except tk.TclError:
+                pass
 
         self.items = []
         self.events = queue.Queue()
@@ -267,14 +408,20 @@ class App(ctk.CTk):
         self.workers_alive = 0
         self.batch_ok = self.batch_fail = 0
         self.cancel_flag = threading.Event()
+        self.preview_slots = threading.Semaphore(3)   # не больше 3 превью одновременно
+        self._last_clip = self._read_clipboard()
 
         self._build_ui()
         self._apply_mode()
         self._setup_clipboard_keys()
         self.after(100, self._poll_events)
         self.after(300, self._autopaste)
+        self.after(700, self._watch_clipboard)
+        if self.settings["check_updates"] and getattr(sys, "frozen", False):
+            self.after(2000, lambda: self.check_updates(manual=False))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self.log(f"Downloader {APP_VERSION}{build}")
         self.log(f"Папка программы: {BASE_DIR}")
         self.log(f"yt-dlp: {YTDLP if os.path.isfile(YTDLP) else 'НЕ НАЙДЕН'}")
         self.log(f"ffmpeg: {FFMPEG or 'НЕ НАЙДЕН (MP3 и склейка видео работать не будут)'}")
@@ -288,7 +435,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------ интерфейс
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
         pad = {"padx": 20}
         secondary = dict(fg_color=("gray75", "gray25"), hover_color=("gray65", "gray30"),
                          text_color=("gray10", "gray90"))
@@ -297,20 +444,44 @@ class App(ctk.CTk):
 
         # --- шапка
         head = ctk.CTkFrame(self, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", pady=(18, 6), **pad)
-        head.grid_columnconfigure(0, weight=1)
+        head.grid(row=0, column=0, sticky="ew", pady=(16, 6), **pad)
+        head.grid_columnconfigure(1, weight=1)
+        if os.path.isfile(ICON_PNG):
+            logo_img = Image.open(ICON_PNG)
+            self.logo = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(52, 52))
+            ctk.CTkLabel(head, text="", image=self.logo).grid(row=0, column=0, rowspan=2,
+                                                              padx=(0, 12))
         ctk.CTkLabel(head, text="Downloader",
-                     font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=0, sticky="w")
+                     font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=1, sticky="sw")
         ctk.CTkLabel(head, text="YouTube, VK, TikTok и ещё 1000+ сайтов",
-                     text_color=GRAY_TEXT).grid(row=1, column=0, sticky="w")
-        self.theme_switch = ctk.CTkSwitch(head, text="Тёмная тема", command=self.toggle_theme)
-        self.theme_switch.grid(row=0, column=1, rowspan=2)
+                     text_color=GRAY_TEXT).grid(row=1, column=1, sticky="nw")
+        switches = ctk.CTkFrame(head, fg_color="transparent")
+        switches.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.theme_switch = ctk.CTkSwitch(switches, text="Тёмная тема", command=self.toggle_theme)
+        self.theme_switch.pack(anchor="w", pady=2)
         if self.settings["theme"] == "dark":
             self.theme_switch.select()
+        self.v_clip = ctk.BooleanVar(value=self.settings["clip_watch"])
+        ctk.CTkSwitch(switches, text="Ловить ссылки из буфера", variable=self.v_clip,
+                      command=self.toggle_clip_watch).pack(anchor="w", pady=2)
+
+        # --- плашка «вышла новая версия» (скрыта, пока не нужна)
+        self.banner = ctk.CTkFrame(self, corner_radius=10, fg_color=("#FDECEC", "#3A1D1F"),
+                                   border_width=1, border_color=ACCENT)
+        self.banner.grid_columnconfigure(0, weight=1)
+        self.banner_lbl = ctk.CTkLabel(self.banner, text="", anchor="w", justify="left",
+                                       text_color=("gray10", "gray90"))
+        self.banner_lbl.grid(row=0, column=0, sticky="ew", padx=14, pady=10)
+        self.banner_btn = ctk.CTkButton(self.banner, text="Обновить", width=110,
+                                        fg_color=ACCENT, hover_color=ACCENT_HOVER)
+        self.banner_btn.grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(self.banner, text="✕", width=30, fg_color="transparent",
+                      hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"),
+                      command=self.hide_banner).grid(row=0, column=2, padx=(0, 8))
 
         # --- ссылка
         url_row = ctk.CTkFrame(self, fg_color="transparent")
-        url_row.grid(row=1, column=0, sticky="ew", pady=8, **pad)
+        url_row.grid(row=2, column=0, sticky="ew", pady=8, **pad)
         url_row.grid_columnconfigure(0, weight=1)
         self.url_entry = ctk.CTkEntry(url_row, height=42, corner_radius=10,
                                       placeholder_text="Вставьте ссылку (Ctrl+V) и нажмите Enter…",
@@ -324,7 +495,7 @@ class App(ctk.CTk):
 
         # --- настройки
         card = ctk.CTkFrame(self, corner_radius=14)
-        card.grid(row=2, column=0, sticky="ew", pady=8, **pad)
+        card.grid(row=3, column=0, sticky="ew", pady=8, **pad)
         card.grid_columnconfigure(3, weight=1)
 
         self.mode = ctk.CTkSegmentedButton(card, values=["Видео", "Аудио"], height=34,
@@ -372,7 +543,7 @@ class App(ctk.CTk):
 
         # --- очередь
         qhead = ctk.CTkFrame(self, fg_color="transparent")
-        qhead.grid(row=3, column=0, sticky="ew", pady=(8, 0), **pad)
+        qhead.grid(row=4, column=0, sticky="ew", pady=(8, 0), **pad)
         qhead.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(qhead, text="Очередь",
                      font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w")
@@ -380,7 +551,7 @@ class App(ctk.CTk):
                       command=self.clear_finished, **outline).grid(row=0, column=1)
 
         self.queue_frame = ctk.CTkScrollableFrame(self, corner_radius=14)
-        self.queue_frame.grid(row=4, column=0, sticky="nsew", pady=6, **pad)
+        self.queue_frame.grid(row=5, column=0, sticky="nsew", pady=6, **pad)
         self.queue_frame.grid_columnconfigure(0, weight=1)
         self.empty_label = ctk.CTkLabel(self.queue_frame,
                                         text="Здесь появятся ссылки для скачивания",
@@ -389,7 +560,7 @@ class App(ctk.CTk):
 
         # --- общий прогресс
         prog = ctk.CTkFrame(self, fg_color="transparent")
-        prog.grid(row=5, column=0, sticky="ew", pady=(4, 0), **pad)
+        prog.grid(row=6, column=0, sticky="ew", pady=(4, 0), **pad)
         prog.grid_columnconfigure(0, weight=1)
         self.progress = ctk.CTkProgressBar(prog, height=10, progress_color=ACCENT)
         self.progress.set(0)
@@ -400,7 +571,7 @@ class App(ctk.CTk):
 
         # --- кнопки
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=6, column=0, sticky="ew", pady=(4, 8), **pad)
+        btns.grid(row=7, column=0, sticky="ew", pady=(4, 8), **pad)
         btns.grid_columnconfigure(3, weight=1)
         self.start_btn = ctk.CTkButton(btns, text="⬇  Скачать", width=150, height=42,
                                        corner_radius=10, fg_color=ACCENT,
@@ -415,9 +586,14 @@ class App(ctk.CTk):
         self.log_btn = ctk.CTkButton(btns, text="Журнал ▾", width=100, height=42,
                                      corner_radius=10, command=self.toggle_log, **outline)
         self.log_btn.grid(row=0, column=2)
-        self.update_btn = ctk.CTkButton(btns, text="Обновить yt-dlp", width=140, height=42,
+        self.update_btn = ctk.CTkButton(btns, text="Обновить yt-dlp", width=130, height=42,
                                         corner_radius=10, command=self.update_ytdlp, **outline)
-        self.update_btn.grid(row=0, column=4)
+        self.update_btn.grid(row=0, column=4, padx=(0, 8))
+        self.app_update_btn = ctk.CTkButton(btns, text="Проверить обновления", width=170,
+                                            height=42, corner_radius=10,
+                                            command=lambda: self.check_updates(manual=True),
+                                            **outline)
+        self.app_update_btn.grid(row=0, column=5)
 
         # --- журнал (скрыт по умолчанию)
         self.log_box = ctk.CTkTextbox(self, height=130, corner_radius=10,
@@ -427,6 +603,18 @@ class App(ctk.CTk):
 
     def set_main_status(self, text, color=None):
         self.status.configure(text=text, text_color=color or GRAY_TEXT)
+
+    def show_banner(self, text, button_text=None, command=None):
+        self.banner_lbl.configure(text=text)
+        if button_text:
+            self.banner_btn.configure(text=button_text, command=command)
+            self.banner_btn.grid()
+        else:
+            self.banner_btn.grid_remove()
+        self.banner.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 0))
+
+    def hide_banner(self):
+        self.banner.grid_remove()
 
     # ------------------------------------------------------------ Ctrl+V и меню
     def _setup_clipboard_keys(self):
@@ -474,6 +662,37 @@ class App(ctk.CTk):
         finally:
             self.entry_menu.grab_release()
 
+    # ------------------------------------------------------------ буфер обмена
+    def _read_clipboard(self):
+        try:
+            return self.clipboard_get().strip()
+        except Exception:
+            return ""
+
+    def toggle_clip_watch(self):
+        # при включении не хватаем то, что уже лежало в буфере
+        self._last_clip = self._read_clipboard()
+        self.settings["clip_watch"] = self.v_clip.get()
+        self._save()
+        if self.v_clip.get():
+            self.set_main_status("Скопируйте ссылку в браузере — она сама появится в очереди")
+
+    def _watch_clipboard(self):
+        """Раз в 0.7 с проверяет буфер обмена и добавляет новые ссылки в очередь."""
+        if self.v_clip.get():
+            text = self._read_clipboard()
+            if text and text != self._last_clip:
+                self._last_clip = text
+                known = {i.url for i in self.items}
+                urls = [u for u in text.split() if URL_RE.match(u) and u not in known]
+                for url in urls:
+                    self.add_item(url)
+                if urls:
+                    self.set_main_status(f"Добавлено из буфера: {len(urls)}")
+                    if self.state() == "iconic":
+                        self.bell()
+        self.after(700, self._watch_clipboard)
+
     # ------------------------------------------------------------ настройки
     def _apply_mode(self):
         if self.mode.get() == "Аудио":
@@ -494,7 +713,7 @@ class App(ctk.CTk):
     def _save(self):
         self.settings.update(mode=self.mode.get(), playlist=self.v_playlist.get(),
                              subs=self.v_subs.get(), embed=self.v_embed.get(),
-                             parallel=self.parallel.get())
+                             parallel=self.parallel.get(), clip_watch=self.v_clip.get())
         save_settings(self.settings)
 
     def current_opts(self):
@@ -530,20 +749,17 @@ class App(ctk.CTk):
     # ------------------------------------------------------------ ссылки и очередь
     def _autopaste(self):
         """При запуске подставляет ссылку из буфера обмена, если она там есть."""
-        try:
-            text = self.clipboard_get().strip()
-        except Exception:
+        if self.v_clip.get():
             return
+        text = self._read_clipboard()
         if text.startswith("http") and not self.url_entry.get():
             self.url_entry.insert(0, text)
 
     def paste_clipboard(self):
-        try:
-            text = self.clipboard_get().strip()
-        except Exception:
-            return
-        self.url_entry.delete(0, "end")
-        self.url_entry.insert(0, text)
+        text = self._read_clipboard()
+        if text:
+            self.url_entry.delete(0, "end")
+            self.url_entry.insert(0, text)
 
     def add_from_entry(self):
         added = False
@@ -554,6 +770,7 @@ class App(ctk.CTk):
                 added = True
         if added:
             self.url_entry.delete(0, "end")
+            self._last_clip = self._read_clipboard()   # чтобы перехват не добавил её ещё раз
         return added
 
     def add_item(self, url):
@@ -563,6 +780,7 @@ class App(ctk.CTk):
         item.grid(row=len(self.items) + 1, column=0, sticky="ew", pady=4, padx=4)
         with self.lock:
             self.items.append(item)
+        threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
         # если загрузка уже идёт, а свободные потоки закончились — запускаем ещё один
         if self.workers_alive and self.workers_alive < int(self.parallel.get()):
             self._spawn_worker()
@@ -590,13 +808,47 @@ class App(ctk.CTk):
         if not self.items:
             self.empty_label.grid()
 
+    # ------------------------------------------------------------ превью
+    def _fetch_preview(self, item):
+        """Фоновый поток: узнаёт название, длительность, размер и обложку."""
+        with self.preview_slots:
+            if item not in self.items:
+                return
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            try:
+                p = subprocess.run(preview_command(item.url, item.opts), capture_output=True,
+                                   cwd=BASE_DIR, env=env, timeout=90,
+                                   creationflags=NO_WINDOW)
+                info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
+            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                info, p = None, None
+                self.events.put(("log", f"Превью {item.url}: {e}"))
+            if not info:
+                err = ""
+                if p is not None:
+                    lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
+                             .splitlines() if ln.startswith("ERROR")]
+                    err = lines[-1].replace("ERROR:", "").strip() if lines else ""
+                if err:
+                    self.events.put(("log", f"Превью {item.url}: {err}"))
+                self.events.put(("meta", item, None, "Не удалось получить информацию"
+                                 + (f": {err[:60]}" if err else ""), ACCENT))
+                return
+            s = summarize(info, item.opts)
+            self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
+        if s.get("thumb"):
+            try:
+                self.events.put(("thumb", item, load_thumbnail(s["thumb"])))
+            except Exception as e:
+                self.events.put(("log", f"Обложка {item.url}: {e}"))
+
     # ------------------------------------------------------------ журнал
     def toggle_log(self):
         if self.log_visible:
             self.log_box.grid_remove()
             self.log_btn.configure(text="Журнал ▾")
         else:
-            self.log_box.grid(row=7, column=0, sticky="ew", padx=20, pady=(0, 16))
+            self.log_box.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, 16))
             self.log_btn.configure(text="Журнал ▴")
         self.log_visible = not self.log_visible
 
@@ -749,6 +1001,71 @@ class App(ctk.CTk):
             self.events.put(("updated", msg))
         threading.Thread(target=run, daemon=True).start()
 
+    # ------------------------------------------------------------ обновление программы
+    def check_updates(self, manual=False):
+        """Спрашивает у GitHub номер последней удачной сборки."""
+        gh = find_gh()
+        if not gh:
+            if manual:
+                self.show_banner("Для проверки обновлений нужен GitHub CLI. "
+                                 "update.bat установит его и поможет войти в GitHub.",
+                                 "Запустить update.bat", self.run_updater)
+            return
+        if manual:
+            self.app_update_btn.configure(state="disabled", text="Проверяю…")
+
+        def run():
+            latest, err = None, ""
+            try:
+                p = subprocess.run(
+                    [gh, "run", "list", "--repo", REPO, "--workflow", "build.yml",
+                     "--status", "success", "--limit", "1",
+                     "--json", "databaseId,createdAt"],
+                    capture_output=True, timeout=30, creationflags=NO_WINDOW)
+                runs = json.loads(p.stdout.decode("utf-8", "replace") or "[]")
+                if runs:
+                    latest = runs[0]
+                err = p.stderr.decode("utf-8", "replace").strip()
+            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                err = str(e)
+            self.events.put(("update_check", latest, err, manual))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_check(self, latest, err, manual):
+        self.app_update_btn.configure(state="normal", text="Проверить обновления")
+        if latest is None:
+            if err:
+                self.log("Проверка обновлений: " + err)
+            if manual:
+                need_login = "auth login" in err or "authenticat" in err.lower()
+                text = ("Нужно один раз войти в GitHub — это сделает update.bat."
+                        if need_login else "Не удалось проверить обновления — подробности в журнале.")
+                self.show_banner(text, "Запустить update.bat", self.run_updater)
+            return
+        run_id = latest.get("databaseId", 0)
+        date = (latest.get("createdAt") or "")[:10]
+        if run_id > BUILD_ID:
+            self.show_banner(f"Вышла новая версия Downloader (сборка {run_id} от {date}).",
+                             "Обновить", self.run_updater)
+        elif manual:
+            self.hide_banner()
+            self.set_main_status(f"✓ У вас последняя версия (сборка {BUILD_ID})", GREEN)
+
+    def run_updater(self):
+        path = os.path.join(BASE_DIR, "update.bat")
+        if not os.path.isfile(path):
+            self.show_banner("Не найден update.bat рядом с программой. Скачайте его из "
+                             "репозитория на GitHub и положите рядом с Downloader.exe.")
+            return
+        if self.workers_alive:
+            self.show_banner("Сейчас идёт скачивание. Дождитесь окончания или нажмите "
+                             "«Отмена», затем обновите.", "Обновить", self.run_updater)
+            return
+        # update.bat закроет программу, заменит exe и запустит новую версию
+        subprocess.Popen(f'start "Обновление Downloader" "{path}" /auto',
+                         shell=True, cwd=BASE_DIR)
+        self.on_close()
+
     # ------------------------------------------------------------ события из потоков
     def _poll_events(self):
         changed = False
@@ -764,6 +1081,13 @@ class App(ctk.CTk):
                     changed = True
                 elif kind == "title":
                     e[1].set_title(e[2])
+                elif kind == "meta":
+                    if e[1].winfo_exists():
+                        e[1].set_title(e[2])
+                        e[1].set_meta(e[3], e[4])
+                elif kind == "thumb":
+                    if e[1].winfo_exists():
+                        e[1].set_thumb(e[2])
                 elif kind == "item_status":
                     e[1].set_status(e[2], e[3])
                     changed = True
@@ -782,6 +1106,8 @@ class App(ctk.CTk):
                 elif kind == "updated":
                     self.update_btn.configure(state="normal")
                     self.set_main_status(e[1])
+                elif kind == "update_check":
+                    self._on_update_check(e[1], e[2], e[3])
         except queue.Empty:
             pass
         if changed and self.workers_alive:

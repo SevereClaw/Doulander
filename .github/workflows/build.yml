@@ -22,10 +22,17 @@ jobs:
           python-version: "3.12"
 
       - name: Установить библиотеки
-        run: pip install customtkinter pyinstaller
+        run: pip install customtkinter pillow pyinstaller
+
+      - name: Вписать номер сборки
+        shell: pwsh
+        run: |
+          (Get-Content downloader.py -Encoding utf8) -replace '^BUILD_ID = 0\b', "BUILD_ID = ${{ github.run_id }}" |
+            Set-Content downloader.py -Encoding utf8
+          Select-String -Path downloader.py -Pattern '^BUILD_ID'
 
       - name: Собрать Downloader.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --collect-data customtkinter downloader.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --collect-data customtkinter downloader.py
 
       - name: Скачать yt-dlp, ffmpeg и deno
         shell: pwsh
