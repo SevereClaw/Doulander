@@ -2,9 +2,15 @@ name: Сборка Downloader
 
 # Запускается:
 #  - вручную: вкладка Actions → "Сборка Downloader" → Run workflow
-#  - при пуше тега вида v1.0.1 — тогда ещё и создаётся Release с готовым архивом
+#    (галочка «Выпустить релиз» — выложить установщик во вкладку Releases)
+#  - при пуше тега вида v1.0.1 — тоже создаётся Release
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Выпустить релиз (установщик во вкладке Releases)"
+        type: boolean
+        default: false
   push:
     tags: ["v*"]
 
@@ -134,10 +140,33 @@ jobs:
           name: Downloader-app
           path: app/
 
+      - name: Номер версии для релиза
+        id: ver
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path downloader.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
       - name: Создать Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          name: Downloader ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            ## Как установить
+            1. Скачайте **DownloaderSetup.exe** ниже (раздел Assets).
+            2. Запустите его — права администратора не нужны.
+            3. Ярлык появится в «Пуске» (и на рабочем столе, если отметить).
+
+            Windows может предупредить «Windows защитил ваш компьютер» — программа не подписана
+            сертификатом. Нажмите «Подробнее» → «Выполнить в любом случае».
+
+            Остальные файлы: `Downloader.zip` — то же без установки (распаковать и запустить),
+            `Downloader.exe` и `update.bat` — для обновления уже установленной программы.
           files: |
             dist-setup/DownloaderSetup.exe
             Downloader.zip
