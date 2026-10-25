@@ -30,7 +30,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -159,6 +159,8 @@ DEFAULTS = {
     "check_updates": True,  # проверять обновления при запуске
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
+    "sponsorblock": False,  # вырезать рекламные вставки (YouTube)
+    "chapters": False,      # разбивать на отдельные файлы по главам
 }
 
 ACCENT = "#E5484D"
@@ -237,7 +239,12 @@ def load_settings():
     return s
 
 
+NO_SAVE = False      # во время самопроверки ничего не записываем рядом с программой
+
+
 def save_settings(s):
+    if NO_SAVE:
+        return
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
@@ -304,6 +311,16 @@ def build_command(url, opts, folder, fragments=8):
         if opts["fmt"] not in NO_THUMB_FORMATS:
             cmd += ["--embed-thumbnail"]
         cmd += ["--embed-metadata"]
+    if opts.get("sponsor"):
+        # реклама, самореклама, «подпишитесь»; для музыки — ещё и не-музыкальные куски
+        cats = "sponsor,selfpromo,interaction"
+        if opts["mode"] == "Аудио":
+            cats += ",music_offtopic"
+        cmd += ["--sponsorblock-remove", cats]
+    if opts.get("chapters"):
+        chapter_dir = ("%(playlist_title&{}/|)s%(title)s" if opts["playlist"] else "%(title)s")
+        cmd += ["--split-chapters",
+                "-o", f"chapter:{chapter_dir}/%(section_number)02d - %(section_title)s.%(ext)s"]
     if opts.get("cut"):
         start, end = opts["cut"]
         cmd += ["--download-sections",
@@ -380,6 +397,13 @@ def summarize(info, opts):
             size = size * part / duration
         dur_text = f"фрагмент {human_duration(part) or '0:00'} из {dur_text}"
     size_text = human_size(size)
+    chapters = len(info.get("chapters") or [])
+    if chapters:
+        n10, n100 = chapters % 10, chapters % 100
+        word = "глава" if n10 == 1 and n100 != 11 else \
+            "главы" if 2 <= n10 <= 4 and not 12 <= n100 <= 14 else "глав"
+        ch = f"{chapters} {word}"
+        dur_text = f"{dur_text}   •   {ch}" if dur_text else ch
     parts = [info.get("uploader") or info.get("channel"), dur_text,
              f"≈ {size_text}" if size_text else None, quality]
     return {"title": info.get("title"),
@@ -405,6 +429,20 @@ def load_thumbnail(url):
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=16, fill=255)
     img.putalpha(mask)
     return img
+
+
+def finalize_chapters(files):
+    """Если видео разбилось на главы, удаляет целый файл и возвращает папку с главами."""
+    result = None
+    for f in files:
+        folder = os.path.splitext(f)[0]
+        if os.path.isdir(folder) and os.listdir(folder) and os.path.isfile(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+            result = folder
+    return result
 
 
 def explain_error(err, code):
@@ -788,13 +826,19 @@ class App(ctk.CTk):
         self.v_playlist = ctk.BooleanVar(value=self.settings["playlist"])
         self.v_subs = ctk.BooleanVar(value=self.settings["subs"])
         self.v_embed = ctk.BooleanVar(value=self.settings["embed"])
+        self.v_sponsor = ctk.BooleanVar(value=self.settings["sponsorblock"])
+        self.v_chapters = ctk.BooleanVar(value=self.settings["chapters"])
         ctk.CTkCheckBox(flags, text="Весь плейлист", variable=self.v_playlist,
-                        command=self._save).pack(side="left", padx=(0, 18))
-        self.subs_box = ctk.CTkCheckBox(flags, text="Субтитры (ru/en)", variable=self.v_subs,
+                        command=self._save).pack(side="left", padx=(0, 16))
+        self.subs_box = ctk.CTkCheckBox(flags, text="Субтитры", variable=self.v_subs,
                                         command=self._save)
-        self.subs_box.pack(side="left", padx=(0, 18))
+        self.subs_box.pack(side="left", padx=(0, 16))
         ctk.CTkCheckBox(flags, text="Обложка и теги", variable=self.v_embed,
-                        command=self._save).pack(side="left")
+                        command=self._save).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(flags, text="Без рекламы", variable=self.v_sponsor,
+                        command=self._toggle_sponsor).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(flags, text="Разбить по главам", variable=self.v_chapters,
+                        command=self._toggle_chapters).pack(side="left")
 
         # фрагмент и cookies
         extra = ctk.CTkFrame(card, fg_color="transparent")
@@ -1056,7 +1100,8 @@ class App(ctk.CTk):
                              subs=self.v_subs.get(), embed=self.v_embed.get(),
                              parallel=self.parallel.get(), clip_watch=self.v_clip.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
-                             sound=self.v_sound.get())
+                             sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
+                             chapters=self.v_chapters.get())
         save_settings(self.settings)
 
     def current_opts(self):
@@ -1071,6 +1116,8 @@ class App(ctk.CTk):
                 "playlist": self.v_playlist.get(),
                 "subs": self.v_subs.get() and self.mode.get() == "Видео",
                 "embed": self.v_embed.get(),
+                "sponsor": self.v_sponsor.get(),
+                "chapters": self.v_chapters.get(),
                 "cut": cut, "exact": self.v_exact.get(),
                 "cookies": self.cookie_args()}
 
@@ -1294,6 +1341,7 @@ class App(ctk.CTk):
             self.procs.add(proc)
 
         last_error = ""
+        files = []
         for raw in proc.stdout:
             line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
             if not line:
@@ -1313,6 +1361,7 @@ class App(ctk.CTk):
                 ev(("title", item, line[3:]))
             elif line.startswith("[F]"):
                 item.file_path = line[3:]
+                files.append(line[3:])
                 ev(("log", "✓ " + line[3:]))
             else:
                 ev(("log", line))
@@ -1327,6 +1376,11 @@ class App(ctk.CTk):
             ev(("item_status", item, "Отменено", None))
             return None
         if code == 0:
+            if item.opts.get("chapters"):
+                folder = finalize_chapters(files)
+                if folder:
+                    item.file_path = folder
+                    ev(("log", "✓ Разбито по главам: " + folder))
             ev(("history", item))
             ev(("state", item, "done"))
             ev(("item_status", item, "✓ Готово", GREEN))
@@ -1636,11 +1690,100 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+    def _toggle_sponsor(self):
+        self._save()
+        if self.v_sponsor.get():
+            self.set_main_status("YouTube: будут вырезаны реклама, самореклама и «подпишитесь» "
+                                 "(по базе SponsorBlock)")
+
+    def _toggle_chapters(self):
+        self._save()
+        if self.v_chapters.get():
+            self.set_main_status("Видео с главами сохранится папкой с отдельным файлом "
+                                 "на каждую главу")
+
     def _toggle_sound(self):
         self._save()
         if self.v_sound.get():
             play_sound()
 
 
+# ================================================================ самопроверка
+def selftest(url, out_dir):
+    """Downloader.exe --selftest URL ПАПКА — проверка сборки на GitHub.
+    Открывает окно, затем качает URL в разных форматах. Код выхода 0 — всё хорошо."""
+    global NO_SAVE
+    NO_SAVE = True
+    os.makedirs(out_dir, exist_ok=True)
+    log_file = open(os.path.join(out_dir, "selftest.log"), "w", encoding="utf-8")
+    failed = 0
+
+    def log(msg):
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    log(f"Downloader {APP_VERSION}, сборка {BUILD_ID}")
+    log(f"yt-dlp: {YTDLP} ({'есть' if os.path.isfile(YTDLP) else 'НЕТ'})")
+    log(f"ffmpeg: {FFMPEG or 'НЕТ'}")
+    log(f"deno:   {DENO or 'НЕТ'}")
+    for name, ok in (("yt-dlp", os.path.isfile(YTDLP)), ("ffmpeg", FFMPEG), ("deno", DENO)):
+        if not ok:
+            failed += 1
+            log(f"FAIL нет {name}")
+
+    # 1. окно открывается без ошибок
+    try:
+        app = App()
+        app.update()
+        app.quit_app()
+        log("OK   окно программы")
+    except Exception as e:
+        failed += 1
+        log(f"FAIL окно программы: {e!r}")
+
+    # 2. скачивание в разных форматах
+    base = {"playlist": False, "subs": False, "embed": True, "exact": True,
+            "cookies": None, "sponsor": False, "chapters": False, "cut": None}
+    cases = [
+        ("video-mp4", dict(base, mode="Видео", quality="1080p", fmt="MP4"), ".mp4"),
+        ("video-mkv", dict(base, mode="Видео", quality="720p", fmt="MKV"), ".mkv"),
+        ("audio-mp3", dict(base, mode="Аудио", quality="Лучшее", fmt="MP3"), ".mp3"),
+        ("audio-flac-cut", dict(base, mode="Аудио", quality="Лучшее", fmt="FLAC", cut=(1, 3)),
+         ".flac"),
+    ]
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    try:
+        p = subprocess.run(preview_command(url, cases[0][1]), capture_output=True, timeout=120,
+                           env=env, creationflags=NO_WINDOW)
+        info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
+        log(f"OK   превью: {summarize(info, cases[0][1])}" if info else "FAIL превью: пусто")
+        failed += 0 if info else 1
+    except Exception as e:
+        failed += 1
+        log(f"FAIL превью: {e!r}")
+    for name, opts, ext in cases:
+        folder = os.path.join(out_dir, name)
+        try:
+            p = subprocess.run(build_command(url, opts, folder), capture_output=True,
+                               timeout=300, env=env, creationflags=NO_WINDOW)
+            files = [f for f in os.listdir(folder) if f.endswith(ext)] \
+                if os.path.isdir(folder) else []
+            ok = p.returncode == 0 and files
+            log(f"{'OK  ' if ok else 'FAIL'} {name}: код {p.returncode}, файлы {files}")
+            if not ok:
+                failed += 1
+                out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+                log("\n".join("      " + ln for ln in out.splitlines()[-20:]))
+        except Exception as e:
+            failed += 1
+            log(f"FAIL {name}: {e!r}")
+
+    log(f"Итог: {'ВСЁ ХОРОШО' if not failed else f'ошибок: {failed}'}")
+    log_file.close()
+    return 1 if failed else 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":
+        sys.exit(selftest(sys.argv[2], sys.argv[3]))
     App().mainloop()
