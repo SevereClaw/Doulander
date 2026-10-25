@@ -112,10 +112,11 @@ AUDIO_QUALITIES = {          # качество для yt-dlp и примерн�
     "192 kbps": ("192K", 192),
     "128 kbps": ("128K", 128),
 }
-VIDEO_FORMATS = {           # формат: (контейнер для склейки, предпочтения по расширению)
-    "MP4": ("mp4", "ext:mp4:m4a"),
-    "MKV": ("mkv", None),
-    "WEBM": ("webm/mkv", "ext:webm:webm"),
+VIDEO_FORMATS = {           # формат: (контейнер для склейки, предпочтения по расширению, перепаковка)
+    "MP4": ("mp4", "ext:mp4:m4a", None),
+    "MKV": ("mkv", None, "mkv"),
+    # в WEBM помещаются не все кодеки — если не влезает, получится MKV
+    "WEBM": ("webm/mkv", "ext:webm:webm", "webm>webm/mkv"),
 }
 AUDIO_FORMATS = {           # формат: (расширение, битрейт без потерь для оценки размера)
     "MP3": ("mp3", None),
@@ -304,7 +305,11 @@ def build_command(url, opts, folder, fragments=8):
         if not lossless:
             cmd += ["--audio-quality", AUDIO_QUALITIES[opts["quality"]][0]]
     else:
-        cmd += ["--merge-output-format", VIDEO_FORMATS[opts["fmt"]][0]]
+        merge, _, remux = VIDEO_FORMATS[opts["fmt"]]
+        cmd += ["--merge-output-format", merge]
+        if remux:
+            # если сайт отдал готовый файл без склейки — всё равно перепаковать в нужный формат
+            cmd += ["--remux-video", remux]
         if opts["subs"]:
             cmd += ["--write-subs", "--sub-langs", "ru.*,en.*", "--embed-subs"]
     if opts["embed"]:
@@ -1747,6 +1752,8 @@ def selftest(url, out_dir):
     cases = [
         ("video-mp4", dict(base, mode="Видео", quality="1080p", fmt="MP4"), ".mp4"),
         ("video-mkv", dict(base, mode="Видео", quality="720p", fmt="MKV"), ".mkv"),
+        # тестовое видео в H.264 в WEBM не помещается — должен получиться MKV
+        ("video-webm", dict(base, mode="Видео", quality="720p", fmt="WEBM"), (".webm", ".mkv")),
         ("audio-mp3", dict(base, mode="Аудио", quality="Лучшее", fmt="MP3"), ".mp3"),
         ("audio-flac-cut", dict(base, mode="Аудио", quality="Лучшее", fmt="FLAC", cut=(1, 3)),
          ".flac"),
