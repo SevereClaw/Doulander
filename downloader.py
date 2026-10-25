@@ -26,6 +26,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
+import phantom_style
+
 try:                                # звук уведомления (только Windows)
     import winsound
 except ImportError:
@@ -35,7 +37,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -259,6 +261,7 @@ DEFAULTS = {
     "subs": False,
     "embed": True,
     "theme": "dark",
+    "style": "phantom",     # оформление: phantom (в стиле Persona 5) / classic
     "parallel": "3",        # сколько ссылок качать одновременно
     "fragments": 8,         # сколько кусков одного видео качать параллельно
     "clip_watch": False,    # ловить ссылки из буфера обмена
@@ -508,6 +511,43 @@ def fmt_time(sec):
     return f"{h}:{m:02d}:{tail}" if h else f"{m}:{tail}"
 
 
+STYLES = {"Phantom (в стиле Persona 5)": "phantom", "Классическое": "classic"}
+
+
+class C:
+    """Цвета интерфейса (классическое оформление; Phantom переопределяет ниже)."""
+    CARD = ("gray90", "gray17")
+    CARD_BORDER = 0
+    BADGE = ("gray80", "gray25")
+    BADGE_TEXT = ("gray10", "gray90")
+    ICON_HOVER = ("gray80", "gray28")
+    ICON_TEXT = ("gray30", "gray70")
+    OUTLINE_TEXT = ("gray20", "gray80")
+    MUTED = ("gray50", "gray50")
+    TEXT = ("gray10", "gray90")
+    BTN2 = ("gray75", "gray25")
+    BTN2_HOVER = ("gray65", "gray30")
+    BTN2_TEXT = ("gray10", "gray90")
+    BANNER = ("#FDECEC", "#3A1D1F")
+    FOLDER_TEXT = ("gray30", "gray70")
+
+
+def R(radius):
+    """Скругление углов: в Phantom углы острые."""
+    return 0 if PHANTOM else radius
+
+
+def title_font(size):
+    """Шрифт заголовков: в Phantom — узкий, жирный, наклонный."""
+    if PHANTOM:
+        return ctk.CTkFont(family="Bahnschrift", size=size + 2, weight="bold", slant="italic")
+    return ctk.CTkFont(size=size, weight="bold")
+
+
+def caps(text):
+    return text.upper() if PHANTOM else text
+
+
 def load_settings():
     s = dict(DEFAULTS)
     try:
@@ -519,6 +559,45 @@ def load_settings():
 
 
 NO_SAVE = False      # во время самопроверки ничего не записываем рядом с программой
+
+
+STYLE = "phantom"
+PHANTOM = True
+FORCE_STYLE = None      # для самопроверки: открыть окно в заданном оформлении
+
+
+def init_style():
+    """Читает оформление из настроек (до создания окон) и подставляет цвета."""
+    global STYLE, PHANTOM, ACCENT, ACCENT_HOVER, GREEN, GRAY_TEXT
+    STYLE = FORCE_STYLE or load_settings().get("style", "phantom")
+    PHANTOM = STYLE == "phantom"
+    if PHANTOM:
+        ps = phantom_style
+        ACCENT, ACCENT_HOVER = ps.RED, ps.RED_HOVER
+        GREEN = ("#3DDC84", "#3DDC84")
+        GRAY_TEXT = (ps.SOFT, ps.SOFT)
+        C.CARD = (ps.BLACK2, ps.BLACK2)
+        C.CARD_BORDER = 2
+        C.BADGE = (ps.RED, ps.RED)
+        C.BADGE_TEXT = (ps.WHITE, ps.WHITE)
+        C.ICON_HOVER = (ps.RED, ps.RED)
+        C.ICON_TEXT = (ps.WHITE, ps.WHITE)
+        C.OUTLINE_TEXT = (ps.WHITE, ps.WHITE)
+        C.MUTED = ("#8A8A8A", "#8A8A8A")
+        C.TEXT = (ps.WHITE, ps.WHITE)
+        C.BTN2 = (ps.WHITE, ps.WHITE)
+        C.BTN2_HOVER = ("#FFC9CE", "#FFC9CE")
+        C.BTN2_TEXT = ("#000000", "#000000")
+        C.BANNER = (ps.BLACK3, ps.BLACK3)
+        C.FOLDER_TEXT = (ps.WHITE, ps.WHITE)
+
+
+def restart_program(app):
+    """Перезапуск — новое оформление применяется только к новым окнам."""
+    args = [sys.executable] if getattr(sys, "frozen", False) else \
+        [sys.executable, os.path.abspath(__file__)]
+    subprocess.Popen(args, cwd=BASE_DIR)
+    app.quit_app()
 
 
 def save_settings(s):
@@ -935,7 +1014,8 @@ def kill_tree(proc):
 # ================================================================ элемент очереди
 class QueueItem(ctk.CTkFrame):
     def __init__(self, master, app, url, opts):
-        super().__init__(master, corner_radius=10, fg_color=("gray90", "gray17"))
+        super().__init__(master, corner_radius=R(10), fg_color=C.CARD,
+                         border_width=C.CARD_BORDER, border_color=ACCENT)
         self.app = app
         self.url = url
         self.opts = opts
@@ -959,7 +1039,8 @@ class QueueItem(ctk.CTkFrame):
             start, end = opts["cut"]
             self.tag += f"\n✂ {fmt_time(start or 0)}–{fmt_time(end) if end else 'конец'}"
         self.thumb = ctk.CTkLabel(self, text=self.tag, width=THUMB_W, height=THUMB_H,
-                                  corner_radius=8, fg_color=("gray80", "gray25"),
+                                  corner_radius=R(8), fg_color=C.BADGE,
+                                  text_color=C.BADGE_TEXT,
                                   font=ctk.CTkFont(size=12, weight="bold"))
         self.thumb.grid(row=0, column=0, rowspan=4, padx=(8, 12), pady=8)
 
@@ -981,7 +1062,7 @@ class QueueItem(ctk.CTkFrame):
         self.bar.grid_remove()
 
         small = dict(width=30, height=30, fg_color="transparent",
-                     hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"))
+                     hover_color=C.ICON_HOVER, text_color=C.ICON_TEXT)
         self.pbtn = ctk.CTkButton(self, text="⏸", command=lambda: self.app.toggle_pause(self),
                                   **small)
         self.pbtn.grid(row=0, column=2, rowspan=4, padx=(8, 0))
@@ -1112,10 +1193,10 @@ class HistoryWindow(ctk.CTkToplevel):
         self.search.grid(row=0, column=0, sticky="ew")
         self.search.bind("<KeyRelease>", lambda e: self._schedule_refresh())
         ctk.CTkButton(top, text="Очистить историю", width=140, height=36,
-                      fg_color="transparent", border_width=1, text_color=("gray20", "gray80"),
+                      fg_color="transparent", border_width=1, text_color=C.OUTLINE_TEXT,
                       command=self.clear_all).grid(row=0, column=1, padx=(8, 0))
 
-        self.list = ctk.CTkScrollableFrame(self, corner_radius=12)
+        self.list = ctk.CTkScrollableFrame(self, corner_radius=R(12))
         self.list.grid(row=1, column=0, sticky="nsew", padx=16)
         self.list.grid_columnconfigure(0, weight=1)
         self.info = ctk.CTkLabel(self, text="", text_color=GRAY_TEXT, anchor="w")
@@ -1141,12 +1222,12 @@ class HistoryWindow(ctk.CTkToplevel):
             self._row(n, rec)
         if not rows:
             ctk.CTkLabel(self.list, text="Ничего не найдено" if q else "История пока пуста",
-                         text_color=("gray50", "gray50")).grid(row=0, column=0, pady=30)
+                         text_color=C.MUTED).grid(row=0, column=0, pady=30)
         more = f" (показаны первые {self.SHOW_MAX})" if len(rows) > self.SHOW_MAX else ""
         self.info.configure(text=f"Записей: {len(rows)}{more}")
 
     def _row(self, n, rec):
-        row = ctk.CTkFrame(self.list, corner_radius=8, fg_color=("gray90", "gray17"))
+        row = ctk.CTkFrame(self.list, corner_radius=R(8), fg_color=C.CARD)
         row.grid(row=n, column=0, sticky="ew", pady=3, padx=2)
         row.grid_columnconfigure(0, weight=1)
         title = rec.get("title") or rec.get("url")
@@ -1164,7 +1245,7 @@ class HistoryWindow(ctk.CTkToplevel):
         btns = ctk.CTkFrame(row, fg_color="transparent")
         btns.grid(row=0, column=1, rowspan=2, padx=8)
         small = dict(width=34, height=30, fg_color="transparent",
-                     hover_color=("gray80", "gray28"), text_color=("gray20", "gray80"))
+                     hover_color=C.ICON_HOVER, text_color=C.OUTLINE_TEXT)
         ctk.CTkButton(btns, text="▶", state="normal" if exists else "disabled",
                       command=lambda: os.startfile(path), **small).pack(side="left")
         ctk.CTkButton(btns, text="📂", command=lambda: self.app.show_in_folder(path or ""),
@@ -1240,7 +1321,7 @@ class BulkWindow(ctk.CTkToplevel):
                           "Например: «Король и Шут — Лесник». Названия ищутся на YouTube, "
                           "берётся первый результат.").grid(
             row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
-        self.text = ctk.CTkTextbox(self, corner_radius=10, font=ctk.CTkFont(size=14))
+        self.text = ctk.CTkTextbox(self, corner_radius=R(10), font=ctk.CTkFont(size=14))
         self.text.grid(row=1, column=0, sticky="nsew", padx=16)
         self.text.bind("<KeyRelease>", lambda e: self.update_count())
         self.text.bind("<<Paste>>", lambda e: self.after(50, self.update_count))
@@ -1285,7 +1366,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        body = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="transparent")
+        body = ctk.CTkScrollableFrame(self, corner_radius=R(0), fg_color="transparent")
         body.grid(row=0, column=0, sticky="nsew")
         body.grid_columnconfigure(0, weight=1)
         self.body = body
@@ -1293,7 +1374,14 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # --- внешний вид и поведение
         self.section("Программа")
-        self.switch("Тёмная тема", app.v_theme, app.toggle_theme)
+        line = self.line()
+        ctk.CTkLabel(line, text="Оформление:").pack(side="left")
+        self.style_menu = ctk.CTkOptionMenu(
+            line, values=list(STYLES), width=210, command=self.change_style)
+        self.style_menu.set(next(k for k, v in STYLES.items() if v == STYLE))
+        self.style_menu.pack(side="left", padx=8)
+        self.switch("Тёмная тема", app.v_theme, app.toggle_theme,
+                    "В оформлении Phantom тема всегда тёмная" if PHANTOM else None)
         self.switch("Ловить ссылки из буфера обмена", app.v_clip, app.toggle_clip_watch)
         self.switch("Крестик сворачивает в трей", app.v_tray, app._save,
                     None if app.tray else "Значок в трее недоступен на этом компьютере")
@@ -1343,7 +1431,7 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkButton(line, text="Найти", width=80, height=32,
                       command=self.find_proxy).pack(side="left", padx=(8, 0))
         ctk.CTkButton(line, text="Проверить", width=100, height=32, fg_color="transparent",
-                      border_width=1, text_color=("gray20", "gray80"),
+                      border_width=1, text_color=C.OUTLINE_TEXT,
                       command=self.test_proxy).pack(side="left", padx=(8, 0))
         self.proxy_result = self.hint("")
         self.hint("VPN-программы (v2rayN, Hiddify, Nekoray, Clash и др.) открывают на компьютере "
@@ -1369,7 +1457,7 @@ class SettingsWindow(ctk.CTkToplevel):
             "%(id)s — код видео, %(playlist_index)s — номер. Папки — через «/».")
         self.example = ctk.CTkLabel(body, text="", anchor="w", justify="left",
                                     font=ctk.CTkFont(family="Consolas", size=12),
-                                    text_color=("gray10", "gray90"), wraplength=540)
+                                    text_color=C.TEXT, wraplength=540)
         self.example.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(6, 4))
         self.hint("Настройки применяются к ссылкам, которые добавлены после изменения.")
 
@@ -1386,7 +1474,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
     def section(self, text):
         ctk.CTkLabel(self.body, text=text, anchor="w",
-                     font=ctk.CTkFont(size=16, weight="bold")).grid(
+                     font=title_font(16)).grid(
             row=self.next(), column=0, sticky="ew", padx=16, pady=(16, 4))
 
     def switch(self, text, var, command, disabled_reason=None):
@@ -1410,6 +1498,17 @@ class SettingsWindow(ctk.CTkToplevel):
                            text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
         lbl.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(0, 4))
         return lbl
+
+    def change_style(self, name):
+        new = STYLES[name]
+        if new == STYLE:
+            return
+        self.app.settings["style"] = new
+        self.app._save()
+        if messagebox.askyesno("Оформление", "Новое оформление включится после перезапуска.\n"
+                                             "Перезапустить сейчас? Очередь сохранится.",
+                               parent=self):
+            restart_program(self.app)
 
     def find_proxy(self):
         self.proxy_result.configure(text="Ищу прокси VPN-программы…", text_color=GRAY_TEXT)
@@ -1468,8 +1567,11 @@ class SettingsWindow(ctk.CTkToplevel):
 class App(ctk.CTk):
     def __init__(self):
         self.settings = load_settings()
-        ctk.set_appearance_mode(self.settings["theme"])
+        init_style()
+        ctk.set_appearance_mode("dark" if PHANTOM else self.settings["theme"])
         ctk.set_default_color_theme("blue")
+        if PHANTOM:
+            phantom_style.apply_theme(ctk.ThemeManager.theme)
         super().__init__()
 
         build = f" (сборка {BUILD_ID})" if BUILD_ID else ""
@@ -1563,61 +1665,69 @@ class App(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(5, weight=1)
         pad = {"padx": 20}
-        secondary = dict(fg_color=("gray75", "gray25"), hover_color=("gray65", "gray30"),
-                         text_color=("gray10", "gray90"))
+        secondary = dict(fg_color=C.BTN2, hover_color=C.BTN2_HOVER,
+                         text_color=C.BTN2_TEXT)
         outline = dict(fg_color="transparent", border_width=1,
-                       text_color=("gray20", "gray80"))
+                       text_color=C.OUTLINE_TEXT)
 
         # --- шапка
         head = ctk.CTkFrame(self, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", pady=(16, 6), **pad)
         head.grid_columnconfigure(1, weight=1)
-        if os.path.isfile(ICON_PNG):
+        version = f"v{APP_VERSION}" + (f"  ·  сборка {BUILD_ID}" if BUILD_ID else "  ·  локальная сборка")
+        if PHANTOM:
+            banner = phantom_style.make_banner(
+                subtitle=f"ВИДЕО · МУЗЫКА · 1000+ САЙТОВ     v{APP_VERSION}", logo_path=ICON_PNG)
+            self.header_img = ctk.CTkImage(light_image=banner, dark_image=banner,
+                                           size=(banner.width // 2, banner.height // 2))
+            ctk.CTkLabel(head, text="", image=self.header_img).grid(
+                row=0, column=0, columnspan=2, rowspan=2, sticky="w")
+        elif os.path.isfile(ICON_PNG):
             logo_img = Image.open(ICON_PNG)
             self.logo = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(52, 52))
             ctk.CTkLabel(head, text="", image=self.logo).grid(row=0, column=0, rowspan=2,
                                                               padx=(0, 12))
-        ctk.CTkLabel(head, text="Downloader",
-                     font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=1, sticky="sw")
-        version = f"v{APP_VERSION}" + (f"  ·  сборка {BUILD_ID}" if BUILD_ID else "  ·  локальная сборка")
-        ctk.CTkLabel(head, text=f"YouTube, VK, TikTok и ещё 1000+ сайтов   ·   {version}",
-                     text_color=GRAY_TEXT).grid(row=1, column=1, sticky="nw")
-        ctk.CTkButton(head, text="⚙  Настройки", width=130, height=38, corner_radius=10,
+        if not PHANTOM:
+            ctk.CTkLabel(head, text="Downloader", font=ctk.CTkFont(size=26, weight="bold")).grid(
+                row=0, column=1, sticky="sw")
+            ctk.CTkLabel(head, text=f"YouTube, VK, TikTok и ещё 1000+ сайтов   ·   {version}",
+                         text_color=GRAY_TEXT).grid(row=1, column=1, sticky="nw")
+        ctk.CTkButton(head, text=caps("⚙  Настройки"), width=130, height=38, corner_radius=R(10),
                       command=self.open_settings, **outline).grid(row=0, column=2, rowspan=2,
                                                                   sticky="e")
 
         # --- плашка «вышла новая версия» (скрыта, пока не нужна)
-        self.banner = ctk.CTkFrame(self, corner_radius=10, fg_color=("#FDECEC", "#3A1D1F"),
+        self.banner = ctk.CTkFrame(self, corner_radius=R(10), fg_color=C.BANNER,
                                    border_width=1, border_color=ACCENT)
         self.banner.grid_columnconfigure(0, weight=1)
         self.banner_lbl = ctk.CTkLabel(self.banner, text="", anchor="w", justify="left",
-                                       text_color=("gray10", "gray90"))
+                                       text_color=C.TEXT)
         self.banner_lbl.grid(row=0, column=0, sticky="ew", padx=14, pady=10)
         self.banner_btn = ctk.CTkButton(self.banner, text="Обновить", width=110,
                                         fg_color=ACCENT, hover_color=ACCENT_HOVER)
         self.banner_btn.grid(row=0, column=1, padx=(0, 6))
         ctk.CTkButton(self.banner, text="✕", width=30, fg_color="transparent",
-                      hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"),
+                      hover_color=C.ICON_HOVER, text_color=C.ICON_TEXT,
                       command=self.hide_banner).grid(row=0, column=2, padx=(0, 8))
 
         # --- ссылка
         url_row = ctk.CTkFrame(self, fg_color="transparent")
         url_row.grid(row=2, column=0, sticky="ew", pady=8, **pad)
         url_row.grid_columnconfigure(0, weight=1)
-        self.url_entry = ctk.CTkEntry(url_row, height=42, corner_radius=10,
+        self.url_entry = ctk.CTkEntry(url_row, height=42, corner_radius=R(10),
                                       placeholder_text="Ссылка или название песни — и Enter",
                                       font=ctk.CTkFont(size=14))
         self.url_entry.grid(row=0, column=0, sticky="ew")
         self.url_entry.bind("<Return>", lambda e: self.add_from_entry())
-        ctk.CTkButton(url_row, text="Вставить", width=90, height=42, corner_radius=10,
+        ctk.CTkButton(url_row, text="Вставить", width=90, height=42, corner_radius=R(10),
                       command=self.paste_clipboard, **secondary).grid(row=0, column=1, padx=(8, 0))
-        ctk.CTkButton(url_row, text="📋 Список", width=100, height=42, corner_radius=10,
+        ctk.CTkButton(url_row, text="📋 Список", width=100, height=42, corner_radius=R(10),
                       command=self.open_bulk, **secondary).grid(row=0, column=2, padx=(8, 0))
-        ctk.CTkButton(url_row, text="+ В очередь", width=110, height=42, corner_radius=10,
+        ctk.CTkButton(url_row, text="+ В очередь", width=110, height=42, corner_radius=R(10),
                       command=self.add_from_entry).grid(row=0, column=3, padx=(8, 0))
 
         # --- настройки
-        card = ctk.CTkFrame(self, corner_radius=14)
+        card = ctk.CTkFrame(self, corner_radius=R(14))
         card.grid(row=3, column=0, sticky="ew", pady=8, **pad)
         card.grid_columnconfigure(5, weight=1)
 
@@ -1655,7 +1765,7 @@ class App(ctk.CTk):
         self.cut_to = ctk.CTkEntry(extra, width=70, placeholder_text="конец")
         self.cut_to.grid(row=0, column=3)
         ctk.CTkButton(extra, text="✕", width=28, height=28, fg_color="transparent",
-                      hover_color=("gray80", "gray28"), text_color=("gray30", "gray70"),
+                      hover_color=C.ICON_HOVER, text_color=C.ICON_TEXT,
                       command=self.clear_cut).grid(row=0, column=4, padx=(4, 8))
         ctk.CTkLabel(extra, text="например 1:20 — 3:45", text_color=GRAY_TEXT).grid(
             row=0, column=5)
@@ -1665,7 +1775,7 @@ class App(ctk.CTk):
         folder_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(folder_row, text="📁").grid(row=0, column=0, padx=(0, 6))
         self.folder_label = ctk.CTkLabel(folder_row, text="", anchor="w",
-                                         text_color=("gray30", "gray70"))
+                                         text_color=C.FOLDER_TEXT)
         self.folder_label.grid(row=0, column=1, sticky="ew")
         ctk.CTkButton(folder_row, text="Изменить", width=90,
                       command=self.choose_folder).grid(row=0, column=2, padx=(8, 0))
@@ -1676,20 +1786,21 @@ class App(ctk.CTk):
         qhead = ctk.CTkFrame(self, fg_color="transparent")
         qhead.grid(row=4, column=0, sticky="ew", pady=(8, 0), **pad)
         qhead.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(qhead, text="Очередь",
-                     font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(qhead, text=caps("Очередь"),
+                     font=title_font(15)).grid(row=0, column=0, sticky="w")
         ctk.CTkButton(qhead, text="🕘 История", width=100, height=26,
                       command=self.open_history, **outline).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(qhead, text="Убрать готовые", width=120, height=26,
                       command=self.clear_finished, **outline).grid(row=0, column=2)
 
-        self.queue_frame = ctk.CTkScrollableFrame(self, corner_radius=14)
+        self.queue_frame = ctk.CTkScrollableFrame(self, corner_radius=R(14))
         self.queue_frame.grid(row=5, column=0, sticky="nsew", pady=6, **pad)
         self.queue_frame.grid_columnconfigure(0, weight=1)
         self.empty_label = ctk.CTkLabel(self.queue_frame,
-                                        text="Здесь появятся ссылки для скачивания\n"
+                                        text=(caps("Очередь пуста") + "\n") * PHANTOM +
+                                             "Здесь появятся ссылки для скачивания\n"
                                              "Можно перетащить ссылку из браузера прямо в окно",
-                                        text_color=("gray50", "gray50"))
+                                        text_color=C.MUTED)
         self.empty_label.grid(row=0, column=0, pady=30)
 
         # --- общий прогресс
@@ -1707,30 +1818,30 @@ class App(ctk.CTk):
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=7, column=0, sticky="ew", pady=(4, 8), **pad)
         btns.grid_columnconfigure(3, weight=1)
-        self.start_btn = ctk.CTkButton(btns, text="⬇  Скачать", width=150, height=42,
-                                       corner_radius=10, fg_color=ACCENT,
+        self.start_btn = ctk.CTkButton(btns, text=caps("⬇  Скачать"), width=150, height=42,
+                                       corner_radius=R(10), fg_color=ACCENT,
                                        hover_color=ACCENT_HOVER,
-                                       font=ctk.CTkFont(size=15, weight="bold"),
+                                       font=title_font(15),
                                        command=self.start)
         self.start_btn.grid(row=0, column=0)
         self.cancel_btn = ctk.CTkButton(btns, text="⏸  Пауза", width=100, height=42,
-                                        corner_radius=10, state="disabled",
+                                        corner_radius=R(10), state="disabled",
                                         command=self.cancel, **secondary)
         self.cancel_btn.grid(row=0, column=1, padx=8)
         self.log_btn = ctk.CTkButton(btns, text="Журнал ▾", width=100, height=42,
-                                     corner_radius=10, command=self.toggle_log, **outline)
+                                     corner_radius=R(10), command=self.toggle_log, **outline)
         self.log_btn.grid(row=0, column=2)
         self.update_btn = ctk.CTkButton(btns, text="Обновить компоненты", width=170, height=42,
-                                        corner_radius=10, command=self.update_ytdlp, **outline)
+                                        corner_radius=R(10), command=self.update_ytdlp, **outline)
         self.update_btn.grid(row=0, column=4, padx=(0, 8))
         self.app_update_btn = ctk.CTkButton(btns, text="Проверить обновления", width=170,
-                                            height=42, corner_radius=10,
+                                            height=42, corner_radius=R(10),
                                             command=lambda: self.check_updates(manual=True),
                                             **outline)
         self.app_update_btn.grid(row=0, column=5)
 
         # --- журнал (скрыт по умолчанию)
-        self.log_box = ctk.CTkTextbox(self, height=130, corner_radius=10,
+        self.log_box = ctk.CTkTextbox(self, height=130, corner_radius=R(10),
                                       font=ctk.CTkFont(family="Consolas", size=12))
         self.log_box.configure(state="disabled")
         self.log_visible = False
@@ -2827,7 +2938,7 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     """Downloader.exe --selftest URL ПАПКА [СТРАНИЦА] — проверка сборки на GitHub.
     Открывает окно, затем качает URL в разных форматах. СТРАНИЦА — «клип» с обложкой
     и субтитрами для проверки музыкальных функций. Код выхода 0 — всё хорошо."""
-    global NO_SAVE
+    global NO_SAVE, FORCE_STYLE
     NO_SAVE = True
     os.makedirs(out_dir, exist_ok=True)
     log_file = open(os.path.join(out_dir, "selftest.log"), "w", encoding="utf-8")
@@ -2846,15 +2957,22 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             failed += 1
             log(f"FAIL нет {name}")
 
-    # 1. окно открывается без ошибок
-    try:
-        app = App()
-        app.update()
-        app.quit_app()
-        log("OK   окно программы")
-    except Exception as e:
-        failed += 1
-        log(f"FAIL окно программы: {e!r}")
+    # 1. окно открывается без ошибок — в обоих оформлениях, с окнами настроек и истории
+    for style in ("phantom", "classic"):
+        FORCE_STYLE = style
+        try:
+            app = App()
+            app.update()
+            app.open_settings()
+            app.open_history()
+            app.open_bulk()
+            app.update()
+            app.quit_app()
+            log(f"OK   окно программы ({style})")
+        except Exception as e:
+            failed += 1
+            log(f"FAIL окно программы ({style}): {e!r}")
+    FORCE_STYLE = None
 
     # 2. скачивание в разных форматах
     base = {"playlist": False, "subs": False, "embed": True, "exact": True,
