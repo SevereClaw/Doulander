@@ -3086,7 +3086,39 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     return 1 if failed else 0
 
 
+def screenshot(out_path, style, urls):
+    """Downloader.exe --screenshot ФАЙЛ.png СТИЛЬ ССЫЛКА... — снимок окна для проверки дизайна."""
+    global NO_SAVE, FORCE_STYLE
+    NO_SAVE, FORCE_STYLE = True, style
+    from PIL import ImageGrab
+    app = App()
+    app.geometry("900x760+0+0")
+    for url in urls:
+        app.add_item(url)
+    if app.items:
+        app.items[0].set_state("run")
+        app.items[0].set_progress(0.42)
+        app.items[0].set_status("42.0%   •   8.31MiB/s   •   осталось 00:07")
+    if len(app.items) > 1:
+        app.items[-1].set_state("done")
+        app.items[-1].set_status("✓ Готово", GREEN)
+    app.set_main_status("Качается: 1   •   в очереди: 1   •   готово: 1")
+    app.progress.set(0.47)
+
+    def grab():
+        app.update()
+        x, y = app.winfo_rootx(), app.winfo_rooty()
+        w, h = app.winfo_width(), app.winfo_height()
+        ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).save(out_path)
+        app.quit_app()
+    app.after(9000, grab)          # ждём превью и обложки
+    app.mainloop()
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--screenshot":
+        sys.exit(screenshot(sys.argv[2], sys.argv[3], sys.argv[4:]))
     if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":
         extra = sys.argv[4:] + [None, None]
         sys.exit(selftest(sys.argv[2], sys.argv[3], extra[0] or None, extra[1] or None))

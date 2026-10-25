@@ -173,3 +173,29 @@ jobs:
             app/Downloader.exe
             app/update.bat
           generate_release_notes: true
+
+      # Снимки окна в обоих оформлениях — в ветку screenshots (для проверки дизайна)
+      - name: Снимки интерфейса
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $srv = Start-Process python -ArgumentList 'tests/range_server.py','testdata','8765' -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          New-Item -ItemType Directory -Force shots | Out-Null
+          foreach ($style in 'phantom','classic') {
+            Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\$style.png",$style,'http://127.0.0.1:8765/clip.html','http://127.0.0.1:8765/test.mp4' -Wait
+          }
+          Stop-Process $srv -ErrorAction SilentlyContinue
+          Get-ChildItem shots
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          $tmp = Join-Path $env:RUNNER_TEMP 'shots'
+          Copy-Item shots $tmp -Recurse
+          git checkout --orphan screenshots
+          git rm -rf --quiet .
+          Copy-Item "$tmp\*.png" .
+          git add *.png
+          git commit -m "Снимки интерфейса, сборка ${{ github.run_id }}"
+          git push -f origin screenshots
