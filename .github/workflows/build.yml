@@ -80,13 +80,13 @@ jobs:
           ./tests/report.ps1 selftest-yt/selftest.log "Проверка YouTube" $p.ExitCode
 
       - name: Сохранить полную сборку (вкладка Actions → Artifacts)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Downloader
           path: Downloader/
 
       - name: Сохранить только программу (для update.bat)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Downloader-app
           path: app/
