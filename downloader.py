@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import tempfile
 import urllib.parse
@@ -34,7 +35,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -275,6 +276,8 @@ DEFAULTS = {
     "lyrics": False,        # музыка: тексты песен (.lrc рядом с треком)
     "proxy_mode": "Нет",    # Нет / Только YouTube / Все сайты
     "proxy": "",            # например socks5://127.0.0.1:10808
+    "auto_ytdlp": True,     # тихо обновлять yt-dlp раз в день
+    "ytdlp_checked": 0,     # когда последний раз проверяли (время в секундах)
 }
 
 ACCENT = "#E5484D"
@@ -390,7 +393,38 @@ def normalize_proxy(text):
     return text
 
 
+SEARCH_PREFIX = "ytsearch1:"          # первый результат поиска на YouTube
+
+
+def is_search(url):
+    return url.startswith("ytsearch")
+
+
+def display_url(url):
+    return "🔍 " + url.split(":", 1)[1] if is_search(url) else url
+
+
+def parse_input(text, allow_search=True):
+    """Текст (одна строка или список) -> ссылки для yt-dlp.
+    Строка со ссылкой — ссылки; строка без ссылки — поиск песни/видео на YouTube."""
+    result = []
+    for line in text.splitlines():
+        line = line.strip().strip("\"'«»")
+        if not line:
+            continue
+        urls = re.findall(r"https?://[^\s\"'<>]+", line)
+        if urls:
+            result += urls
+        elif allow_search:
+            query = re.sub(r"^\s*\d{1,3}[.)]\s+", "", line).strip()   # «1. Песня» -> «Песня»
+            if query:
+                result.append(SEARCH_PREFIX + query)
+    return result
+
+
 def is_youtube(url):
+    if is_search(url):
+        return True
     try:
         host = urllib.parse.urlsplit(url).hostname or ""
     except ValueError:
@@ -929,7 +963,7 @@ class QueueItem(ctk.CTkFrame):
                                   font=ctk.CTkFont(size=12, weight="bold"))
         self.thumb.grid(row=0, column=0, rowspan=4, padx=(8, 12), pady=8)
 
-        self.title_lbl = ctk.CTkLabel(self, text=url, anchor="w",
+        self.title_lbl = ctk.CTkLabel(self, text=display_url(url), anchor="w",
                                       font=ctk.CTkFont(size=13, weight="bold"))
         self.title_lbl.grid(row=0, column=1, sticky="ew", pady=(8, 0))
 
@@ -1187,6 +1221,57 @@ class HistoryWindow(ctk.CTkToplevel):
         self.refresh()
 
 
+# ================================================================ окно «Список»
+class BulkWindow(ctk.CTkToplevel):
+    """Большое поле: сразу много ссылок или названий песен, по одному на строку."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Список ссылок и песен")
+        self.geometry("620x520")
+        self.minsize(460, 360)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self, anchor="w", justify="left", text_color=GRAY_TEXT,
+                     text="По одной на строку: ссылка или название песни.\n"
+                          "Например: «Король и Шут — Лесник». Названия ищутся на YouTube, "
+                          "берётся первый результат.").grid(
+            row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        self.text = ctk.CTkTextbox(self, corner_radius=10, font=ctk.CTkFont(size=14))
+        self.text.grid(row=1, column=0, sticky="nsew", padx=16)
+        self.text.bind("<KeyRelease>", lambda e: self.update_count())
+        self.text.bind("<<Paste>>", lambda e: self.after(50, self.update_count))
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="ew", padx=16, pady=12)
+        bottom.grid_columnconfigure(0, weight=1)
+        self.count = ctk.CTkLabel(bottom, text="", anchor="w", text_color=GRAY_TEXT)
+        self.count.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(bottom, text="В очередь", width=110,
+                      command=lambda: self.submit(False)).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkButton(bottom, text="⬇  Скачать всё", width=140, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, command=lambda: self.submit(True)).grid(
+            row=0, column=2, padx=(8, 0))
+        self.update_count()
+        self.after(150, self.lift)
+        self.after(200, self.text.focus_set)
+
+    def update_count(self):
+        items = parse_input(self.text.get("1.0", "end"))
+        searches = sum(1 for u in items if is_search(u))
+        self.count.configure(text=f"Ссылок: {len(items) - searches}   •   "
+                                  f"песен для поиска: {searches}")
+
+    def submit(self, start):
+        added = self.app.add_many(self.text.get("1.0", "end"))
+        if added:
+            self.destroy()
+            if start:
+                self.app.start()
+
+
 # ================================================================ окно настроек
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, app):
@@ -1217,6 +1302,8 @@ class SettingsWindow(ctk.CTkToplevel):
                     app.toggle_autostart,
                     None if getattr(sys, "frozen", False) else "Доступно только в Downloader.exe")
         self.switch("Проверять обновления при запуске", app.v_check_updates, app._save)
+        self.switch("Обновлять yt-dlp автоматически (раз в день, тихо)", app.v_auto_ytdlp,
+                    app._save)
 
         # --- скачивание
         self.section("Скачивание")
@@ -1421,6 +1508,8 @@ class App(ctk.CTk):
         self.after(100, self._poll_events)
         self.after(300, self._autopaste)
         self.after(700, self._watch_clipboard)
+        self._tools_busy = False
+        self.after(8000, self._auto_ytdlp_tick)
         if self.settings["check_updates"] and getattr(sys, "frozen", False):
             self.after(2000, lambda: self.check_updates(manual=False))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1451,6 +1540,7 @@ class App(ctk.CTk):
         self.v_sound = B(value=s["sound"])
         self.v_autostart = B(value=s["autostart"])
         self.v_check_updates = B(value=s["check_updates"])
+        self.v_auto_ytdlp = B(value=s["auto_ytdlp"])
         self.v_parallel = S(value=str(s["parallel"]))
         self.v_playlist = B(value=s["playlist"])
         self.v_subs = B(value=s["subs"])
@@ -1515,14 +1605,16 @@ class App(ctk.CTk):
         url_row.grid(row=2, column=0, sticky="ew", pady=8, **pad)
         url_row.grid_columnconfigure(0, weight=1)
         self.url_entry = ctk.CTkEntry(url_row, height=42, corner_radius=10,
-                                      placeholder_text="Вставьте ссылку (Ctrl+V) и нажмите Enter…",
+                                      placeholder_text="Ссылка или название песни — и Enter",
                                       font=ctk.CTkFont(size=14))
         self.url_entry.grid(row=0, column=0, sticky="ew")
         self.url_entry.bind("<Return>", lambda e: self.add_from_entry())
         ctk.CTkButton(url_row, text="Вставить", width=90, height=42, corner_radius=10,
                       command=self.paste_clipboard, **secondary).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkButton(url_row, text="📋 Список", width=100, height=42, corner_radius=10,
+                      command=self.open_bulk, **secondary).grid(row=0, column=2, padx=(8, 0))
         ctk.CTkButton(url_row, text="+ В очередь", width=110, height=42, corner_radius=10,
-                      command=self.add_from_entry).grid(row=0, column=2, padx=(8, 0))
+                      command=self.add_from_entry).grid(row=0, column=3, padx=(8, 0))
 
         # --- настройки
         card = ctk.CTkFrame(self, corner_radius=14)
@@ -1804,6 +1896,7 @@ class App(ctk.CTk):
                              parallel=self.v_parallel.get(), clip_watch=self.v_clip.get(),
                              autostart=self.v_autostart.get(),
                              check_updates=self.v_check_updates.get(),
+                             auto_ytdlp=self.v_auto_ytdlp.get(),
                              organize=self.v_org.get(), name_template=self.v_name.get(),
                              custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
@@ -1877,17 +1970,32 @@ class App(ctk.CTk):
             self.url_entry.insert(0, text)
 
     def add_from_entry(self):
-        added = False
-        # можно вставить сразу несколько ссылок через пробел или с новой строки
-        for url in self.url_entry.get().split():
-            if url.startswith("http"):
-                if not self.add_item(url):
-                    return False
-                added = True
+        added = self.add_many(self.url_entry.get())
         if added:
             self.url_entry.delete(0, "end")
             self._last_clip = self._read_clipboard()   # чтобы перехват не добавил её ещё раз
         return added
+
+    def add_many(self, text, allow_search=True):
+        """Добавляет ссылки и названия из текста. Возвращает, сколько добавлено."""
+        items = parse_input(text, allow_search)
+        added = 0
+        for url in items:
+            if not self.add_item(url):
+                break
+            added += 1
+        if added > 1:
+            searches = sum(1 for u in items[:added] if is_search(u))
+            self.set_main_status(f"Добавлено: {added}" +
+                                 (f" (из них поиском по названию: {searches})" if searches else ""))
+        return added
+
+    def open_bulk(self):
+        if getattr(self, "bulk_win", None) and self.bulk_win.winfo_exists():
+            self.bulk_win.deiconify()
+            self.bulk_win.lift()
+            return
+        self.bulk_win = BulkWindow(self)
 
     def add_item(self, url, opts=None):
         try:
@@ -1963,6 +2071,16 @@ class App(ctk.CTk):
                 self.events.put(("meta", item, None, "Не удалось получить информацию"
                                  + (f": {err[:60]}" if err else ""), ACCENT))
                 return
+            if is_search(item.url):
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    self.events.put(("meta", item, None, "Ничего не найдено по этому запросу",
+                                     ACCENT))
+                    return
+                info = entries[0]
+                real = info.get("webpage_url") or \
+                    f"https://www.youtube.com/watch?v={info.get('id')}"
+                self.events.put(("resolved", item, real))
             s = summarize(info, item.opts)
             self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
         if s.get("thumb"):
@@ -1992,6 +2110,10 @@ class App(ctk.CTk):
     def start(self):
         self.add_from_entry()
         if self.workers_alive:
+            return
+        if self._tools_busy:                 # как раз обновляется yt-dlp — подождём
+            self.set_main_status("Обновляется yt-dlp — загрузка начнётся через пару секунд…")
+            self.after(1500, self.start)
             return
         for item in self.items:
             # повторить неудачные и продолжить остановленные кнопкой «Пауза»
@@ -2354,6 +2476,12 @@ class App(ctk.CTk):
                     if e[1].winfo_exists():
                         e[1].set_title(e[2])
                         e[1].set_meta(e[3], e[4])
+                elif kind == "auto_ytdlp":
+                    self._on_auto_ytdlp(e[1])
+                elif kind == "resolved":
+                    if e[1].st in ("wait", "paused"):      # дальше качаем по найденной ссылке
+                        e[1].url = e[2]
+                        save_needed = True
                 elif kind == "thumb":
                     if e[1].winfo_exists():
                         e[1].set_thumb(e[2])
@@ -2467,6 +2595,56 @@ class App(ctk.CTk):
             return proxy
         return None
 
+    # ------------------------------------------------------------ тихое обновление yt-dlp
+    def _auto_ytdlp_tick(self):
+        """Раз в час смотрит, не пора ли обновить yt-dlp (раз в сутки), и делает это тихо."""
+        delay = 3600 * 1000
+        try:
+            due = time.time() - float(self.settings.get("ytdlp_checked") or 0) > 20 * 3600
+            if self.v_auto_ytdlp.get() and due and not NO_SAVE and os.path.isfile(YTDLP):
+                if self.workers_alive or self._tools_busy:
+                    delay = 10 * 60 * 1000          # идёт скачивание — попробуем позже
+                else:
+                    self._silent_ytdlp_update()
+        finally:
+            self.after(delay, self._auto_ytdlp_tick)
+
+    def _silent_ytdlp_update(self):
+        self._tools_busy = True
+
+        def run():
+            try:
+                p = subprocess.run([YTDLP, "-U"], capture_output=True, cwd=BASE_DIR,
+                                   timeout=300, creationflags=NO_WINDOW)
+                out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                out = str(e)
+            ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
+            ver = ver.group(0) if ver else ""
+            if "Updated yt-dlp" in out:
+                result = ("updated", ver)
+            elif "up to date" in out:
+                result = ("same", ver)
+            else:
+                result = ("failed", out.strip().splitlines()[-1] if out.strip() else "")
+            self.events.put(("auto_ytdlp", result))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_auto_ytdlp(self, result):
+        self._tools_busy = False
+        kind, text = result
+        if kind in ("updated", "same"):
+            self.settings["ytdlp_checked"] = time.time()
+            self._save()
+        if kind == "updated":
+            self.log(f"yt-dlp обновился автоматически: {text}")
+            if not self.workers_alive:
+                self.set_main_status(f"✓ yt-dlp обновился до {text}", GREEN)
+        elif kind == "same":
+            self.log(f"yt-dlp: последняя версия {text}")
+        else:
+            self.log(f"Автообновление yt-dlp не удалось: {text}")
+
     def _check_tools(self):
         """Если в папке программы чего-то не хватает — предлагает докачать."""
         missing = missing_tools()
@@ -2551,7 +2729,7 @@ class App(ctk.CTk):
 
     def _on_drop(self, data):
         """Что-то бросили в окно: ссылку из браузера, ярлык .url или .txt со ссылками."""
-        texts = [data]
+        texts, lists = [data], []
         if not re.match(r"\s*https?://", data):
             try:
                 paths = self.tk.splitlist(data)
@@ -2561,13 +2739,18 @@ class App(ctk.CTk):
                 if os.path.isfile(path) and path.lower().endswith((".url", ".txt")):
                     try:
                         with open(path, encoding="utf-8", errors="replace") as f:
-                            texts.append(f.read())
+                            (lists if path.lower().endswith(".txt") else texts).append(f.read())
                     except OSError:
                         pass
         known = {i.url for i in self.items}
         urls = []
         for text in texts:
             for url in re.findall(r"https?://[^\s\"'<>]+", text):
+                if url not in known and url not in urls:
+                    urls.append(url)
+        # .txt может быть списком песен без ссылок — их ищем по названию
+        for text in lists:
+            for url in parse_input(text):
                 if url not in known and url not in urls:
                     urls.append(url)
         added = [u for u in urls if self.add_item(u)]
