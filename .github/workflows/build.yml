@@ -82,6 +82,12 @@ jobs:
           Add-Content selftest/selftest.log "Запросов через тестовый прокси: $hits"
           $code = $p.ExitCode
           if ($hits -eq 0) { Add-Content selftest/selftest.log "FAIL прокси не использовался"; $code = 1 }
+          # перезапуск программы самой собой (обновление, смена оформления):
+          # старая копия сразу закрывается, новая должна запуститься
+          Start-Process Downloader/Downloader.exe -ArgumentList '--spawn-test',"$PWD\spawn-ok.txt" -Wait
+          for ($i = 0; $i -lt 20 -and -not (Test-Path spawn-ok.txt); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path spawn-ok.txt) { Add-Content selftest/selftest.log "OK   перезапуск программы самой собой" }
+          else { Add-Content selftest/selftest.log "FAIL перезапуск: новая копия не запустилась"; $code = 1 }
           ./tests/report.ps1 selftest/selftest.log "Самопроверка" $code
 
       # YouTube иногда не пускает серверы GitHub, поэтому эта проверка только для информации.

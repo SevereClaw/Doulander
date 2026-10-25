@@ -37,7 +37,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.11.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -605,11 +605,25 @@ def init_style():
         C.FOLDER_TEXT = (ps.WHITE, ps.WHITE)
 
 
+def clean_env():
+    """Окружение для запуска новой копии программы.
+    Собранный exe распаковывается во временную папку _MEI… и пишет её в переменные
+    окружения. Если новая копия их унаследует, она возьмёт Python из папки старой копии,
+    которая удалится при выходе, — и упадёт с «Failed to load Python DLL»."""
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("_PYI") or key in ("_MEIPASS2", "TCL_LIBRARY", "TK_LIBRARY",
+                                             "TKPATH", "PYTHONHOME", "PYTHONPATH"):
+            env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def restart_program(app):
     """Перезапуск — новое оформление применяется только к новым окнам."""
     args = [sys.executable] if getattr(sys, "frozen", False) else \
         [sys.executable, os.path.abspath(__file__)]
-    subprocess.Popen(args, cwd=BASE_DIR)
+    subprocess.Popen(args, cwd=BASE_DIR, env=clean_env())
     app.quit_app()
 
 
@@ -2812,7 +2826,7 @@ class App(ctk.CTk):
             return
         # update.bat закроет программу, заменит exe и запустит новую версию
         subprocess.Popen(f'start "Обновление Downloader" "{path}" /auto',
-                         shell=True, cwd=BASE_DIR)
+                         shell=True, cwd=BASE_DIR, env=clean_env())
         self.quit_app()
 
     # ------------------------------------------------------------ события из потоков
@@ -3403,6 +3417,14 @@ def screenshot(out_path, style, urls):
 
 
 if __name__ == "__main__":
+    # для автопроверки перезапуска: новая копия должна стартовать, даже если старая уже закрылась
+    if len(sys.argv) >= 3 and sys.argv[1] == "--ping":
+        with open(sys.argv[2], "w", encoding="utf-8") as f:
+            f.write("ok")
+        sys.exit(0)
+    if len(sys.argv) >= 3 and sys.argv[1] == "--spawn-test":
+        subprocess.Popen([sys.executable, "--ping", sys.argv[2]], env=clean_env())
+        sys.exit(0)
     if len(sys.argv) >= 4 and sys.argv[1] == "--screenshot":
         sys.exit(screenshot(sys.argv[2], sys.argv[3], sys.argv[4:]))
     if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":

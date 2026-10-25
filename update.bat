@@ -3,6 +3,13 @@ title Обновление Downloader
 chcp 65001 >nul
 cd /d "%~dp0"
 :: Запуск из программы: update.bat /auto — без вопросов, в конце сразу открывает Downloader
+:: Если update.bat запустила сама программа — сбрасываем переменные её распаковки,
+:: иначе новый Downloader.exe не запустится («Failed to load Python DLL»)
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+for /f "delims==" %%v in ('set _PYI 2^>nul') do set "%%v="
+set "_MEIPASS2="
+set "TCL_LIBRARY="
+set "TK_LIBRARY="
 
 set "REPO=SevereClaw/Doulander"
 set "TMPD=%TEMP%\downloader_update"
