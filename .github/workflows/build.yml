@@ -56,17 +56,20 @@ jobs:
           Get-ChildItem Downloader
           Compress-Archive -Path Downloader -DestinationPath Downloader.zip
 
-      # Проверка: программа открывается и качает тестовое видео в MP4, MKV, MP3 и FLAC.
+      # Проверка: программа открывается и качает тестовое видео в MP4, MKV, MP3 и FLAC,
+      # а для музыки — квадратная обложка, выравнивание громкости и текст песни.
       # Если не прошла — сборка красная, и update.bat её не скачает.
       - name: Автопроверка программы
         shell: pwsh
         timeout-minutes: 10
         run: |
           New-Item -ItemType Directory -Force testdata | Out-Null
-          Downloader/ffmpeg.exe -loglevel error -f lavfi -i testsrc=duration=6:size=1280x720:rate=25 -f lavfi -i sine=frequency=440:duration=6 -c:v libx264 -c:a aac -shortest -y testdata/test.mp4
+          Downloader/ffmpeg.exe -loglevel error -f lavfi -i testsrc=duration=6:size=1280x720:rate=25 -f lavfi -i sine=frequency=440:duration=6 -af volume=-12dB -c:v libx264 -c:a aac -shortest -y testdata/test.mp4
+          Downloader/ffmpeg.exe -loglevel error -f lavfi -i testsrc=size=1280x720 -frames:v 1 -y testdata/thumb.jpg
+          Copy-Item tests/clip.html, tests/lyrics.vtt testdata/
           $srv = Start-Process python -ArgumentList 'tests/range_server.py','testdata','8765' -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 2
-          $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','http://127.0.0.1:8765/test.mp4',"$PWD\selftest" -Wait -PassThru
+          $p = Start-Process Downloader/Downloader.exe -ArgumentList '--selftest','http://127.0.0.1:8765/test.mp4',"$PWD\selftest",'http://127.0.0.1:8765/clip.html' -Wait -PassThru
           Stop-Process $srv -ErrorAction SilentlyContinue
           ./tests/report.ps1 selftest/selftest.log "Самопроверка" $p.ExitCode
 

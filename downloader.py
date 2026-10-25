@@ -32,7 +32,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -254,6 +254,9 @@ DEFAULTS = {
     "custom_template": "%(uploader)s - %(title)s",
     "sponsorblock": False,  # вырезать рекламные вставки (YouTube)
     "chapters": False,      # разбивать на отдельные файлы по главам
+    "square_cover": True,   # музыка: квадратная обложка
+    "normalize": False,     # музыка: выравнивать громкость
+    "lyrics": False,        # музыка: тексты песен (.lrc рядом с треком)
 }
 
 ACCENT = "#E5484D"
@@ -465,7 +468,16 @@ def build_command(url, opts, folder, fragments=8):
     if opts["embed"]:
         if opts["fmt"] not in NO_THUMB_FORMATS:
             cmd += ["--embed-thumbnail"]
+            if opts["mode"] == "Аудио" and opts.get("square"):
+                # обложка 16:9 -> квадрат по центру, как у альбома.
+                # jpg превращаем в png, остальное в jpg — иначе yt-dlp не трогает картинку
+                cmd += ["--convert-thumbnails", "webp>jpg/png>jpg/jpg>png",
+                        "--ppa", "ThumbnailsConvertor:-qmin 1 -q:v 1 -vf "
+                                 "crop=\"'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'\""]
         cmd += ["--embed-metadata"]
+    if opts["mode"] == "Аудио" and opts.get("lyrics"):
+        # настоящие (не автоматические) субтитры клипа -> файл .lrc с таймингами
+        cmd += ["--write-subs", "--sub-langs", "ru.*,en.*", "--convert-subs", "lrc"]
     if opts.get("sponsor"):
         # реклама, самореклама, «подпишитесь»; для музыки — ещё и не-музыкальные куски
         cats = "sponsor,selfpromo,interaction"
@@ -584,6 +596,92 @@ def load_thumbnail(url):
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=16, fill=255)
     img.putalpha(mask)
     return img
+
+
+AUDIO_ENCODERS = {      # чем перекодировать после выравнивания громкости
+    "MP3": ["-c:a", "libmp3lame", "-q:a", "0", "-ar", "44100"],
+    "M4A": ["-c:a", "aac", "-b:a", "256k", "-ar", "44100"],
+    "OPUS": ["-c:a", "libopus", "-b:a", "192k", "-ar", "48000"],
+    "FLAC": ["-c:a", "flac", "-ar", "44100"],
+    "WAV": ["-c:a", "pcm_s16le", "-ar", "44100"],
+}
+LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"      # уровень как у Spotify / YouTube Music
+
+
+def audio_files(paths):
+    """Все аудиофайлы: сами файлы и содержимое папок (после разбивки по главам)."""
+    exts = tuple("." + v[0] for v in AUDIO_FORMATS.values())
+    result = []
+    for p in paths:
+        if os.path.isdir(p):
+            result += [os.path.join(p, f) for f in sorted(os.listdir(p))
+                       if f.lower().endswith(exts)]
+        elif os.path.isfile(p) and p.lower().endswith(exts):
+            result.append(p)
+    return result
+
+
+def tidy_lyrics(files):
+    """«Трек.ru.lrc» -> «Трек.lrc» (так его находят Poweramp, foobar и др.).
+    Если есть несколько языков — берём русский, потом английский."""
+    found = 0
+    for f in files:
+        stem = os.path.splitext(f)[0]
+        folder, base = os.path.split(stem)
+        try:
+            names = os.listdir(folder or ".")
+        except OSError:
+            continue
+        cands = [n for n in names if n.startswith(base + ".") and n.lower().endswith(".lrc")
+                 and n != base + ".lrc"]
+        if not cands:
+            continue
+        cands.sort(key=lambda n: (0 if ".ru" in n[len(base):] else
+                                  1 if ".en" in n[len(base):] else 2, n))
+        try:
+            os.replace(os.path.join(folder, cands[0]), stem + ".lrc")
+            for extra in cands[1:]:
+                os.remove(os.path.join(folder, extra))
+            found += 1
+        except OSError:
+            pass
+    return found
+
+
+def normalize_audio(path, fmt):
+    """Приводит громкость трека к общему уровню. Обложка и теги сохраняются."""
+    root, ext = os.path.splitext(path)
+    tmp = f"{root}.norm{ext}"
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+           "-map", "0", "-map_metadata", "0", "-c", "copy",
+           *AUDIO_ENCODERS.get(fmt, AUDIO_ENCODERS["MP3"]), "-af", LOUDNORM, tmp]
+    p = subprocess.run(cmd, capture_output=True, timeout=1800, creationflags=NO_WINDOW)
+    if p.returncode != 0 or not os.path.isfile(tmp):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise RuntimeError(p.stderr.decode("utf-8", "replace").strip()[-300:])
+    os.replace(tmp, path)
+
+
+def postprocess_audio(paths, opts, status=None):
+    """После скачивания: тексты песен и выравнивание громкости. Возвращает заметки для журнала."""
+    notes = []
+    if opts.get("mode") != "Аудио":
+        return notes
+    files = audio_files(paths)
+    if opts.get("lyrics"):
+        n = tidy_lyrics(files)
+        notes.append(f"тексты песен: {n}" if n else "у этого видео нет субтитров с текстом")
+    if opts.get("normalize") and FFMPEG:
+        for i, f in enumerate(files, 1):
+            if status:
+                status(f"Выравниваю громкость… {i}/{len(files)}")
+            try:
+                normalize_audio(f, opts.get("fmt", "MP3"))
+            except Exception as e:
+                notes.append(f"громкость не выровнена ({os.path.basename(f)}): {e}")
+        notes.append(f"громкость выровнена: {len(files)}")
+    return notes
 
 
 def finalize_chapters(files):
@@ -883,6 +981,14 @@ class SettingsWindow(ctk.CTkToplevel):
                   "Firefox или файл cookies.txt (расширение «Get cookies.txt LOCALLY»).")
 
         # --- папки и имена файлов
+        self.section("Музыка (режим «Аудио»)")
+        self.check("Квадратная обложка — как у альбома, а не кадр 16:9", app.v_square)
+        self.check("Выравнивать громкость — все треки звучат одинаково громко", app.v_normalize)
+        self.check("Тексты песен — файл .lrc рядом с треком (Poweramp, foobar, AIMP)",
+                   app.v_lyrics)
+        self.hint("Тексты берутся из субтитров клипа — они есть не у всех видео. "
+                  "Выравнивание громкости заново кодирует трек, это занимает несколько секунд.")
+
         self.section("Папки и имена файлов")
         line = self.line()
         ctk.CTkLabel(line, text="Раскладывать:").pack(side="left")
@@ -1035,6 +1141,9 @@ class App(ctk.CTk):
         self.v_sponsor = B(value=s["sponsorblock"])
         self.v_chapters = B(value=s["chapters"])
         self.v_exact = B(value=s["exact_cut"])
+        self.v_square = B(value=s["square_cover"])
+        self.v_normalize = B(value=s["normalize"])
+        self.v_lyrics = B(value=s["lyrics"])
         self.v_cookies = S(value=s["cookies"] if s["cookies"] in COOKIE_SOURCES else "Нет")
         self.v_org = S(value=s["organize"] if s["organize"] in ORGANIZE else "Не раскладывать")
         self.v_name = S(value=s["name_template"] if s["name_template"] in NAME_TEMPLATES
@@ -1380,7 +1489,9 @@ class App(ctk.CTk):
                              custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
-                             chapters=self.v_chapters.get())
+                             chapters=self.v_chapters.get(),
+                             square_cover=self.v_square.get(),
+                             normalize=self.v_normalize.get(), lyrics=self.v_lyrics.get())
         save_settings(self.settings)
 
     def current_opts(self):
@@ -1397,6 +1508,9 @@ class App(ctk.CTk):
                 "embed": self.v_embed.get(),
                 "sponsor": self.v_sponsor.get(),
                 "chapters": self.v_chapters.get(),
+                "square": self.v_square.get(),
+                "normalize": self.v_normalize.get(),
+                "lyrics": self.v_lyrics.get(),
                 "cut": cut, "exact": self.v_exact.get(),
                 "layout": {"org": self.v_org.get(), "name": self.v_name.get(),
                            "custom": self.v_custom.get()},
@@ -1735,11 +1849,17 @@ class App(ctk.CTk):
             ev(("item_status", item, f"⏸ На паузе — {int(item.frac * 100)}%", None))
             return None
         if code == 0:
+            targets = list(files)
             if item.opts.get("chapters"):
                 folder = finalize_chapters(files)
                 if folder:
                     item.file_path = folder
+                    targets = [folder]
                     ev(("log", "✓ Разбито по главам: " + folder))
+            for note in postprocess_audio(
+                    targets, item.opts,
+                    lambda text: ev(("item_progress", item, 1.0, text))):
+                ev(("log", f"♪ {item.full_title or item.url}: {note}"))
             ev(("history", item))
             ev(("state", item, "done"))
             ev(("item_status", item, "✓ Готово", GREEN))
@@ -2167,9 +2287,26 @@ class App(ctk.CTk):
 
 
 # ================================================================ самопроверка
-def selftest(url, out_dir):
-    """Downloader.exe --selftest URL ПАПКА — проверка сборки на GitHub.
-    Открывает окно, затем качает URL в разных форматах. Код выхода 0 — всё хорошо."""
+def measure_cover(path):
+    """Размер вшитой обложки (ширина, высота) — через ffmpeg."""
+    p = subprocess.run([FFMPEG, "-hide_banner", "-i", path], capture_output=True,
+                       creationflags=NO_WINDOW)
+    m = re.search(r"Video: .*?(\d{2,5})x(\d{2,5})", p.stderr.decode("utf-8", "replace"))
+    return (int(m[1]), int(m[2])) if m else None
+
+
+def measure_loudness(path):
+    """Средняя громкость трека в LUFS."""
+    p = subprocess.run([FFMPEG, "-hide_banner", "-nostats", "-i", path, "-af", "ebur128",
+                        "-f", "null", "-"], capture_output=True, creationflags=NO_WINDOW)
+    vals = re.findall(r"I:\s+(-?\d+(?:\.\d+)?) LUFS", p.stderr.decode("utf-8", "replace"))
+    return float(vals[-1]) if vals else None
+
+
+def selftest(url, out_dir, page_url=None):
+    """Downloader.exe --selftest URL ПАПКА [СТРАНИЦА] — проверка сборки на GitHub.
+    Открывает окно, затем качает URL в разных форматах. СТРАНИЦА — «клип» с обложкой
+    и субтитрами для проверки музыкальных функций. Код выхода 0 — всё хорошо."""
     global NO_SAVE
     NO_SAVE = True
     os.makedirs(out_dir, exist_ok=True)
@@ -2247,6 +2384,44 @@ def selftest(url, out_dir):
             failed += 1
             log(f"FAIL {name}: {e!r}")
 
+    # 3. музыка: квадратная обложка, громкость, тексты
+    if page_url:
+        opts = dict(base, mode="Аудио", quality="Лучшее", fmt="MP3",
+                    square=True, normalize=True, lyrics=True)
+        folder = os.path.join(out_dir, "music")
+        try:
+            p = subprocess.run(build_command(page_url, opts, folder), capture_output=True,
+                               timeout=300, env=env, creationflags=NO_WINDOW)
+            out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+            files = [ln[3:] for ln in out.splitlines() if ln.startswith("[F]")]
+            notes = postprocess_audio(files, opts) if p.returncode == 0 else []
+            mp3 = audio_files(files)
+            checks = []
+            if p.returncode != 0 or not mp3:
+                checks.append(("скачивание", False, f"код {p.returncode}"))
+            else:
+                cover = measure_cover(mp3[0])
+                checks.append(("квадратная обложка", bool(cover) and cover[0] == cover[1],
+                               f"{cover[0]}x{cover[1]}" if cover else "нет обложки"))
+                lufs = measure_loudness(mp3[0])
+                checks.append(("громкость", lufs is not None and abs(lufs + 14) <= 2,
+                               f"{lufs} LUFS (нужно около -14)"))
+                lrc = os.path.splitext(mp3[0])[0] + ".lrc"
+                text = open(lrc, encoding="utf-8", errors="replace").read() \
+                    if os.path.isfile(lrc) else ""
+                checks.append(("текст песни .lrc", "Первая строка" in text,
+                               os.path.basename(lrc) if text else "файла нет"))
+            for name, ok, detail in checks:
+                failed += 0 if ok else 1
+                log(f"{'OK  ' if ok else 'FAIL'} музыка — {name}: {detail}")
+            if notes:
+                log("      " + "; ".join(notes))
+            if not all(ok for _, ok, _ in checks):
+                log("\n".join("      " + ln for ln in out.splitlines()[-20:]))
+        except Exception as e:
+            failed += 1
+            log(f"FAIL музыка: {e!r}")
+
     log(f"Итог: {'ВСЁ ХОРОШО' if not failed else f'ошибок: {failed}'}")
     log_file.close()
     return 1 if failed else 0
@@ -2254,5 +2429,5 @@ def selftest(url, out_dir):
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":
-        sys.exit(selftest(sys.argv[2], sys.argv[3]))
+        sys.exit(selftest(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None))
     App().mainloop()

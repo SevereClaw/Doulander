@@ -12,6 +12,9 @@ import sys
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
+                      ".vtt": "text/vtt", ".html": "text/html; charset=utf-8"}
+
     def send_head(self):
         self._remaining = None
         path = self.translate_path(self.path)
