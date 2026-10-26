@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -865,7 +865,7 @@ def build_command(url, opts, folder, fragments=8, info_json=None):
         # --- скорость
         "-N", str(fragments),               # качать куски видео параллельно
         "--http-chunk-size", "10M",         # обходит ограничение скорости YouTube
-        "--retries", "10", "--fragment-retries", "10",
+        "--retries", "10", "--fragment-retries", "10", "--extractor-retries", "5",
         # Защитник Windows и индексатор на миг блокируют новые файлы — пробуем дольше
         "--file-access-retries", "10",
         "--socket-timeout", "15",
@@ -923,7 +923,8 @@ def build_command(url, opts, folder, fragments=8, info_json=None):
 
 def preview_command(url, opts):
     """Команда, которая только получает информацию о видео (без скачивания)."""
-    cmd = [YTDLP, url, "-J", "--no-warnings", "--socket-timeout", "15"]
+    cmd = [YTDLP, url, "-J", "--no-warnings", "--socket-timeout", "15",
+           "--extractor-retries", "5", "--retries", "5"]
     if opts["playlist"]:
         cmd += ["--yes-playlist", "--flat-playlist"]
     else:
@@ -1196,7 +1197,18 @@ def finalize_chapters(files):
 
 
 NET_ERRORS = ("timed out", "timeout", "connection", "unable to download webpage", "getaddrinfo",
-              "ssl", "remote end closed", "unreachable", "reset by peer", "proxy")
+              "ssl", "remote end closed", "unreachable", "reset by peer", "proxy",
+              "unable to download api page", "eof occurred", "bad record mac",
+              "incompleteread", "winerror 10054", "winerror 10060")
+
+
+NET_ATTEMPTS = 3
+
+
+def is_net_error(err):
+    """Сбой связи (обрыв, SSL, таймаут) — такое обычно проходит при повторе."""
+    low = (err or "").lower()
+    return any(k in low for k in NET_ERRORS)
 
 
 CODEC_NAMES = {"avc1": "H.264", "avc": "H.264", "h264": "H.264", "vp09": "VP9", "vp9": "VP9",
@@ -1268,6 +1280,9 @@ def explain_error(err, code, url="", proxy=None):
     low = err.lower()
     if any(k in low for k in NET_ERRORS):
         if proxy:
+            if "ssl" in low or "eof" in low or "reset" in low:
+                return ("Связь через прокси обрывается — переподключите VPN "
+                        "или выберите в нём другой сервер")
             return "Прокси не отвечает — проверьте, что VPN-программа запущена (⚙ → Сеть)"
         if is_youtube(url):
             return "YouTube не открывается напрямую — включите прокси: ⚙ Настройки → Сеть"
@@ -2741,27 +2756,47 @@ class App(ctk.CTk):
                 with self.lock:
                     self._previews -= 1
 
-    def _fetch_preview_inner(self, item):
+    def _preview_once(self, item, proxy):
+        """Один запуск yt-dlp за сведениями. Возвращает (сведения или None, текст ошибки)."""
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         try:
-            opts = dict(item.opts, proxy_url=self.proxy_for(item.url))
+            opts = dict(item.opts, proxy_url=proxy)
             p = subprocess.run(preview_command(item.url, opts), capture_output=True,
                                cwd=BASE_DIR, env=env, timeout=90,
                                creationflags=NO_WINDOW)
             info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
-        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-            info, p = None, None
-            self.events.put(("log", f"Превью {item.url}: {e}"))
+        except subprocess.TimeoutExpired:
+            return None, "timed out"
+        except (OSError, ValueError) as e:
+            return None, str(e)
+        if info:
+            return info, ""
+        lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
+                 .splitlines() if ln.startswith("ERROR")]
+        return None, lines[-1].replace("ERROR:", "").strip() if lines else ""
+
+    def _fetch_preview_inner(self, item):
+        proxy = self.proxy_for(item.url)
+        info, err = None, ""
+        for attempt in range(1, NET_ATTEMPTS + 1):
+            info, err = self._preview_once(item, proxy)
+            if info or not is_net_error(err) or item not in self.items:
+                break
+            # обрыв связи или сбой SSL (часто бывает с YouTube без VPN) — пробуем ещё раз
+            self.events.put(("log", f"Превью {item.url}: сбой связи, повтор "
+                                    f"{attempt + 1}/{NET_ATTEMPTS}: {err}"))
+            self.events.put(("meta", item, None,
+                             f"Сбой связи — пробую ещё раз ({attempt + 1}/{NET_ATTEMPTS})…",
+                             None))
+            time.sleep(2 * attempt)
         if not info:
-            err = ""
-            if p is not None:
-                lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
-                         .splitlines() if ln.startswith("ERROR")]
-                err = lines[-1].replace("ERROR:", "").strip() if lines else ""
             if err:
                 self.events.put(("log", f"Превью {item.url}: {err}"))
-            self.events.put(("meta", item, None, "Не удалось получить информацию"
-                             + (f": {err[:60]}" if err else ""), ACCENT))
+            text = explain_error(err, 1, item.url, proxy) if err else ""
+            if not text or text.startswith("Ошибка: "):
+                # непонятная ошибка — показываем её начало, полностью она в журнале
+                text = "Не удалось получить информацию" + (f": {err[:60]}" if err else "")
+            self.events.put(("meta", item, None, text, ACCENT))
             return
         if is_search(item.url):
             entries = [e for e in (info.get("entries") or []) if e]
@@ -2958,7 +2993,20 @@ class App(ctk.CTk):
             # пробуем обычным способом
             ev(("log", f"Повтор без сохранённых сведений: {item.url}"))
             item.info_json = None
+            info = None
             code, last_error, files = self._run_ytdlp(item, opts, None)
+        attempt = 1
+        while code not in (0, None) and is_net_error(last_error) \
+                and attempt < NET_ATTEMPTS and not self._stopped(item):
+            # обрыв связи / сбой SSL: yt-dlp продолжит с того же места (.part остаётся)
+            attempt += 1
+            ev(("log", f"Сбой связи, повтор {attempt}/{NET_ATTEMPTS}: {last_error}"))
+            ev(("item_status", item, f"Сбой связи — пробую ещё раз ({attempt}/{NET_ATTEMPTS})…",
+                None))
+            time.sleep(3 * attempt)
+            if self._stopped(item):
+                break
+            code, last_error, files = self._run_ytdlp(item, opts, info)
         if code is None:
             return False
 
@@ -3662,6 +3710,16 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
         if not ok:
             failed += 1
             log(f"FAIL нет {name}")
+
+    # сбой SSL / обрыв связи распознаётся (на нём программа повторяет попытку)
+    ssl_err = ("[youtube] 3VT85q-E-UU: Unable to download API page: [SSL: "
+               "DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac")
+    if is_net_error(ssl_err) and not is_net_error("Unsupported URL: x") and \
+            "прокси" in explain_error(ssl_err, 1, "https://youtu.be/x"):
+        log("OK   сбой SSL распознаётся как сбой связи")
+    else:
+        failed += 1
+        log("FAIL сбой SSL не распознан")
 
     # 1. окно открывается без ошибок — в обоих оформлениях, с окнами настроек и истории
     for style in ("phantom", "classic"):
