@@ -232,7 +232,9 @@ def grab_frame(ctx, path, t, w, h, cover=False):
 
 # ---------------------------------------------------------------- проигрыватель
 class Player:
-    """Кадры — из ffmpeg (rawvideo), звук — ffplay без окна. Время — по часам."""
+    """Кадры — из ffmpeg (rawvideo), звук — ffplay без окна.
+    Часы воспроизведения запускаются, когда пришёл первый кадр, — тогда же стартует звук.
+    Так картинка и звук совпадают, сколько бы ни запускался ffmpeg на этом компьютере."""
 
     def __init__(self, ctx, path, info, w, h, on_frame, on_end):
         self.ctx, self.path, self.info = ctx, path, info
@@ -246,9 +248,9 @@ class Player:
         self._gen = 0
 
     def position(self):
-        if not self.playing:
+        if not self.playing or self.wall0 is None:
             return self.pos0
-        return min(self.end, self.pos0 + (time.time() - self.wall0))
+        return min(self.end, self.pos0 + max(0.0, time.time() - self.wall0))
 
     def play(self, start, end, with_audio=True):
         self.stop()
@@ -257,7 +259,8 @@ class Player:
         self.pos0, self.end = start, end
         dur = max(0.05, end - start)
         self.playing = True
-        self.wall0 = time.time() + 0.12            # небольшая задержка на запуск ffmpeg
+        self.wall0 = None                          # часы пойдут с первым кадром
+        self.with_audio = with_audio
         nw = self.ctx.no_window
         if self.info.has_video:
             fps = min(self.info.fps, 30.0)
@@ -270,13 +273,20 @@ class Player:
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                 creationflags=nw)
             threading.Thread(target=self._read_video, args=(gen, fps), daemon=True).start()
-        if with_audio and self.info.has_audio and self.ctx.ffplay:
+        else:
+            self._start_clock()                    # только звук — часы сразу
+        threading.Thread(target=self._watch_end, args=(gen,), daemon=True).start()
+
+    def _start_clock(self):
+        """Пошли часы — запускаем и звук с того же места."""
+        self.wall0 = time.time()
+        if self.with_audio and self.info.has_audio and self.ctx.ffplay:
             self.aproc = subprocess.Popen(
                 [self.ctx.ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
-                 "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", self.path],
+                 "-ss", f"{self.pos0:.3f}", "-t", f"{max(0.05, self.end - self.pos0):.3f}",
+                 self.path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                creationflags=nw)
-        threading.Thread(target=self._watch_end, args=(gen,), daemon=True).start()
+                creationflags=self.ctx.no_window)
 
     def _read_video(self, gen, fps):
         size = self.w * self.h * 3
@@ -286,17 +296,22 @@ class Player:
             buf = proc.stdout.read(size)
             if not buf or len(buf) < size:
                 break
+            if gen != self._gen:
+                break
+            if self.wall0 is None:                      # первый кадр — пускаем часы и звук
+                self._start_clock()
             target = self.wall0 + i / fps
             delay = target - time.time()
             if delay > 0:
                 time.sleep(delay)
-            if delay > -1.5 / fps and gen == self._gen:     # сильно опаздываем — пропускаем
+            # опаздываем больше чем на четверть секунды — кадр пропускаем, иначе показываем
+            if delay > -0.25 and gen == self._gen:
                 self.on_frame(buf)
             i += 1
 
     def _watch_end(self, gen):
         while gen == self._gen and self.playing:
-            if time.time() - self.wall0 >= self.end - self.pos0:
+            if self.wall0 is not None and time.time() - self.wall0 >= self.end - self.pos0:
                 if gen == self._gen:
                     self.playing = False
                     self.pos0 = self.end
@@ -373,7 +388,10 @@ class VideoEditor(ctk.CTkToplevel):
                                  width=self.PREVIEW_W, height=self.PREVIEW_H)
         self.preview.grid(row=1, column=0, padx=16, sticky="n")
         self._img_item = self.preview.create_image(self.PREVIEW_W // 2, self.PREVIEW_H // 2)
-        self._overlay = self.preview.create_text(16, self.PREVIEW_H - 18, anchor="w",
+        self._overlay_bg = self.preview.create_rectangle(8, self.PREVIEW_H - 32, 96,
+                                                         self.PREVIEW_H - 6, fill="#000000",
+                                                         outline="")
+        self._overlay = self.preview.create_text(16, self.PREVIEW_H - 19, anchor="w",
                                                  fill="#FFFFFF", text="",
                                                  font=("Bahnschrift", 13, "bold"))
         self.preview.bind("<Button-1>", lambda e: self.toggle_play())
@@ -523,6 +541,8 @@ class VideoEditor(ctk.CTkToplevel):
                 Image.frombytes("RGB", (self.PREVIEW_W, self.PREVIEW_H), frame)
             self._tk_frame = ImageTk.PhotoImage(img)
             self.preview.itemconfigure(self._img_item, image=self._tk_frame)
+            self.preview.tag_raise(self._overlay_bg)
+            self.preview.tag_raise(self._overlay)
             self.frames_shown += 1
         if self.player and self.player.playing:
             self.playhead = self.player.position()
