@@ -185,27 +185,36 @@ def run_trim(ctx, src, dst, start, end, exact, with_audio, info, progress=None, 
 
 
 # ---------------------------------------------------------------- картинки для шкалы
-def make_filmstrip(ctx, path, info, count=16, height=56):
-    """Полоса из `count` кадров по всей длине видео."""
+def make_filmstrip(ctx, path, info, count=16, height=56, on_progress=None):
+    """Полоса из `count` кадров по всей длине видео.
+    Каждый кадр берётся быстрым переходом к ближайшему ключевому кадру — не нужно
+    прогонять через ffmpeg всё видео (на длинных роликах это были минуты нагрузки)."""
     if not info.has_video or info.duration <= 0:
         return None
     w = max(8, int(height * (info.width / info.height))) if info.height else int(height * 16 / 9)
-    fps = count / max(info.duration, 0.1)
-    p = subprocess.run([ctx.ffmpeg, "-v", "error", "-i", path, "-vf",
-                        f"fps={fps:.6f},scale={w}:{height},tile={count}x1", "-frames:v", "1",
-                        "-f", "image2pipe", "-vcodec", "png", "-"],
-                       capture_output=True, timeout=120, creationflags=ctx.no_window)
-    if p.returncode != 0 or not p.stdout:
-        return None
-    from io import BytesIO
-    return Image.open(BytesIO(p.stdout)).convert("RGB")
+    strip = Image.new("RGB", (w * count, height), "#000000")
+    got = 0
+    for i in range(count):
+        t = (i + 0.5) * info.duration / count
+        p = subprocess.run([ctx.ffmpeg, "-v", "error", "-noaccurate_seek", "-ss", f"{t:.3f}",
+                            "-i", path, "-frames:v", "1", "-an", "-vf", f"scale={w}:{height}",
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                           capture_output=True, timeout=30, creationflags=ctx.no_window)
+        if len(p.stdout) >= w * height * 3:
+            strip.paste(Image.frombytes("RGB", (w, height), p.stdout[:w * height * 3]),
+                        (i * w, 0))
+            got += 1
+        if on_progress and (i % 4 == 3 or i == count - 1):
+            on_progress(strip.copy())          # полоса появляется по частям
+    return strip if got else None
 
 
 def make_waveform(ctx, path, info, width=1200, height=40, color="#FFFFFF"):
     if not info.has_audio:
         return None
-    p = subprocess.run([ctx.ffmpeg, "-v", "error", "-i", path, "-filter_complex",
-                        f"aformat=channel_layouts=mono,showwavespic=s={width}x{height}"
+    p = subprocess.run([ctx.ffmpeg, "-v", "error", "-vn", "-sn", "-dn", "-i", path,
+                        "-filter_complex",
+                        f"[0:a:0]aformat=channel_layouts=mono,showwavespic=s={width}x{height}"
                         f":colors={color}", "-frames:v", "1", "-f", "image2pipe",
                         "-vcodec", "png", "-"],
                        capture_output=True, timeout=120, creationflags=ctx.no_window)
@@ -269,7 +278,8 @@ class Player:
         if self.info.has_video:
             fps = min(self.info.fps, 30.0)
             self.vproc = subprocess.Popen(
-                [self.ctx.ffmpeg, "-nostdin", "-v", "error", "-ss", f"{start:.3f}", "-i", self.path,
+                [self.ctx.ffmpeg, "-nostdin", "-v", "error", "-hwaccel", "auto",
+                 "-ss", f"{start:.3f}", "-i", self.path,
                  "-t", f"{dur:.3f}", "-an", "-vf",
                  f"fps={fps:.3f},scale={self.w}:{self.h}:force_original_aspect_ratio=decrease,"
                  f"pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2:color=black",
@@ -319,7 +329,7 @@ class Player:
                 time.sleep(delay)
             # опаздываем больше чем на четверть секунды — кадр пропускаем, иначе показываем
             if delay > -0.25 and gen == self._gen:
-                self.on_frame(buf)
+                self.on_frame(buf, (self.w, self.h))
                 self.frames_sent += 1
             i += 1
 
@@ -500,16 +510,20 @@ class VideoEditor(ctk.CTkToplevel):
             return
         self.start_t, self.end_t = 0.0, self.info.duration
         self._ui(self._loaded)
-        film = make_filmstrip(self.ctx, self.path, self.info)
-        wave = make_waveform(self.ctx, self.path, self.info, color=self.ctx.wave_color)
         first = grab_frame(self.ctx, self.path, 0, self.PREVIEW_W, self.PREVIEW_H,
                            cover=not self.info.has_video)
-        self._film, self._wave = film, wave
-        self._ui(self._render_strip)
         if first is not None:
             self._show_image(first)
         elif not self.info.has_video:
             self._ui(self._show_audio_placeholder)
+        self._wave = make_waveform(self.ctx, self.path, self.info, color=self.ctx.wave_color)
+        self._ui(self._render_strip)
+
+        def partial(img):
+            self._film = img
+            self._ui(self._render_strip)
+        self._film = make_filmstrip(self.ctx, self.path, self.info, on_progress=partial)
+        self._ui(self._render_strip)
 
     def _loaded(self):
         if not self.winfo_exists():
@@ -536,9 +550,9 @@ class VideoEditor(ctk.CTkToplevel):
             self._latest = img
 
     # ---------- кадры из проигрывателя (другой поток)
-    def _on_frame(self, buf):
+    def _on_frame(self, buf, size):
         with self._frame_lock:
-            self._latest = buf
+            self._latest = (buf, size)
 
     def _on_play_end(self):
         self._ui(self._stopped_at_end)
@@ -565,7 +579,7 @@ class VideoEditor(ctk.CTkToplevel):
             frame, self._latest = self._latest, None
         if frame is not None:
             img = frame if isinstance(frame, Image.Image) else \
-                Image.frombytes("RGB", (self.PREVIEW_W, self.PREVIEW_H), frame)
+                Image.frombytes("RGB", frame[1], frame[0])
             self._display(img)
             self.frames_shown += 1
         if self.player and self.player.playing:
@@ -576,7 +590,8 @@ class VideoEditor(ctk.CTkToplevel):
             self._last_time_text = text
             self.time_lbl.configure(text=f"{fmt_t(self.playhead)} / {fmt_t(self.info.duration)}")
             self.preview.itemconfigure(self._overlay, text=text)
-        self.after(15, self._tick)
+        # во время воспроизведения — часто, в покое — реже (меньше нагрузка)
+        self.after(15 if (self.player and self.player.playing) else 40, self._tick)
 
     def _display(self, img):
         """Показать кадр, вписав его в окно предпросмотра; время — в его левом нижнем углу."""
@@ -586,11 +601,16 @@ class VideoEditor(ctk.CTkToplevel):
             self._last_img = img
             scale = min(cw / img.width, ch / img.height)
             w, h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
-            if (w, h) != img.size:
+            if abs(w - img.width) > 2 or abs(h - img.height) > 2:
                 img = img.resize((w, h), Image.BILINEAR)
+            w, h = img.size
             x, y = (cw - w) // 2, (ch - h) // 2
-            self._tk_frame = ImageTk.PhotoImage(img)
-            cv.itemconfigure(self._img_item, image=self._tk_frame)
+            tkf = getattr(self, "_tk_frame", None)
+            if tkf is not None and tkf.width() == w and tkf.height() == h:
+                tkf.paste(img)                  # тот же размер — обновляем картинку на месте
+            else:
+                self._tk_frame = ImageTk.PhotoImage(img)
+                cv.itemconfigure(self._img_item, image=self._tk_frame)
             cv.coords(self._img_item, x, y)
         else:
             x, y, h = 0, 0, ch
@@ -752,8 +772,20 @@ class VideoEditor(ctk.CTkToplevel):
         if start < self.start_t or start >= self.end_t - 0.05:
             start = self.start_t                 # с начала выделения
         self.playhead = start
+        self._fit_player()
         self.player.play(start, self.end_t, self.with_audio)
         self.play_btn.configure(text="⏸")
+
+    def _fit_player(self):
+        """ffmpeg отдаёт кадры сразу под размер окна — программе не нужно их масштабировать."""
+        if not self.player or not self.info.has_video:
+            return
+        cw = max(160, self.preview.winfo_width())
+        ch = max(90, self.preview.winfo_height())
+        aspect = (self.info.width / self.info.height) if self.info.height else 16 / 9
+        w = min(cw, int(ch * aspect))
+        h = int(w / aspect)
+        self.player.w, self.player.h = max(2, w // 2 * 2), max(2, h // 2 * 2)
 
     def seek(self, t, quiet=False):
         if not self.info.duration:
@@ -793,6 +825,7 @@ class VideoEditor(ctk.CTkToplevel):
         self._update_labels()
         if self.player and self.player.playing:      # перезапустить с новым звуком
             pos = self.player.position()
+            self._fit_player()
             self.player.play(pos, self.end_t, self.with_audio)
 
     def _update_labels(self):

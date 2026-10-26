@@ -88,6 +88,18 @@ jobs:
           for ($i = 0; $i -lt 20 -and -not (Test-Path spawn-ok.txt); $i++) { Start-Sleep -Seconds 1 }
           if (Test-Path spawn-ok.txt) { Add-Content selftest/selftest.log "OK   перезапуск программы самой собой" }
           else { Add-Content selftest/selftest.log "FAIL перезапуск: новая копия не запустилась"; $code = 1 }
+          # одна копия программы: вторая копия должна сразу закрыться, передав окно первой
+          # (запускаем из копии папки, чтобы настройки не попали в сборку)
+          $inst = Join-Path $env:RUNNER_TEMP 'inst'
+          Copy-Item Downloader $inst -Recurse -Force
+          $first = Start-Process "$inst\Downloader.exe" -PassThru
+          Start-Sleep -Seconds 10
+          $second = Start-Process "$inst\Downloader.exe" -PassThru
+          $quit = $second.WaitForExit(15000)
+          $alive = -not $first.HasExited
+          Get-Process Downloader -ErrorAction SilentlyContinue | Stop-Process -Force
+          if ($quit -and $alive) { Add-Content selftest/selftest.log "OK   вторая копия передала окно первой и закрылась" }
+          else { Add-Content selftest/selftest.log "FAIL одна копия: вторая закрылась=$quit, первая работает=$alive"; $code = 1 }
           ./tests/report.ps1 selftest/selftest.log "Самопроверка" $code
 
       # YouTube иногда не пускает серверы GitHub, поэтому эта проверка только для информации.

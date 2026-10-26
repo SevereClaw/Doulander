@@ -38,7 +38,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -645,21 +645,57 @@ def cleanup_old_temp():
                 continue
             if time.time() - os.path.getmtime(path) < 600:    # могла запуститься только что
                 continue
-            # если копия программы ещё работает, Windows не даст переименовать папку
-            trash = path + "_old"
-            os.rename(path, trash)
-            shutil.rmtree(trash, ignore_errors=True)
+            # Надёжная проверка «папкой никто не пользуется»: Python работающей копии
+            # (python3xx.dll) загружен в память, и Windows не даст его удалить.
+            # Не получилось — значит, папка занята, и мы больше ничего в ней не трогаем.
+            for name_dll in os.listdir(path):
+                low = name_dll.lower()
+                if low.startswith("python3") and low.endswith(".dll"):
+                    os.remove(os.path.join(path, name_dll))
+            shutil.rmtree(path, ignore_errors=True)
             removed += 1
         except OSError:
             pass
     return removed
 
 
+INSTANCE_PORT = 47613      # «замок» одной копии программы и связь с ней
+
+
+def claim_single_instance(wait=0.0):
+    """Сокет-замок: вернёт его, если мы единственная копия, иначе None.
+    wait — сколько секунд ждать, пока старая копия закроется (при перезапуске)."""
+    deadline = time.time() + wait
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            sock.bind(("127.0.0.1", INSTANCE_PORT))
+            sock.listen(5)
+            return sock
+        except OSError:
+            sock.close()
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def notify_running_instance(args):
+    """Попросить уже запущенную копию показать окно (и открыть файл/ссылки из args)."""
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=2) as c:
+            c.sendall(("SHOW\n" + "\n".join(args)).encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+
 def restart_program(app):
     """Перезапуск — новое оформление применяется только к новым окнам."""
     args = [sys.executable] if getattr(sys, "frozen", False) else \
         [sys.executable, os.path.abspath(__file__)]
-    subprocess.Popen(args, cwd=BASE_DIR, env=clean_env())
+    subprocess.Popen(args + ["--restart"], cwd=BASE_DIR, env=clean_env())
     app.quit_app()
 
 
@@ -2995,6 +3031,9 @@ class App(ctk.CTk):
                     self._add_history(e[1])
                 elif kind == "tray_show":
                     self.show_window()
+                elif kind == "instance":
+                    self.show_window()
+                    self.handle_args(e[1])
                 elif kind == "tray_quit":
                     self.quit_app()
         except queue.Empty:
@@ -3057,6 +3096,12 @@ class App(ctk.CTk):
         self.quit_app()
 
     def quit_app(self):
+        sock = getattr(self, "instance_sock", None)
+        if sock:
+            try:
+                sock.close()            # освободить «замок» для следующей копии
+            except OSError:
+                pass
         self.save_queue()
         self.cancel()
         self._save()
@@ -3125,6 +3170,41 @@ class App(ctk.CTk):
             self.log(f"yt-dlp: последняя версия {text}")
         else:
             self.log(f"Автообновление yt-dlp не удалось: {text}")
+
+    def listen_instance(self, sock):
+        """Принимает просьбы от повторных запусков программы: показать окно, открыть файл."""
+        self.instance_sock = sock
+
+        def run():
+            while True:
+                try:
+                    conn, _ = sock.accept()
+                except OSError:
+                    return
+                try:
+                    conn.settimeout(2)
+                    data = b""
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+                lines = data.decode("utf-8", "replace").splitlines()
+                if lines and lines[0] == "SHOW":
+                    self.events.put(("instance", lines[1:]))
+        threading.Thread(target=run, daemon=True).start()
+
+    def handle_args(self, args):
+        """Файлы и ссылки, переданные программе («Открыть с помощью», повторный запуск)."""
+        for arg in args:
+            if os.path.isfile(arg) and arg.lower().endswith(editor.MEDIA_EXTS):
+                self.open_editor(arg)
+            elif arg.startswith("http"):
+                self.add_item(arg)
 
     def _check_tools(self):
         """Если в папке программы чего-то не хватает — предлагает докачать."""
@@ -3607,4 +3687,17 @@ if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--selftest":
         extra = sys.argv[4:] + [None, None]
         sys.exit(selftest(sys.argv[2], sys.argv[3], extra[0] or None, extra[1] or None))
-    App().mainloop()
+
+    # одна копия программы: повторный запуск просто показывает уже открытое окно
+    user_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    lock = claim_single_instance(wait=10 if "--restart" in sys.argv else 0)
+    if lock is None:
+        if "--tray" in sys.argv or notify_running_instance(user_args):
+            sys.exit(0)
+        # старая копия не ответила (зависла) — запускаемся всё равно
+    app = App()
+    if lock:
+        app.listen_instance(lock)
+    if user_args:
+        app.after(800, lambda: app.handle_args(user_args))
+    app.mainloop()
