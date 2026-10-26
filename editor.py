@@ -399,17 +399,16 @@ class VideoEditor(ctk.CTkToplevel):
                      text_color=c.gray).grid(row=0, column=1, sticky="ew", padx=12)
 
         # предпросмотр
-        self.preview = tk.Canvas(self, bg="#000000", highlightthickness=0,
-                                 width=self.PREVIEW_W, height=self.PREVIEW_H)
-        self.preview.grid(row=1, column=0, padx=16, sticky="n")
-        self._img_item = self.preview.create_image(self.PREVIEW_W // 2, self.PREVIEW_H // 2)
-        self._overlay_bg = self.preview.create_rectangle(8, self.PREVIEW_H - 32, 96,
-                                                         self.PREVIEW_H - 6, fill="#000000",
-                                                         outline="")
-        self._overlay = self.preview.create_text(16, self.PREVIEW_H - 19, anchor="w",
-                                                 fill="#FFFFFF", text="",
+        # предпросмотр растягивается под окно (с сохранением пропорций)
+        self.preview = tk.Canvas(self, bg="#000000", highlightthickness=0, width=640, height=300)
+        self.preview.grid(row=1, column=0, padx=16, sticky="nsew")
+        self._img_item = self.preview.create_image(0, 0, anchor="nw")
+        self._overlay_bg = self.preview.create_rectangle(0, 0, 0, 0, fill="#000000", outline="")
+        self._overlay = self.preview.create_text(0, 0, anchor="w", fill="#FFFFFF", text="",
                                                  font=("Bahnschrift", 13, "bold"))
+        self._last_img = None
         self.preview.bind("<Button-1>", lambda e: self.toggle_play())
+        self.preview.bind("<Configure>", lambda e: self._display(self._last_img))
 
         # шкала
         self.timeline = tk.Canvas(self, height=self.RULER_H + self.STRIP_H + self.WAVE_H + 10,
@@ -567,10 +566,7 @@ class VideoEditor(ctk.CTkToplevel):
         if frame is not None:
             img = frame if isinstance(frame, Image.Image) else \
                 Image.frombytes("RGB", (self.PREVIEW_W, self.PREVIEW_H), frame)
-            self._tk_frame = ImageTk.PhotoImage(img)
-            self.preview.itemconfigure(self._img_item, image=self._tk_frame)
-            self.preview.tag_raise(self._overlay_bg)
-            self.preview.tag_raise(self._overlay)
+            self._display(img)
             self.frames_shown += 1
         if self.player and self.player.playing:
             self.playhead = self.player.position()
@@ -581,6 +577,28 @@ class VideoEditor(ctk.CTkToplevel):
             self.time_lbl.configure(text=f"{fmt_t(self.playhead)} / {fmt_t(self.info.duration)}")
             self.preview.itemconfigure(self._overlay, text=text)
         self.after(15, self._tick)
+
+    def _display(self, img):
+        """Показать кадр, вписав его в окно предпросмотра; время — в его левом нижнем углу."""
+        cv = self.preview
+        cw, ch = max(2, cv.winfo_width()), max(2, cv.winfo_height())
+        if img is not None:
+            self._last_img = img
+            scale = min(cw / img.width, ch / img.height)
+            w, h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+            if (w, h) != img.size:
+                img = img.resize((w, h), Image.BILINEAR)
+            x, y = (cw - w) // 2, (ch - h) // 2
+            self._tk_frame = ImageTk.PhotoImage(img)
+            cv.itemconfigure(self._img_item, image=self._tk_frame)
+            cv.coords(self._img_item, x, y)
+        else:
+            x, y, h = 0, 0, ch
+        by = y + h
+        cv.coords(self._overlay_bg, x + 8, by - 32, x + 96, by - 6)
+        cv.coords(self._overlay, x + 16, by - 19)
+        cv.tag_raise(self._overlay_bg)
+        cv.tag_raise(self._overlay)
 
     # ---------- шкала
     def _x(self, t):
