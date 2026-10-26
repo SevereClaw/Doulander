@@ -668,7 +668,8 @@ def title_font(size):
 def title_widget(parent, text, size=16):
     """Заголовок раздела: в Phantom — красная косая плашка (картинка), иначе текст."""
     if PHANTOM:
-        img = phantom_style.make_title(text.upper(), size=size)
+        img = phantom_style.cached("title", (APP_VERSION, text.upper(), size),
+                                   lambda: phantom_style.make_title(text.upper(), size=size))
         cimg = ctk.CTkImage(light_image=img, dark_image=img,
                             size=(img.width // 2, img.height // 2))
         lbl = ctk.CTkLabel(parent, text="", image=cimg)
@@ -2117,8 +2118,11 @@ class App(ctk.CTk):
         head.grid_columnconfigure(1, weight=1)
         version = f"v{APP_VERSION}" + (f"  ·  сборка {BUILD_ID}" if BUILD_ID else "  ·  локальная сборка")
         if PHANTOM:
-            banner = phantom_style.make_banner(
-                subtitle=f"ВИДЕО · МУЗЫКА · 1000+ САЙТОВ     v{APP_VERSION}", logo_path=ICON_PNG)
+            subtitle = f"ВИДЕО · МУЗЫКА · 1000+ САЙТОВ     v{APP_VERSION}"
+            # шапка рисуется один раз на версию, дальше берётся готовая из кэша
+            banner = phantom_style.cached(
+                "banner", (APP_VERSION, BUILD_ID, subtitle),
+                lambda: phantom_style.make_banner(subtitle=subtitle, logo_path=ICON_PNG))
             self.header_img = ctk.CTkImage(light_image=banner, dark_image=banner,
                                            size=(banner.width // 2, banner.height // 2))
             ctk.CTkLabel(head, text="", image=self.header_img).grid(

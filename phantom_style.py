@@ -3,9 +3,12 @@
 острые углы, «вырезанные» буквы разного шрифта на разноцветных плашках.
 Всё рисуется здесь с нуля (PIL), никаких файлов из игры.
 """
+import functools
+import hashlib
 import math
 import os
 import random
+import tempfile
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -24,24 +27,28 @@ FALLBACK_FONTS = ["DejaVuSans-Bold.ttf", "DejaVuSerif-Bold.ttf", "DejaVuSansMono
 TEXT_FONTS = ["bahnschrift.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"]
 
 
-def _load(names, size):
-    fonts = []
-    for name in names:
-        try:
-            fonts.append(ImageFont.truetype(name, size))
-        except OSError:
-            pass
-    return fonts
+@functools.lru_cache(maxsize=None)
+def _font(name, size):
+    """Один шрифт нужного размера (загружается один раз). None — такого шрифта нет."""
+    try:
+        return ImageFont.truetype(name, size)
+    except OSError:
+        return None
 
 
-def _letter_fonts(size):
-    fonts = _load(LETTER_FONTS, size)
-    return fonts or _load(FALLBACK_FONTS, size) or [ImageFont.load_default()]
+@functools.lru_cache(maxsize=None)
+def _available(names):
+    """Какие шрифты из списка есть на компьютере (проверяется один раз)."""
+    return tuple(n for n in names if _font(n, 12) is not None)
+
+
+def _letter_font_names():
+    return _available(tuple(LETTER_FONTS)) or _available(tuple(FALLBACK_FONTS))
 
 
 def _text_font(size):
-    fonts = _load(TEXT_FONTS, size)
-    return fonts[0] if fonts else ImageFont.load_default()
+    names = _available(tuple(TEXT_FONTS))
+    return _font(names[0], size) if names else ImageFont.load_default()
 
 
 def _halftone(draw, box, step, max_r, color, direction=1):
@@ -77,6 +84,28 @@ def _ransom_letter(ch, font, scheme, angle):
     return tile.rotate(angle, expand=True, resample=Image.BICUBIC)
 
 
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "Downloader-cache")
+
+
+def cached(kind, key, build):
+    """Готовая картинка из кэша на диске; если её нет — рисуем и сохраняем."""
+    name = hashlib.sha1(repr((kind, key)).encode("utf-8")).hexdigest()[:16] + ".png"
+    path = os.path.join(CACHE_DIR, name)
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    except OSError:
+        pass
+    img = build()
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        img.save(path)
+    except OSError:
+        pass
+    return img
+
+
 def make_banner(title="DOWNLOADER", subtitle="", logo_path=None, scale=2, seed=7):
     """Шапка 640x96 (в логических пикселях). scale — для чётких экранов."""
     W, H = 640 * scale, 96 * scale
@@ -106,7 +135,8 @@ def make_banner(title="DOWNLOADER", subtitle="", logo_path=None, scale=2, seed=7
     prev = None
     for i, ch in enumerate(title):
         size = rnd.randint(30, 42) * s
-        font = rnd.choice(_letter_fonts(size))
+        names = _letter_font_names()
+        font = _font(rnd.choice(names), size) if names else ImageFont.load_default()
         scheme = rnd.choice([sc for sc in schemes if sc != prev])
         prev = scheme
         angle = rnd.uniform(-11, 11)
