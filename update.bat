@@ -67,6 +67,9 @@ echo   Сборка №%RUN% от %WHEN%
 set "HAVE="
 if exist "%INFO%" set /p HAVE=<"%INFO%"
 if not exist "%~dp0Downloader.exe" set "HAVE="
+:: программа теперь ставится папкой (Downloader.exe + _internal) — если папки ещё нет,
+:: обновляемся, даже если номер сборки совпал
+if not exist "%~dp0_internal\" set "HAVE="
 if "%HAVE%"=="%RUN%" (
     echo.
     echo У вас уже последняя версия.
@@ -78,7 +81,9 @@ echo.
 echo Скачиваю новую версию...
 if exist "%TMPD%" rmdir /s /q "%TMPD%"
 mkdir "%TMPD%"
-"%GH%" run download %RUN% --repo %REPO% --name Downloader-app --dir "%TMPD%"
+:: сначала сборка-папка (быстрый запуск), для старых сборок — одним файлом
+"%GH%" run download %RUN% --repo %REPO% --name Downloader-appdir --dir "%TMPD%" 2>nul
+if errorlevel 1 "%GH%" run download %RUN% --repo %REPO% --name Downloader-app --dir "%TMPD%"
 if errorlevel 1 goto fail
 if not exist "%TMPD%\Downloader.exe" (
     echo В сборке нет Downloader.exe — возможно, она сделана старой версией автосборки.
@@ -95,6 +100,14 @@ taskkill /im Downloader.exe /f >nul 2>nul
 timeout /t 2 >nul
 
 :replace
+:: _internal — части программы; /MIR убирает старые лишние файлы
+if not exist "%TMPD%\_internal\" goto replace_exe
+robocopy "%TMPD%\_internal" "%~dp0_internal" /MIR /R:5 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 (
+    echo Не удалось обновить папку _internal — закройте программу и попробуйте снова.
+    goto fail
+)
+:replace_exe
 copy /y "%TMPD%\Downloader.exe" "%~dp0Downloader.exe" >nul
 if errorlevel 1 (
     echo Не удалось заменить Downloader.exe — закройте программу и попробуйте снова.
@@ -109,13 +122,17 @@ echo   Downloader.exe обновлён
 echo.
 echo Компоненты в папке программы:
 
-if exist "%~dp0yt-dlp.exe" goto ytdlp_update
-echo   yt-dlp — нет, скачиваю...
-curl.exe -L --fail --progress-bar -o "%~dp0yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-goto ffmpeg
-:ytdlp_update
-echo   yt-dlp — есть, обновляю на месте:
-"%~dp0yt-dlp.exe" -U
+:: yt-dlp «папкой» (yt-dlp\yt-dlp.exe) запускается быстрее; обновляет его сама программа
+if exist "%~dp0yt-dlp\yt-dlp.exe" (
+    echo   yt-dlp — есть, его обновляет сама программа
+    goto ffmpeg
+)
+if not exist "%TMPD%" mkdir "%TMPD%"
+echo   yt-dlp — ставлю быструю версию...
+curl.exe -L --fail --progress-bar -o "%TMPD%\ytdlp.zip" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip"
+if errorlevel 1 goto ffmpeg
+powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath (Join-Path $env:TMPD 'ytdlp.zip') -DestinationPath (Join-Path $env:TMPD 'ytdlp')"
+if exist "%TMPD%\ytdlp\yt-dlp.exe" robocopy "%TMPD%\ytdlp" "%~dp0yt-dlp" /E /NFL /NDL /NJH /NJS /NP >nul
 
 :ffmpeg
 :: ffmpeg обновлять не нужно: если он есть, его не трогаем

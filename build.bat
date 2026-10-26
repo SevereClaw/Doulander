@@ -7,7 +7,7 @@ cd /d "%~dp0"
 set "OUT=%~dp0Downloader"
 set "TMPD=%TEMP%\downloader_build"
 
-set "URL_YTDLP=https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+set "URL_YTDLP=https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip"
 set "URL_FFMPEG=https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
 set "URL_DENO=https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
 
@@ -36,18 +36,23 @@ echo [1/5] Устанавливаю библиотеки Python...
 if errorlevel 1 goto fail
 
 echo.
-echo [2/5] Собираю Downloader.exe (минута-две)...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --name Downloader --icon "%~dp0icon.ico" --add-data "%~dp0icon.ico;." --add-data "%~dp0icon.png;." --add-data "%~dp0sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter --distpath "%TMPD%\dist" --workpath "%TMPD%\build" --specpath "%TMPD%" downloader.py
+echo [2/5] Собираю Downloader (минута-две)...
+:: сборка папкой (Downloader.exe + _internal) — запускается без распаковки во временную папку
+%PY% -m PyInstaller --noconfirm --windowed --name Downloader --icon "%~dp0icon.ico" --add-data "%~dp0icon.ico;." --add-data "%~dp0icon.png;." --add-data "%~dp0sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter --distpath "%TMPD%\dist" --workpath "%TMPD%\build" --specpath "%TMPD%" downloader.py
 if errorlevel 1 goto fail
-copy /y "%TMPD%\dist\Downloader.exe" "%OUT%\Downloader.exe" >nul
+robocopy "%TMPD%\dist\Downloader\_internal" "%OUT%\_internal" /MIR /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 goto fail
+copy /y "%TMPD%\dist\Downloader\Downloader.exe" "%OUT%\Downloader.exe" >nul
 if errorlevel 1 goto fail
 if exist "update.bat" copy /y "update.bat" "%OUT%\update.bat" >nul
 
 :: ------------------------------------------------ yt-dlp
 echo.
 echo [3/5] yt-dlp
-if exist "%OUT%\yt-dlp.exe" goto ytdlp_ok
-call :download "%URL_YTDLP%" "%OUT%\yt-dlp.exe" || goto fail
+:: быстрая версия «папкой» (yt-dlp\yt-dlp.exe + _internal)
+if exist "%OUT%\yt-dlp\yt-dlp.exe" goto ytdlp_ok
+call :download "%URL_YTDLP%" "%TMPD%\ytdlp.zip" || goto fail
+call :unzip "%TMPD%\ytdlp.zip" "%OUT%\yt-dlp" || goto fail
 goto ffmpeg
 :ytdlp_ok
 echo   Уже есть — пропускаю (обновить можно кнопкой в программе)

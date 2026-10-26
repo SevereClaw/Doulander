@@ -17,7 +17,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+import hashlib
 import tempfile
+import uuid
 import urllib.parse
 import urllib.request
 import zipfile
@@ -38,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -94,10 +96,15 @@ def launch_error_text(err):
 YTDLP = FFMPEG = DENO = FFPROBE = FFPLAY = None
 
 
+YTDLP_DIR = os.path.join(BASE_DIR, "yt-dlp")      # быстрый yt-dlp: exe + _internal
+
+
 def refresh_tools():
     """Ищет yt-dlp, ffmpeg и deno заново (например, после докачки)."""
     global YTDLP, FFMPEG, DENO, FFPROBE, FFPLAY
-    YTDLP = find_tool("yt-dlp.exe") or os.path.join(BASE_DIR, "yt-dlp.exe")
+    fast = os.path.join(YTDLP_DIR, "yt-dlp.exe")
+    YTDLP = fast if os.path.isfile(fast) else \
+        (find_tool("yt-dlp.exe") or os.path.join(BASE_DIR, "yt-dlp.exe"))
     FFMPEG = find_tool("ffmpeg.exe")
     FFPROBE = find_tool("ffprobe.exe")
     FFPLAY = find_tool("ffplay.exe")        # звук в предпросмотре редактора
@@ -118,6 +125,113 @@ TOOL_SOURCES = {
     "deno": ("https://github.com/denoland/deno/releases/latest/download/"
              "deno-x86_64-pc-windows-msvc.zip", ("deno.exe",)),
 }
+
+
+YTDLP_ZIP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip"
+YTDLP_SUMS_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS"
+
+
+def ytdlp_is_fast():
+    return os.path.normcase(YTDLP).startswith(os.path.normcase(YTDLP_DIR + os.sep))
+
+
+def ytdlp_version():
+    try:
+        p = subprocess.run([YTDLP, "--version"], capture_output=True, timeout=60,
+                           creationflags=NO_WINDOW)
+        return p.stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def latest_ytdlp_sha():
+    """Контрольная сумма последней версии yt-dlp_win.zip (маленький файл, без скачивания архива)."""
+    req = urllib.request.Request(YTDLP_SUMS_URL, headers={"User-Agent": "Downloader"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        text = r.read().decode("utf-8", "replace")
+    for line in text.splitlines():
+        digest, _, name = line.strip().partition("  ")
+        if name.strip() == "yt-dlp_win.zip":
+            return digest.strip().lower()
+    return None
+
+
+def installed_ytdlp_sha():
+    try:
+        with open(os.path.join(YTDLP_DIR, ".sha256"), encoding="utf-8") as f:
+            return f.read().strip().lower()
+    except OSError:
+        return None
+
+
+def install_ytdlp_fast(progress=None, expected=None):
+    """Ставит yt-dlp «папкой» (yt-dlp_win.zip): он запускается без распаковки во временную
+    папку — каждое превью и каждая загрузка стартуют быстрее. Архив проверяется по SHA-256."""
+    expected = expected or latest_ytdlp_sha()
+    new_dir = os.path.join(BASE_DIR, "yt-dlp_new")
+    old_dir = os.path.join(BASE_DIR, "yt-dlp_old")
+    with tempfile.TemporaryDirectory(dir=BASE_DIR) as tmp:
+        archive = os.path.join(tmp, "yt-dlp_win.zip")
+        download_to(YTDLP_ZIP_URL, archive, progress)
+        h = hashlib.sha256()
+        with open(archive, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+        if expected and digest != expected:
+            raise RuntimeError("архив yt-dlp скачался с ошибкой (контрольная сумма не совпала)")
+        shutil.rmtree(new_dir, ignore_errors=True)
+        with zipfile.ZipFile(archive) as z:
+            for name in z.namelist():
+                if name.startswith(("/", "\\")) or ".." in name.replace("\\", "/").split("/"):
+                    raise RuntimeError("подозрительный архив yt-dlp")
+            z.extractall(new_dir)
+    if not os.path.isfile(os.path.join(new_dir, "yt-dlp.exe")):
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise RuntimeError("в архиве нет yt-dlp.exe")
+    with open(os.path.join(new_dir, ".sha256"), "w", encoding="utf-8") as f:
+        f.write(digest)
+    shutil.rmtree(old_dir, ignore_errors=True)
+    if os.path.isdir(YTDLP_DIR):
+        os.rename(YTDLP_DIR, old_dir)       # не выйдет, если yt-dlp сейчас работает
+    os.rename(new_dir, YTDLP_DIR)
+    shutil.rmtree(old_dir, ignore_errors=True)
+    refresh_tools()
+
+
+def update_ytdlp_fast(progress=None):
+    """Обновляет быстрый yt-dlp, если вышла новая версия. Возвращает ('same'|'updated', версия)."""
+    latest = latest_ytdlp_sha()
+    if ytdlp_is_fast() and latest and installed_ytdlp_sha() == latest:
+        return "same", ytdlp_version()
+    install_ytdlp_fast(progress, latest)
+    return "updated", ytdlp_version()
+
+
+def update_ytdlp_any(wait_idle=None, progress=None):
+    """Обновляет yt-dlp. Возвращает ('updated'|'same'|'failed', текст).
+    Сначала — быстрая версия «папкой» (заодно переводит на неё старый yt-dlp.exe);
+    если GitHub недоступен, а стоит старый yt-dlp.exe — его собственное -U."""
+    try:
+        if wait_idle:
+            wait_idle()
+        return update_ytdlp_fast(progress)
+    except Exception as e:          # noqa: BLE001 — запасной путь ниже
+        err = str(e)
+    if os.path.isfile(YTDLP) and not ytdlp_is_fast():
+        try:
+            p = subprocess.run([YTDLP, "-U"], capture_output=True, cwd=BASE_DIR,
+                               timeout=300, creationflags=NO_WINDOW)
+            out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+        except (OSError, subprocess.TimeoutExpired) as e:
+            out = str(e)
+        ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
+        ver = ver.group(0) if ver else ""
+        if "Updated yt-dlp" in out:
+            return "updated", ver
+        if "up to date" in out:
+            return "same", ver
+    return "failed", err
 
 
 def missing_tools():
@@ -145,6 +259,9 @@ def download_to(url, dest, progress=None):
 
 def install_tool(name, progress=None):
     """Скачивает компонент в папку программы."""
+    if name == "yt-dlp":
+        install_ytdlp_fast(progress)
+        return
     url, members = TOOL_SOURCES[name]
     if not members:
         download_to(url, os.path.join(BASE_DIR, name + ".exe"), progress)
@@ -734,10 +851,10 @@ def common_args(opts=None):
     return args
 
 
-def build_command(url, opts, folder, fragments=8):
-    """Команда для скачивания одной ссылки."""
+def build_command(url, opts, folder, fragments=8, info_json=None):
+    """Команда для скачивания одной ссылки (или по сохранённым сведениям из превью)."""
     cmd = [
-        YTDLP, url,
+        YTDLP, *(["--load-info-json", info_json] if info_json else [url]),
         "-P", folder,
         "--newline", "--progress", "--no-simulate",
         "--progress-template",
@@ -1165,6 +1282,33 @@ def explain_error(err, code, url="", proxy=None):
     return "Ошибка: " + (err[:80] or f"код {code}")
 
 
+INFO_CACHE = os.path.join(tempfile.gettempdir(), "Downloader-info")
+INFO_MAX_AGE = 3 * 3600         # ссылки на видео у YouTube живут несколько часов
+
+
+def save_info(info):
+    """Сохраняет сведения о видео из превью — потом загрузка начнётся сразу, без повторного
+    обращения к сайту (это самая долгая часть подготовки, особенно на YouTube)."""
+    try:
+        os.makedirs(INFO_CACHE, exist_ok=True)
+        path = os.path.join(INFO_CACHE, uuid.uuid4().hex + ".json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False)
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def cleanup_info_cache():
+    try:
+        for name in os.listdir(INFO_CACHE):
+            path = os.path.join(INFO_CACHE, name)
+            if time.time() - os.path.getmtime(path) > INFO_MAX_AGE:
+                os.remove(path)
+    except OSError:
+        pass
+
+
 def kill_tree(proc):
     """Останавливает yt-dlp вместе с запущенным им ffmpeg."""
     if proc and proc.poll() is None:
@@ -1390,7 +1534,7 @@ class QueueItem(ctk.CTkFrame):
 
 # ================================================================ окно истории
 class HistoryWindow(ctk.CTkToplevel):
-    SHOW_MAX = 150          # сколько строк показывать за раз (иначе окно тормозит)
+    PAGE = 40               # строк за раз: каждая строка — несколько виджетов, сотни тормозят
 
     def __init__(self, app):
         super().__init__(app)
@@ -1433,15 +1577,33 @@ class HistoryWindow(ctk.CTkToplevel):
         for w in self.list.winfo_children():
             w.destroy()
         q = self.search.get().strip().lower()
-        rows = [h for h in self.app.history
-                if not q or q in (h.get("title") or "").lower() or q in h.get("url", "").lower()]
-        for n, rec in enumerate(rows[:self.SHOW_MAX]):
-            self._row(n, rec)
-        if not rows:
+        self.rows = [h for h in self.app.history
+                     if not q or q in (h.get("title") or "").lower()
+                     or q in h.get("url", "").lower()]
+        self.shown = 0
+        self.more_btn = None
+        if not self.rows:
             ctk.CTkLabel(self.list, text="Ничего не найдено" if q else "История пока пуста",
                          text_color=C.MUTED).grid(row=0, column=0, pady=30)
-        more = f" (показаны первые {self.SHOW_MAX})" if len(rows) > self.SHOW_MAX else ""
-        self.info.configure(text=f"Записей: {len(rows)}{more}")
+        self.show_more()
+
+    def show_more(self):
+        """Дорисовывает следующую порцию строк (кнопка «Показать ещё»)."""
+        if self.more_btn is not None:
+            self.more_btn.destroy()
+            self.more_btn = None
+        end = min(len(self.rows), self.shown + self.PAGE)
+        for n in range(self.shown, end):
+            self._row(n, self.rows[n])
+        self.shown = end
+        left = len(self.rows) - self.shown
+        if left > 0:
+            self.more_btn = ctk.CTkButton(self.list, text=f"Показать ещё ({left})", height=32,
+                                          fg_color=C.BTN2, hover_color=C.BTN2_HOVER,
+                                          text_color=C.BTN2_TEXT, command=self.show_more)
+            self.more_btn.grid(row=self.shown, column=0, sticky="ew", pady=6, padx=2)
+        self.info.configure(text=f"Записей: {len(self.rows)}" +
+                                 (f"   ·   показано {self.shown}" if left > 0 else ""))
 
     def _row(self, n, rec):
         row = ctk.CTkFrame(self.list, corner_radius=R(8), fg_color=C.CARD)
@@ -1867,6 +2029,8 @@ class App(ctk.CTk):
         self.batch_ok = self.batch_fail = 0
         self.cancel_flag = threading.Event()
         self.preview_slots = threading.Semaphore(3)   # не больше 3 превью одновременно
+        self._previews = 0                            # сколько превью идёт прямо сейчас
+        self._tools_busy = False                      # обновляются компоненты
         self.history = load_history()
         self.history_win = None
         self.tray = None
@@ -1885,7 +2049,6 @@ class App(ctk.CTk):
         self.after(100, self._poll_events)
         self.after(300, self._autopaste)
         self.after(700, self._watch_clipboard)
-        self._tools_busy = False
         self.after(8000, self._auto_ytdlp_tick)
         if self.settings["check_updates"] and getattr(sys, "frozen", False):
             self.after(2000, lambda: self.check_updates(manual=False))
@@ -1901,6 +2064,7 @@ class App(ctk.CTk):
         self.refresh_folder_label()
         if not NO_SAVE:
             threading.Thread(target=cleanup_old_temp, daemon=True).start()
+            threading.Thread(target=cleanup_info_cache, daemon=True).start()
             self.restore_queue()
             if self.v_autostart.get():
                 set_autostart(True)          # обновить путь, если папку с программой перенесли
@@ -2547,44 +2711,58 @@ class App(ctk.CTk):
     def _fetch_preview(self, item):
         """Фоновый поток: узнаёт название, длительность, размер и обложку."""
         with self.preview_slots:
+            while self._tools_busy:             # yt-dlp как раз обновляется — подождём
+                time.sleep(0.5)
             if item not in self.items:
                 return
-            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            with self.lock:
+                self._previews += 1
             try:
-                opts = dict(item.opts, proxy_url=self.proxy_for(item.url))
-                p = subprocess.run(preview_command(item.url, opts), capture_output=True,
-                                   cwd=BASE_DIR, env=env, timeout=90,
-                                   creationflags=NO_WINDOW)
-                info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
-            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-                info, p = None, None
-                self.events.put(("log", f"Превью {item.url}: {e}"))
-            if not info:
-                err = ""
-                if p is not None:
-                    lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
-                             .splitlines() if ln.startswith("ERROR")]
-                    err = lines[-1].replace("ERROR:", "").strip() if lines else ""
-                if err:
-                    self.events.put(("log", f"Превью {item.url}: {err}"))
-                self.events.put(("meta", item, None, "Не удалось получить информацию"
-                                 + (f": {err[:60]}" if err else ""), ACCENT))
+                self._fetch_preview_inner(item)
+            finally:
+                with self.lock:
+                    self._previews -= 1
+
+    def _fetch_preview_inner(self, item):
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        try:
+            opts = dict(item.opts, proxy_url=self.proxy_for(item.url))
+            p = subprocess.run(preview_command(item.url, opts), capture_output=True,
+                               cwd=BASE_DIR, env=env, timeout=90,
+                               creationflags=NO_WINDOW)
+            info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            info, p = None, None
+            self.events.put(("log", f"Превью {item.url}: {e}"))
+        if not info:
+            err = ""
+            if p is not None:
+                lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
+                         .splitlines() if ln.startswith("ERROR")]
+                err = lines[-1].replace("ERROR:", "").strip() if lines else ""
+            if err:
+                self.events.put(("log", f"Превью {item.url}: {err}"))
+            self.events.put(("meta", item, None, "Не удалось получить информацию"
+                             + (f": {err[:60]}" if err else ""), ACCENT))
+            return
+        if is_search(item.url):
+            entries = [e for e in (info.get("entries") or []) if e]
+            if not entries:
+                self.events.put(("meta", item, None, "Ничего не найдено по этому запросу",
+                                 ACCENT))
                 return
-            if is_search(item.url):
-                entries = [e for e in (info.get("entries") or []) if e]
-                if not entries:
-                    self.events.put(("meta", item, None, "Ничего не найдено по этому запросу",
-                                     ACCENT))
-                    return
-                info = entries[0]
-                real = info.get("webpage_url") or \
-                    f"https://www.youtube.com/watch?v={info.get('id')}"
-                self.events.put(("resolved", item, real))
-            s = summarize(info, item.opts)
-            self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
-            if info.get("_type") != "playlist":
-                self.events.put(("choices", item,
-                                 format_choices(info, item.opts["mode"], item.opts["fmt"])))
+            info = entries[0]
+            real = info.get("webpage_url") or \
+                f"https://www.youtube.com/watch?v={info.get('id')}"
+            self.events.put(("resolved", item, real))
+        s = summarize(info, item.opts)
+        self.events.put(("meta", item, s["title"], s["meta"] or "—", None))
+        if info.get("_type") != "playlist" and not item.opts.get("playlist"):
+            item.info_json = save_info(info)
+            item.info_time = time.time()
+        if info.get("_type") != "playlist":
+            self.events.put(("choices", item,
+                             format_choices(info, item.opts["mode"], item.opts["fmt"])))
         if s.get("thumb"):
             try:
                 self.events.put(("thumb", item, load_thumbnail(s["thumb"],
@@ -2605,6 +2783,9 @@ class App(ctk.CTk):
     def log(self, text):
         self.log_box.configure(state="normal")
         self.log_box.insert("end", text + "\n")
+        # держим последние ~3000 строк — длинный журнал тормозит окно и ест память
+        if int(self.log_box.index("end-1c").split(".")[0]) > 3000:
+            self.log_box.delete("1.0", "1000.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -2741,56 +2922,22 @@ class App(ctk.CTk):
         ev(("state", item, "run"))
         ev(("item_status", item, "Подготовка…", None))
         proxy = self.proxy_for(item.url)
-        cmd = build_command(item.url, dict(item.opts, proxy_url=proxy), self.settings["folder"],
-                            self.settings.get("fragments", 8))
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, cwd=BASE_DIR, env=env,
-                creationflags=NO_WINDOW)
-        except OSError as e:
-            ev(("log", f"Не удалось запустить {YTDLP}: {e}"))
-            ev(("state", item, "error"))
-            ev(("item_status", item, "Ошибка запуска: " + launch_error_text(e), ACCENT))
+        opts = dict(item.opts, proxy_url=proxy)
+        info = getattr(item, "info_json", None)
+        if not (info and os.path.isfile(info) and
+                time.time() - getattr(item, "info_time", 0) < INFO_MAX_AGE):
+            info = None
+        code, last_error, files = self._run_ytdlp(item, opts, info)
+        if code not in (0, None) and info and not self._stopped(item):
+            # сохранённые сведения устарели (ссылки на видео живут несколько часов) —
+            # пробуем обычным способом
+            ev(("log", f"Повтор без сохранённых сведений: {item.url}"))
+            item.info_json = None
+            code, last_error, files = self._run_ytdlp(item, opts, None)
+        if code is None:
             return False
-        with self.lock:
-            self.procs.add(proc)
-            self.item_procs[item] = proc
 
-        last_error = ""
-        files = []
-        for raw in proc.stdout:
-            line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
-            if not line:
-                continue
-            if line.startswith("[P]"):
-                pct, speed, eta = (line[3:].split("|") + ["", ""])[:3]
-                try:
-                    frac = float(pct.strip().rstrip("%")) / 100
-                except ValueError:
-                    frac = 0.0
-                if frac >= 1:
-                    text = "Обработка (ffmpeg)…"
-                else:
-                    text = f"{pct.strip()}   •   {speed.strip()}   •   осталось {eta.strip()}"
-                ev(("item_progress", item, frac, text))
-            elif line.startswith("[T]"):
-                ev(("title", item, line[3:]))
-            elif line.startswith("[F]"):
-                item.file_path = line[3:]
-                files.append(line[3:])
-                ev(("log", "✓ " + line[3:]))
-            else:
-                ev(("log", line))
-                if line.startswith("ERROR"):
-                    last_error = line.replace("ERROR:", "").strip()
-        code = proc.wait()
-        with self.lock:
-            self.procs.discard(proc)
-            self.item_procs.pop(item, None)
-
-        if item.pause_requested or self.cancel_flag.is_set():
+        if self._stopped(item):
             # недокачанный файл (.part) остаётся — yt-dlp продолжит с того же места
             item.pause_requested = False
             ev(("state", item, "paused"))
@@ -2815,6 +2962,68 @@ class App(ctk.CTk):
         ev(("state", item, "error"))
         ev(("item_status", item, explain_error(last_error, code, item.url, proxy), ACCENT))
         return False
+
+    def _stopped(self, item):
+        return item.pause_requested or self.cancel_flag.is_set()
+
+    def _run_ytdlp(self, item, opts, info_json):
+        """Один запуск yt-dlp. Возвращает (код, последняя ошибка, файлы); код None — не запустился."""
+        ev = self.events.put
+        cmd = build_command(item.url, opts, self.settings["folder"],
+                            self.settings.get("fragments", 8), info_json)
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, cwd=BASE_DIR, env=env,
+                creationflags=NO_WINDOW)
+        except OSError as e:
+            ev(("log", f"Не удалось запустить {YTDLP}: {e}"))
+            ev(("state", item, "error"))
+            ev(("item_status", item, "Ошибка запуска: " + launch_error_text(e), ACCENT))
+            return None, "", []
+        with self.lock:
+            self.procs.add(proc)
+            self.item_procs[item] = proc
+
+        last_error = ""
+        files = []
+        last_shown = 0.0
+        for raw in proc.stdout:
+            line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
+            if not line:
+                continue
+            if line.startswith("[P]"):
+                pct, speed, eta = (line[3:].split("|") + ["", ""])[:3]
+                try:
+                    frac = float(pct.strip().rstrip("%")) / 100
+                except ValueError:
+                    frac = 0.0
+                # yt-dlp пишет прогресс десятки раз в секунду — окну хватит 5 раз
+                now = time.monotonic()
+                if frac < 1 and now - last_shown < 0.2:
+                    continue
+                last_shown = now
+                if frac >= 1:
+                    text = "Обработка (ffmpeg)…"
+                else:
+                    text = f"{pct.strip()}   •   {speed.strip()}   •   осталось {eta.strip()}"
+                ev(("item_progress", item, frac, text))
+            elif line.startswith("[T]"):
+                ev(("title", item, line[3:]))
+            elif line.startswith("[F]"):
+                item.file_path = line[3:]
+                files.append(line[3:])
+                ev(("log", "✓ " + line[3:]))
+            else:
+                ev(("log", line))
+                if line.startswith("ERROR"):
+                    last_error = line.replace("ERROR:", "").strip()
+        code = proc.wait()
+        with self.lock:
+            self.procs.discard(proc)
+            self.item_procs.pop(item, None)
+        return code, last_error, files
 
     def update_ytdlp(self):
         """Обновляет yt-dlp и deno на месте, недостающее докачивает в папку программы.
@@ -2855,18 +3064,17 @@ class App(ctk.CTk):
                         ev(("log", line))
                 return out
 
-            # yt-dlp: обновляется сам
+            # yt-dlp: быстрая версия «папкой», проверка по контрольной сумме
             if os.path.isfile(YTDLP):
-                ev(("tools_progress", 0, "Обновляю yt-dlp…"))
-                out = run_tool([YTDLP, "-U"])
-                ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
-                ver = ver.group(0) if ver else ""
-                if "up to date" in out:
-                    results.append(f"yt-dlp — последняя версия {ver}".strip())
-                elif "Updated yt-dlp" in out:
-                    results.append(f"yt-dlp обновлён до {ver}".strip())
+                ev(("tools_progress", 0, "Проверяю yt-dlp…"))
+                kind, text = update_ytdlp_any(self._wait_ytdlp_idle, progress("yt-dlp"))
+                if kind == "same":
+                    results.append(f"yt-dlp — последняя версия {text}".strip())
+                elif kind == "updated":
+                    results.append(f"yt-dlp обновлён до {text}".strip())
                 else:
                     results.append("yt-dlp — не удалось обновить (см. журнал)")
+                    ev(("log", f"yt-dlp: {text}"))
             # deno: тоже умеет обновляться сам
             if DENO:
                 ev(("tools_progress", 0, "Обновляю deno…"))
@@ -3059,12 +3267,29 @@ class App(ctk.CTk):
                 text += f"   •   на паузе: {paused}"
             self.set_main_status(text + f"   •   готово: {self.batch_ok}")
 
+    MAX_DONE_CARDS = 100
+
+    def _trim_done(self):
+        """Не держим в очереди больше 100 готовых карточек — сотни виджетов тормозят окно.
+        Убранные остаются в «Истории»."""
+        done = [i for i in self.items if i.st == "done"]
+        extra = len(done) - self.MAX_DONE_CARDS
+        if extra <= 0:
+            return
+        with self.lock:
+            for item in done[:extra]:
+                self.items.remove(item)
+        for item in done[:extra]:
+            item.destroy()
+        self._regrid()
+
     def _finish_batch(self):
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.update_btn.configure(state="normal")
         for item in self.items:
             item.batch = False
+        self._trim_done()
         ok, fail = self.batch_ok, self.batch_fail
         self.progress.set(1 if ok and not fail else 0)
         msg = f"Скачано: {ok}"
@@ -3139,22 +3364,19 @@ class App(ctk.CTk):
         self._tools_busy = True
 
         def run():
-            try:
-                p = subprocess.run([YTDLP, "-U"], capture_output=True, cwd=BASE_DIR,
-                                   timeout=300, creationflags=NO_WINDOW)
-                out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
-            except (OSError, subprocess.TimeoutExpired) as e:
-                out = str(e)
-            ver = re.search(r"(stable|nightly|master)@[\d.]+", out)
-            ver = ver.group(0) if ver else ""
-            if "Updated yt-dlp" in out:
-                result = ("updated", ver)
-            elif "up to date" in out:
-                result = ("same", ver)
-            else:
-                result = ("failed", out.strip().splitlines()[-1] if out.strip() else "")
-            self.events.put(("auto_ytdlp", result))
+            self.events.put(("auto_ytdlp", update_ytdlp_any(self._wait_ytdlp_idle)))
         threading.Thread(target=run, daemon=True).start()
+
+    def _wait_ytdlp_idle(self, timeout=120):
+        """Ждём, пока не работает ни одна копия yt-dlp (загрузки и превью) — иначе папку
+        с ним не заменить."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                busy = bool(self.procs) or self._previews > 0
+            if not busy:
+                return
+            time.sleep(0.5)
 
     def _on_auto_ytdlp(self, result):
         self._tools_busy = False
@@ -3403,7 +3625,11 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
         log_file.flush()
 
     log(f"Downloader {APP_VERSION}, сборка {BUILD_ID}")
-    log(f"yt-dlp: {YTDLP} ({'есть' if os.path.isfile(YTDLP) else 'НЕТ'})")
+    log(f"yt-dlp: {YTDLP} ({'есть' if os.path.isfile(YTDLP) else 'НЕТ'}, "
+        f"{'быстрая версия' if ytdlp_is_fast() else 'одним файлом'})")
+    t0 = time.time()
+    ver = ytdlp_version()
+    log(f"      запуск yt-dlp --version: {time.time() - t0:.2f} с ({ver})")
     log(f"ffmpeg: {FFMPEG or 'НЕТ'}")
     log(f"deno:   {DENO or 'НЕТ'}")
     for name, ok in (("yt-dlp", os.path.isfile(YTDLP)), ("ffmpeg", FFMPEG), ("deno", DENO)):
@@ -3415,8 +3641,10 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     for style in ("phantom", "classic"):
         FORCE_STYLE = style
         try:
+            t0 = time.time()
             app = App()
             app.update()
+            log(f"      окно ({style}) открылось за {time.time() - t0:.2f} с")
             app.open_settings()
             app.open_history()
             app.open_bulk()
@@ -3480,6 +3708,28 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
         except Exception as e:
             failed += 1
             log(f"FAIL {name}: {e!r}")
+
+    # 2а. загрузка по сохранённым сведениям из превью (без повторного обращения к сайту)
+    try:
+        opts = dict(base, mode="Видео", quality="720p", fmt="MP4")
+        p = subprocess.run(preview_command(url, opts), capture_output=True, timeout=120,
+                           env=env, creationflags=NO_WINDOW)
+        info_path = save_info(json.loads(p.stdout.decode("utf-8", "replace") or "null"))
+        folder = os.path.join(out_dir, "from-info")
+        t0 = time.time()
+        p = subprocess.run(build_command(url, opts, folder, info_json=info_path),
+                           capture_output=True, timeout=300, env=env, creationflags=NO_WINDOW)
+        files = os.listdir(folder) if os.path.isdir(folder) else []
+        ok = bool(info_path) and p.returncode == 0 and any(f.endswith(".mp4") for f in files)
+        failed += 0 if ok else 1
+        log(f"{'OK  ' if ok else 'FAIL'} загрузка по сведениям из превью: код {p.returncode}, "
+            f"{time.time() - t0:.1f} с, файлы {files}")
+        if not ok:
+            out = ANSI.sub("", (p.stdout + p.stderr).decode("utf-8", "replace"))
+            log("\n".join("      " + ln for ln in out.splitlines()[-15:]))
+    except Exception as e:
+        failed += 1
+        log(f"FAIL загрузка по сведениям из превью: {e!r}")
 
     # 2б. скачивание через прокси (как у пользователей с VPN-программой)
     if proxy_url:

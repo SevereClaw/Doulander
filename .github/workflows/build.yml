@@ -37,19 +37,34 @@ jobs:
             Set-Content downloader.py -Encoding utf8
           Select-String -Path downloader.py -Pattern '^BUILD_ID'
 
-      - name: Собрать Downloader.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Downloader --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." --add-data "sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter downloader.py
+      # Основная сборка — папкой (Downloader.exe + _internal): запускается сразу,
+      # без распаковки во временную папку при каждом старте.
+      - name: Собрать Downloader (папкой)
+        shell: pwsh
+        run: pyinstaller --noconfirm --windowed --name Downloader --icon "$PWD\icon.ico" --add-data "$PWD\icon.ico;." --add-data "$PWD\icon.png;." --add-data "$PWD\sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter downloader.py
+
+      # Сборка одним файлом — только для перехода: её скачивают старые update.bat,
+      # после чего update.bat обновляется сам и дальше ставит сборку-папку.
+      - name: Собрать Downloader.exe (одним файлом, для старых update.bat)
+        shell: pwsh
+        run: pyinstaller --noconfirm --onefile --distpath dist-onefile --workpath build-onefile --specpath build-onefile --windowed --name Downloader --icon "$PWD\icon.ico" --add-data "$PWD\icon.ico;." --add-data "$PWD\icon.png;." --add-data "$PWD\sound.wav;." --collect-all tkinterdnd2 --hidden-import pystray._win32 --hidden-import socks --hidden-import sockshandler --collect-data customtkinter downloader.py
 
       - name: Скачать yt-dlp, ffmpeg и deno
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          New-Item -ItemType Directory -Force Downloader | Out-Null
-          Copy-Item dist/Downloader.exe, update.bat Downloader/
-          New-Item -ItemType Directory -Force app | Out-Null
-          Copy-Item dist/Downloader.exe, update.bat app/
+          New-Item -ItemType Directory -Force Downloader, app, appdir | Out-Null
+          Copy-Item dist/Downloader/* Downloader/ -Recurse
+          Copy-Item update.bat Downloader/
+          # для update.bat: новая сборка-папка и (для перехода) одним файлом
+          Copy-Item dist/Downloader/* appdir/ -Recurse
+          Copy-Item update.bat appdir/
+          Copy-Item dist-onefile/Downloader.exe, update.bat app/
 
-          Invoke-WebRequest "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile Downloader/yt-dlp.exe
+          # yt-dlp «папкой» — быстрый запуск каждого превью и загрузки
+          Invoke-WebRequest "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip" -OutFile ytdlp.zip
+          Expand-Archive ytdlp.zip -DestinationPath Downloader/yt-dlp
+          (Get-FileHash ytdlp.zip -Algorithm SHA256).Hash.ToLower() | Set-Content Downloader/yt-dlp/.sha256 -NoNewline -Encoding ascii
 
           Invoke-WebRequest "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
@@ -100,6 +115,18 @@ jobs:
           Get-Process Downloader -ErrorAction SilentlyContinue | Stop-Process -Force
           if ($quit -and $alive) { Add-Content selftest/selftest.log "OK   вторая копия передала окно первой и закрылась" }
           else { Add-Content selftest/selftest.log "FAIL одна копия: вторая закрылась=$quit, первая работает=$alive"; $code = 1 }
+          # замер запуска: сборка-папка против сборки одним файлом (по 3 раза, берём лучший)
+          function StartTime($exe) {
+            $best = 999
+            for ($i = 0; $i -lt 3; $i++) {
+              $t = (Measure-Command { Start-Process $exe -ArgumentList '--ping',"$PWD\ping.txt" -Wait }).TotalSeconds
+              if ($t -lt $best) { $best = $t }
+            }
+            return [math]::Round($best, 2)
+          }
+          $dirT = StartTime "Downloader\Downloader.exe"
+          $oneT = StartTime "dist-onefile\Downloader.exe"
+          Add-Content selftest/selftest.log "      запуск программы: папкой $dirT с, одним файлом $oneT с"
           ./tests/report.ps1 selftest/selftest.log "Самопроверка" $code
 
       # YouTube иногда не пускает серверы GitHub, поэтому эта проверка только для информации.
@@ -131,7 +158,7 @@ jobs:
           $ok = $p.ExitCode -eq 0
           $report = @("Установка в $app : код $($p.ExitCode)")
           function Check($name, $cond) { $script:ok = $script:ok -and $cond; $script:report += "$(if ($cond) {'OK  '} else {'FAIL'}) $name" }
-          foreach ($f in 'Downloader.exe','yt-dlp.exe','ffmpeg.exe','ffplay.exe','deno.exe','update.bat','unins000.exe') { Check $f (Test-Path (Join-Path $app $f)) }
+          foreach ($f in 'Downloader.exe','_internal','yt-dlp\yt-dlp.exe','yt-dlp\_internal','ffmpeg.exe','ffplay.exe','deno.exe','update.bat','unins000.exe') { Check $f (Test-Path (Join-Path $app $f)) }
           Check 'запись в «Установка и удаление программ»' (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A1E-5B7D-4E9A-9C1B-D0A1E2F3B4C5}_is1')
           Check 'ярлык в «Пуске»' (Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'Downloader.lnk'))
           Start-Process (Join-Path $app 'unins000.exe') -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
@@ -153,6 +180,12 @@ jobs:
           path: Downloader/
 
       - name: Сохранить только программу (для update.bat)
+        uses: actions/upload-artifact@v5
+        with:
+          name: Downloader-appdir
+          path: appdir/
+
+      - name: Сохранить программу одним файлом (для старых update.bat)
         uses: actions/upload-artifact@v5
         with:
           name: Downloader-app
@@ -188,8 +221,7 @@ jobs:
           files: |
             dist-setup/DownloaderSetup.exe
             Downloader.zip
-            app/Downloader.exe
-            app/update.bat
+            appdir/update.bat
           generate_release_notes: true
 
       # Снимки окна в обоих оформлениях — в ветку screenshots (для проверки дизайна)
