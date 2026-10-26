@@ -246,6 +246,9 @@ class Player:
         self.wall0 = 0.0
         self.end = 0.0
         self._gen = 0
+        self.frames_read = 0      # для диагностики
+        self.frames_sent = 0
+        self.error = None
 
     def position(self):
         if not self.playing or self.wall0 is None:
@@ -265,7 +268,7 @@ class Player:
         if self.info.has_video:
             fps = min(self.info.fps, 30.0)
             self.vproc = subprocess.Popen(
-                [self.ctx.ffmpeg, "-v", "error", "-ss", f"{start:.3f}", "-i", self.path,
+                [self.ctx.ffmpeg, "-nostdin", "-v", "error", "-ss", f"{start:.3f}", "-i", self.path,
                  "-t", f"{dur:.3f}", "-an", "-vf",
                  f"fps={fps:.3f},scale={self.w}:{self.h}:force_original_aspect_ratio=decrease,"
                  f"pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2:color=black",
@@ -289,13 +292,22 @@ class Player:
                 creationflags=self.ctx.no_window)
 
     def _read_video(self, gen, fps):
+        try:
+            self._read_video_loop(gen, fps)
+        except Exception as e:      # noqa: BLE001 — покажем в окне и в самопроверке
+            self.error = repr(e)
+
+    def _read_video_loop(self, gen, fps):
         size = self.w * self.h * 3
         i = 0
         proc = self.vproc
         while gen == self._gen and proc and proc.stdout:
             buf = proc.stdout.read(size)
             if not buf or len(buf) < size:
+                if proc.poll() not in (None, 0) and not self.error:
+                    self.error = f"ffmpeg завершился с кодом {proc.returncode}"
                 break
+            self.frames_read += 1
             if gen != self._gen:
                 break
             if self.wall0 is None:                      # первый кадр — пускаем часы и звук
@@ -307,6 +319,7 @@ class Player:
             # опаздываем больше чем на четверть секунды — кадр пропускаем, иначе показываем
             if delay > -0.25 and gen == self._gen:
                 self.on_frame(buf)
+                self.frames_sent += 1
             i += 1
 
     def _watch_end(self, gen):
