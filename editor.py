@@ -9,6 +9,7 @@
 """
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -376,6 +377,7 @@ class VideoEditor(ctk.CTkToplevel):
         self._exporting = False
         self._export_stop = False
         self.player = None
+        self._calls = queue.Queue()      # поручения окну из фоновых потоков
         self._build()
         self.bind("<Destroy>", self._on_destroy)
         self.after(150, self.lift)
@@ -478,6 +480,10 @@ class VideoEditor(ctk.CTkToplevel):
                         ("<KeyPress>", self._on_key)):
             self.bind(seq, fn)
 
+    def _ui(self, fn):
+        """Выполнить в окне (из любого потока) — заберёт главный цикл _tick."""
+        self._calls.put(fn)
+
     def set_status(self, text, color=None):
         if self.winfo_exists():
             self.status.configure(text=text, text_color=color or self.ctx.gray)
@@ -487,24 +493,24 @@ class VideoEditor(ctk.CTkToplevel):
         try:
             self.info = probe(self.ctx, self.path)
         except Exception as e:       # noqa: BLE001 — показываем пользователю
-            self.after(0, lambda: self.set_status(f"Не удалось открыть файл: {e}", self.ctx.accent))
+            self._ui(lambda: self.set_status(f"Не удалось открыть файл: {e}", self.ctx.accent))
             return
         if self.info.duration <= 0:
-            self.after(0, lambda: self.set_status("Не удалось узнать длительность файла",
+            self._ui(lambda: self.set_status("Не удалось узнать длительность файла",
                                                   self.ctx.accent))
             return
         self.start_t, self.end_t = 0.0, self.info.duration
-        self.after(0, self._loaded)
+        self._ui(self._loaded)
         film = make_filmstrip(self.ctx, self.path, self.info)
         wave = make_waveform(self.ctx, self.path, self.info, color=self.ctx.wave_color)
         first = grab_frame(self.ctx, self.path, 0, self.PREVIEW_W, self.PREVIEW_H,
                            cover=not self.info.has_video)
         self._film, self._wave = film, wave
-        self.after(0, self._render_strip)
+        self._ui(self._render_strip)
         if first is not None:
             self._show_image(first)
         elif not self.info.has_video:
-            self.after(0, self._show_audio_placeholder)
+            self._ui(self._show_audio_placeholder)
 
     def _loaded(self):
         if not self.winfo_exists():
@@ -536,7 +542,7 @@ class VideoEditor(ctk.CTkToplevel):
             self._latest = buf
 
     def _on_play_end(self):
-        self.after(0, self._stopped_at_end)
+        self._ui(self._stopped_at_end)
 
     def _stopped_at_end(self):
         if self.winfo_exists():
@@ -547,6 +553,15 @@ class VideoEditor(ctk.CTkToplevel):
         """Главный цикл: показать новый кадр, подвинуть бегунок и время."""
         if not self.winfo_exists():
             return
+        while True:                     # поручения из фоновых потоков
+            try:
+                fn = self._calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:
+                pass
         with self._frame_lock:
             frame, self._latest = self._latest, None
         if frame is not None:
@@ -792,10 +807,9 @@ class VideoEditor(ctk.CTkToplevel):
 
         def run():
             ok, err = run_trim(self.ctx, self.path, dst, start, end, exact, audio, self.info,
-                               progress=lambda f: self.after(0, lambda: self.winfo_exists() and
-                                                             self.progress.set(f)),
+                               progress=lambda f: self._ui(lambda: self.progress.set(f)),
                                stop=lambda: self._export_stop)
-            self.after(0, lambda: self._saved(ok, err, dst))
+            self._ui(lambda: self._saved(ok, err, dst))
         threading.Thread(target=run, daemon=True).start()
 
     def _saved(self, ok, err, dst):

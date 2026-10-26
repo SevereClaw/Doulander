@@ -3499,9 +3499,8 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
                 time.sleep(0.02)
             shown = win.frames_shown
             pl = win.player
-            diag = (f"прочитано {pl.frames_read}, отдано {pl.frames_sent}, "
-                    f"часы {'пошли' if pl.wall0 else 'не пошли'}, ffmpeg "
-                    f"{pl.vproc.poll() if pl.vproc else 'нет'}, ошибка {pl.error}")
+            diag = (f"прочитано {pl.frames_read}, отдано {pl.frames_sent}, ошибка {pl.error}"
+                    if pl else "проигрыватель не создан")
             app.quit_app()
             FORCE_STYLE = None
             good = shown >= 10
