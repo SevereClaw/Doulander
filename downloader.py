@@ -26,6 +26,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
+import editor
 import phantom_style
 
 try:                                # звук уведомления (только Windows)
@@ -37,7 +38,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.11.2"
+APP_VERSION = "1.12.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -90,14 +91,16 @@ def launch_error_text(err):
     return str(err)
 
 
-YTDLP = FFMPEG = DENO = None
+YTDLP = FFMPEG = DENO = FFPROBE = FFPLAY = None
 
 
 def refresh_tools():
     """Ищет yt-dlp, ffmpeg и deno заново (например, после докачки)."""
-    global YTDLP, FFMPEG, DENO
+    global YTDLP, FFMPEG, DENO, FFPROBE, FFPLAY
     YTDLP = find_tool("yt-dlp.exe") or os.path.join(BASE_DIR, "yt-dlp.exe")
     FFMPEG = find_tool("ffmpeg.exe")
+    FFPROBE = find_tool("ffprobe.exe")
+    FFPLAY = find_tool("ffplay.exe")        # звук в предпросмотре редактора
     # deno нужен YouTube для расшифровки ссылок; его установщик кладёт его в ~/.deno/bin
     DENO = find_tool("deno.exe") or next(
         (p for p in [os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe")]
@@ -111,7 +114,7 @@ TOOL_SOURCES = {
     "yt-dlp": ("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
                None),
     "ffmpeg": ("https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/"
-               "ffmpeg-master-latest-win64-gpl.zip", ("ffmpeg.exe", "ffprobe.exe")),
+               "ffmpeg-master-latest-win64-gpl.zip", ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe")),
     "deno": ("https://github.com/denoland/deno/releases/latest/download/"
              "deno-x86_64-pc-windows-msvc.zip", ("deno.exe",)),
 }
@@ -1311,6 +1314,12 @@ class QueueItem(ctk.CTkFrame):
             m.add_command(label="⏸  Поставить на паузу",
                           command=lambda: self.app.toggle_pause(self))
         if done:
+            is_media = exists and os.path.isfile(self.file_path) and \
+                self.file_path.lower().endswith(editor.MEDIA_EXTS)
+            m.add_command(label="✂  Обрезать в редакторе",
+                          state="normal" if is_media else "disabled",
+                          command=lambda: self.app.open_editor(self.file_path, self.url,
+                                                               self.full_title))
             m.add_command(label="⟳  Скачать снова", command=self.redownload)
         m.add_command(label="🔗  Копировать ссылку", command=self.copy_url)
         m.add_separator()
@@ -1435,6 +1444,10 @@ class HistoryWindow(ctk.CTkToplevel):
                       command=lambda: os.startfile(path))
         m.add_command(label="📂  Показать в папке",
                       command=lambda: self.app.show_in_folder(path or ""))
+        is_media = exists and os.path.isfile(path) and path.lower().endswith(editor.MEDIA_EXTS)
+        m.add_command(label="✂  Обрезать в редакторе", state="normal" if is_media else "disabled",
+                      command=lambda: self.app.open_editor(path, rec.get("url"),
+                                                           rec.get("title")))
         m.add_command(label="⟳  Скачать снова", command=lambda: self.redownload(rec))
         m.add_command(label="🔗  Копировать ссылку", command=lambda: self.copy_url(rec))
         m.add_separator()
@@ -2015,10 +2028,12 @@ class App(ctk.CTk):
         qhead.grid(row=4, column=0, sticky="ew", pady=(8, 0), **pad)
         qhead.grid_columnconfigure(0, weight=1)
         title_widget(qhead, "Очередь", 15).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(qhead, text="✂ Редактор", width=100, height=26,
+                      command=self.open_editor, **outline).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(qhead, text="🕘 История", width=100, height=26,
-                      command=self.open_history, **outline).grid(row=0, column=1, padx=(0, 8))
+                      command=self.open_history, **outline).grid(row=0, column=2, padx=(0, 8))
         ctk.CTkButton(qhead, text="Убрать готовые", width=120, height=26,
-                      command=self.clear_finished, **outline).grid(row=0, column=2)
+                      command=self.clear_finished, **outline).grid(row=0, column=3)
 
         self.queue_frame = ctk.CTkScrollableFrame(self, corner_radius=R(14))
         self.queue_frame.grid(row=5, column=0, sticky="nsew", pady=6, **pad)
@@ -2385,6 +2400,50 @@ class App(ctk.CTk):
             self.set_main_status(f"Добавлено: {added}" +
                                  (f" (из них поиском по названию: {searches})" if searches else ""))
         return added
+
+    def editor_ctx(self, url=None, title=None):
+        ps = phantom_style
+
+        def on_saved(path):
+            self.log("✂ Сохранено: " + path)
+            self.set_main_status("✂ Сохранено: " + os.path.basename(path), GREEN)
+            if url:
+                rec = {"url": url, "title": f"{title or os.path.basename(path)} (обрезка)",
+                       "file": path,
+                       "date": datetime.datetime.now().strftime("%d.%m.%Y %H:%M"), "opts": {}}
+                self.history.insert(0, rec)
+                save_history(self.history)
+                self.refresh_history_window()
+        import types
+        return types.SimpleNamespace(
+            ffmpeg=FFMPEG, ffprobe=FFPROBE, ffplay=FFPLAY, no_window=NO_WINDOW, icon=ICON_ICO,
+            title_widget=title_widget, gray=GRAY_TEXT, accent=ACCENT,
+            accent_hover=ACCENT_HOVER, green=GREEN,
+            btn2=dict(fg_color=C.BTN2, hover_color=C.BTN2_HOVER, text_color=C.BTN2_TEXT),
+            timeline_bg=ps.BLACK2 if PHANTOM else "#2B2B2B",
+            ruler=ps.SOFT if PHANTOM else "#A0A0A0",
+            handle="#FFFFFF", playhead=ps.RED if PHANTOM else "#4CD964",
+            wave_color="#FFFFFF" if PHANTOM else "#9BC3FF",
+            on_saved=on_saved, show_in_folder=self.show_in_folder)
+
+    def open_editor(self, path=None, url=None, title=None):
+        """✂ Редактор: обрезать видео или аудио. Без пути — выбрать файл."""
+        if not FFMPEG:
+            self.set_main_status("Для редактора нужен ffmpeg — нажмите «Обновить компоненты»",
+                                 ACCENT)
+            return
+        if not path:
+            path = filedialog.askopenfilename(
+                title="Какой файл обрезать?", initialdir=self.settings["folder"],
+                filetypes=[("Видео и аудио", " ".join("*" + e for e in editor.MEDIA_EXTS)),
+                           ("Все файлы", "*.*")])
+            if not path:
+                return
+        if not os.path.isfile(path):
+            self.set_main_status("Файл не найден: " + path, ACCENT)
+            return
+        self.editor_win = editor.VideoEditor(self, self.editor_ctx(url, title),
+                                             os.path.normpath(path))
 
     def open_format_picker(self, item):
         if not item.choices:
@@ -2783,7 +2842,15 @@ class App(ctk.CTk):
                     results.append(f"deno обновлён{(' до ' + ver.group(1)) if ver else ''}")
                 else:
                     results.append("deno — не удалось обновить (см. журнал)")
-            if FFMPEG:
+            if FFMPEG and not FFPLAY:
+                # ffplay нужен только для звука в редакторе — приходит в том же архиве
+                try:
+                    install_tool("ffmpeg", progress("ffmpeg + ffplay"))
+                    results.append("ffplay скачан (звук в редакторе)")
+                except Exception as e:
+                    results.append("ffplay — не удалось скачать")
+                    ev(("log", f"Не удалось скачать ffplay: {e}"))
+            elif FFMPEG:
                 results.append("ffmpeg на месте")
             # чего нет — докачиваем в папку программы
             for name in missing_tools():
@@ -3149,6 +3216,10 @@ class App(ctk.CTk):
                 paths = self.tk.splitlist(data)
             except tk.TclError:
                 paths = []
+            media = [p for p in paths if os.path.isfile(p) and p.lower().endswith(editor.MEDIA_EXTS)]
+            if media:
+                self.open_editor(media[0])
+                return "copy"
             for path in paths:
                 if os.path.isfile(path) and path.lower().endswith((".url", ".txt")):
                     try:
@@ -3389,6 +3460,54 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             failed += 1
             log(f"FAIL музыка: {e!r}")
 
+    # 4. редактор: разбор файла, обрезка «Быстро» и «Точно», окно с воспроизведением
+    src = os.path.join(out_dir, "video-mp4", "test.mp4")
+    if os.path.isfile(src):
+        import types
+        ctx = types.SimpleNamespace(ffmpeg=FFMPEG, ffprobe=FFPROBE, ffplay=None,
+                                    no_window=NO_WINDOW)
+        try:
+            info = editor.probe(ctx, src)
+            ok = info.duration > 4 and info.has_video and info.has_audio
+            failed += 0 if ok else 1
+            log(f"{'OK  ' if ok else 'FAIL'} редактор — файл: {info.duration:.2f} с, "
+                f"{info.width}x{info.height}, {info.fps:g} fps")
+            for exact in (False, True):
+                dst = editor.output_path(src, 1.0, 4.0, exact, info)
+                done, err = editor.run_trim(ctx, src, dst, 1.0, 4.0, exact, True, info)
+                d = editor.probe(ctx, dst).duration if done else 0
+                # «Быстро» режет по ключевым кадрам — длина может отличаться
+                good = done and (abs(d - 3.0) < 0.3 if exact else 2.0 < d < 6.5)
+                failed += 0 if good else 1
+                log(f"{'OK  ' if good else 'FAIL'} редактор — {'точно' if exact else 'быстро'}"
+                    f" 1–4 с: {d:.2f} с {os.path.basename(dst) if done else err}")
+            FORCE_STYLE = "phantom"
+            app = App()
+            app.update()
+            app.open_editor(src)
+            win = app.editor_win
+            deadline = time.time() + 15
+            while time.time() < deadline and not win.player:
+                app.update()
+                time.sleep(0.05)
+            win.seek(1.0)
+            win.end_t = 3.5
+            win.toggle_play()
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                app.update()
+                time.sleep(0.02)
+            shown = win.frames_shown
+            app.quit_app()
+            FORCE_STYLE = None
+            good = shown >= 10
+            failed += 0 if good else 1
+            log(f"{'OK  ' if good else 'FAIL'} редактор — окно и воспроизведение: "
+                f"показано кадров {shown}")
+        except Exception as e:
+            failed += 1
+            log(f"FAIL редактор: {e!r}")
+
     log(f"Итог: {'ВСЁ ХОРОШО' if not failed else f'ошибок: {failed}'}")
     log_file.close()
     return 1 if failed else 0
@@ -3411,6 +3530,27 @@ def screenshot(out_path, style, urls):
     from PIL import ImageGrab
     app = App()
     app.geometry("900x760+0+0")
+    if extra == "editor":
+        app.open_editor(urls[0])
+
+        def prepare_editor():
+            win = app.editor_win
+            win.geometry("880x790+0+0")
+            win.start_t, win.end_t = 1.2, 4.6
+            win._update_labels()
+            win.seek(2.6)
+            win.after(2500, grab_editor)
+
+        def grab_editor():
+            win = app.editor_win
+            win.update()
+            x, y = win.winfo_rootx(), win.winfo_rooty()
+            ImageGrab.grab(bbox=(x, y, x + win.winfo_width(), y + win.winfo_height()),
+                           all_screens=True).save(out_path)
+            app.quit_app()
+        app.after(6000, prepare_editor)
+        app.mainloop()
+        return 0
     for url in urls:
         app.add_item(url)
     if app.items:

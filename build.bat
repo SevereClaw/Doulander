@@ -60,7 +60,7 @@ if exist "%OUT%\ffmpeg.exe" if exist "%OUT%\ffprobe.exe" goto ffmpeg_ok
 call :download "%URL_FFMPEG%" "%TMPD%\ffmpeg.zip" || goto fail
 echo   Распаковываю...
 call :unzip "%TMPD%\ffmpeg.zip" "%TMPD%\ffmpeg" || goto fail
-for /r "%TMPD%\ffmpeg" %%F in (ffmpeg.exe ffprobe.exe) do if exist "%%F" copy /y "%%F" "%OUT%\" >nul
+for /r "%TMPD%\ffmpeg" %%F in (ffmpeg.exe ffprobe.exe ffplay.exe) do if exist "%%F" copy /y "%%F" "%OUT%\" >nul
 if not exist "%OUT%\ffmpeg.exe" goto fail
 goto deno
 :ffmpeg_ok

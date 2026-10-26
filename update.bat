@@ -127,7 +127,7 @@ if not exist "%TMPD%" mkdir "%TMPD%"
 echo   ffmpeg — нет, скачиваю (около 150 МБ)...
 curl.exe -L --fail --progress-bar -o "%TMPD%\ffmpeg.zip" "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
 powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath (Join-Path $env:TMPD 'ffmpeg.zip') -DestinationPath (Join-Path $env:TMPD 'ffmpeg')"
-for /r "%TMPD%\ffmpeg" %%F in (ffmpeg.exe ffprobe.exe) do if exist "%%F" copy /y "%%F" "%~dp0" >nul
+for /r "%TMPD%\ffmpeg" %%F in (ffmpeg.exe ffprobe.exe ffplay.exe) do if exist "%%F" copy /y "%%F" "%~dp0" >nul
 
 :deno
 if not exist "%~dp0deno.exe" goto deno_get

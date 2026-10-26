@@ -53,7 +53,7 @@ jobs:
 
           Invoke-WebRequest "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
-          Get-ChildItem ffmpeg -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination Downloader/
+          Get-ChildItem ffmpeg -Recurse -Include ffmpeg.exe, ffprobe.exe, ffplay.exe | Copy-Item -Destination Downloader/
 
           Invoke-WebRequest "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
           Expand-Archive deno.zip -DestinationPath deno
@@ -119,7 +119,7 @@ jobs:
           $ok = $p.ExitCode -eq 0
           $report = @("Установка в $app : код $($p.ExitCode)")
           function Check($name, $cond) { $script:ok = $script:ok -and $cond; $script:report += "$(if ($cond) {'OK  '} else {'FAIL'}) $name" }
-          foreach ($f in 'Downloader.exe','yt-dlp.exe','ffmpeg.exe','deno.exe','update.bat','unins000.exe') { Check $f (Test-Path (Join-Path $app $f)) }
+          foreach ($f in 'Downloader.exe','yt-dlp.exe','ffmpeg.exe','ffplay.exe','deno.exe','update.bat','unins000.exe') { Check $f (Test-Path (Join-Path $app $f)) }
           Check 'запись в «Установка и удаление программ»' (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A1E-5B7D-4E9A-9C1B-D0A1E2F3B4C5}_is1')
           Check 'ярлык в «Пуске»' (Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'Downloader.lnk'))
           Start-Process (Join-Path $app 'unins000.exe') -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
@@ -193,6 +193,7 @@ jobs:
           foreach ($style in 'phantom','classic','phantom-picker','phantom-flash') {
             Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\$style.png",$style,'http://127.0.0.1:8765/clip.html','http://127.0.0.1:8765/test.mp4' -Wait
           }
+          Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\phantom-editor.png",'phantom-editor',"$PWD\testdata\test.mp4" -Wait
           Stop-Process $srv -ErrorAction SilentlyContinue
           Get-ChildItem shots
           git config user.name "github-actions"
