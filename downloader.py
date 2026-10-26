@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -866,6 +866,8 @@ def build_command(url, opts, folder, fragments=8, info_json=None):
         "-N", str(fragments),               # качать куски видео параллельно
         "--http-chunk-size", "10M",         # обходит ограничение скорости YouTube
         "--retries", "10", "--fragment-retries", "10",
+        # Защитник Windows и индексатор на миг блокируют новые файлы — пробуем дольше
+        "--file-access-retries", "10",
         "--socket-timeout", "15",
     ]
     # плейлист складывается в отдельную папку с его названием (см. output_stem)
@@ -1384,6 +1386,7 @@ class QueueItem(ctk.CTkFrame):
         self.btn = ctk.CTkButton(self, text="✕", command=self.on_button, **small)
         self.btn.grid(row=0, column=4, rowspan=4, padx=(0, 8))
         self.after(100, lambda: bind_right_click(self, self.show_menu))
+        self.video_key = None            # «сайт:код видео» — чтобы не качать одно видео дважды
         self.pause_requested = False     # пауза нажата во время скачивания
         self.user_paused = False         # поставлена на паузу вручную (кнопкой ⏸)
 
@@ -2664,7 +2667,18 @@ class App(ctk.CTk):
             return
         self.bulk_win = BulkWindow(self)
 
+    def find_active(self, url):
+        """Та же ссылка уже ждёт, качается или на паузе?"""
+        for i in self.items:
+            if i.url == url and i.st in ("wait", "run", "paused"):
+                return i
+        return None
+
     def add_item(self, url, opts=None):
+        same = self.find_active(url)
+        if same:
+            self.set_main_status("Эта ссылка уже в очереди: " + (same.full_title or url))
+            return same
         try:
             opts = opts or self.current_opts()
         except ValueError:
@@ -2764,6 +2778,8 @@ class App(ctk.CTk):
         if info.get("_type") != "playlist" and not item.opts.get("playlist"):
             item.info_json = save_info(info)
             item.info_time = time.time()
+        if info.get("id"):
+            item.video_key = f"{info.get('extractor_key') or info.get('extractor')}:{info['id']}"
         if info.get("_type") != "playlist":
             self.events.put(("choices", item,
                              format_choices(info, item.opts["mode"], item.opts["fmt"])))
@@ -2906,8 +2922,13 @@ class App(ctk.CTk):
 
     def _take_item(self):
         with self.lock:
+            # одно и то же видео (даже по разным ссылкам) двумя загрузками одновременно
+            # не качаем — они пишут одни и те же файлы и мешают друг другу
+            busy = {(i.url) for i in self.items if i.st == "run"} | \
+                {i.video_key for i in self.items if i.st == "run" and i.video_key}
             for item in self.items:
-                if item.st == "wait":
+                if item.st == "wait" and item.url not in busy and \
+                        not (item.video_key and item.video_key in busy):
                     item.st = "run"          # сразу занимаем, чтобы другой поток не взял
                     return item
         return None
@@ -3355,7 +3376,8 @@ class App(ctk.CTk):
         """Раз в час смотрит, не пора ли обновить yt-dlp (раз в сутки), и делает это тихо."""
         delay = 3600 * 1000
         try:
-            due = time.time() - float(self.settings.get("ytdlp_checked") or 0) > 20 * 3600
+            due = time.time() - float(self.settings.get("ytdlp_checked") or 0) > 20 * 3600 \
+                or not ytdlp_is_fast()          # стоит старый yt-dlp одним файлом — переходим
             if self.v_auto_ytdlp.get() and due and not NO_SAVE and os.path.isfile(YTDLP):
                 if self.workers_alive or self._tools_busy:
                     delay = 10 * 60 * 1000          # идёт скачивание — попробуем позже
@@ -3653,6 +3675,10 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             app.open_history()
             app.open_bulk()
             app.add_item("https://example.com/test-video")
+            before = len(app.items)
+            app.add_item("https://example.com/test-video")        # та же ссылка ещё раз
+            if len(app.items) != before:
+                raise RuntimeError("одна и та же ссылка добавилась в очередь дважды")
             app.items[-1].set_choices(SAMPLE_CHOICES)
             app.open_format_picker(app.items[-1])
             app.picker_win.pick(SAMPLE_CHOICES[2])
