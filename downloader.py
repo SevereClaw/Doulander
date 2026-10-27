@@ -4627,6 +4627,10 @@ def screenshot(out_path, style, urls):
         def grab_gallery():
             win = app.gallery_win
             win.geometry("1000x700+0+0")
+            win.attributes("-topmost", True)
+            win.lift()
+            win.update()
+            time.sleep(0.5)
             win.update()
             x, y = win.winfo_rootx(), win.winfo_rooty()
             ImageGrab.grab(bbox=(x, y, x + win.winfo_width(), y + win.winfo_height()),
