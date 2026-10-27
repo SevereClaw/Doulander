@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -1885,6 +1885,346 @@ class HistoryWindow(ctk.CTkToplevel):
         self.refresh()
 
 
+
+# ================================================================ галерея
+LOW_PRIORITY = 0x00004000 if os.name == "nt" else 0     # ffmpeg галереи не мешает играм и браузеру
+_media_cache = {}           # путь -> (время изменения, длительность, есть видео)
+
+
+def media_details(path):
+    """Длительность и есть ли видео — через ffprobe, с запоминанием."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None, False
+    hit = _media_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1], hit[2]
+    dur, video = None, False
+    if FFPROBE:
+        try:
+            p = subprocess.run([FFPROBE, "-v", "error", "-print_format", "json",
+                                "-show_format", "-show_streams", path],
+                               capture_output=True, timeout=20,
+                               creationflags=NO_WINDOW | LOW_PRIORITY)
+            info = json.loads(p.stdout.decode("utf-8", "replace") or "{}")
+            dur = float((info.get("format") or {}).get("duration") or 0) or None
+            video = any(st.get("codec_type") == "video" and
+                        not (st.get("disposition") or {}).get("attached_pic")
+                        for st in info.get("streams") or [])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    _media_cache[path] = (mtime, dur, video)
+    return dur, video
+
+
+def gallery_thumb(path, dur, video, w=416, h=234):
+    """Кадр из видео (или обложка трека) 16:9, из кэша или через ffmpeg. None — нет картинки."""
+    try:
+        key = f"{path}|{os.path.getmtime(path)}"
+    except OSError:
+        return None
+    cached = os.path.join(THUMB_CACHE, "g" + uuid.uuid5(uuid.NAMESPACE_URL, key).hex + ".png")
+    if os.path.isfile(cached):
+        try:
+            return Image.open(cached).copy()
+        except OSError:
+            pass
+    if not FFMPEG:
+        return None
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    if video:
+        t = min(max((dur or 0) * 0.2, 0), 60)
+        cmd = [FFMPEG, "-v", "error", "-ss", f"{t:.2f}", "-i", path, "-an", "-frames:v", "1"]
+    else:
+        cmd = [FFMPEG, "-v", "error", "-i", path, "-an", "-frames:v", "1"]
+    try:
+        p = subprocess.run(cmd + ["-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"],
+                           capture_output=True, timeout=30,
+                           creationflags=NO_WINDOW | LOW_PRIORITY)
+        if p.returncode != 0 or not p.stdout:
+            return None
+        img = Image.open(io.BytesIO(p.stdout)).convert("RGB")
+        os.makedirs(THUMB_CACHE, exist_ok=True)
+        img.save(cached)
+        return img
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def downloaded_media(history):
+    """Скачанные программой файлы, которые ещё лежат на месте: [(путь, запись истории)].
+    Папка с главами разворачивается в отдельные треки."""
+    out, seen = [], set()
+    for rec in history:
+        path = rec.get("file")
+        if not path:
+            continue
+        if os.path.isdir(path):
+            try:
+                files = sorted(os.path.join(path, n) for n in os.listdir(path))
+            except OSError:
+                continue
+        else:
+            files = [path]
+        for f in files:
+            key = os.path.normcase(os.path.abspath(f))
+            if key in seen or not f.lower().endswith(editor.MEDIA_EXTS) or \
+                    not os.path.isfile(f):
+                continue
+            seen.add(key)
+            out.append((f, rec))
+    return out
+
+
+class GalleryWindow(ctk.CTkToplevel):
+    """Всё, что скачала программа: плитки с кадром, длительностью и размером."""
+    TILE_W, TILE_H = 208, 117
+    PAGE = 24
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Галерея")
+        self.geometry("1000x700")
+        self.minsize(560, 420)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.kind = ctk.StringVar(value="Все")
+        self.tiles = []
+        self._gen = 0
+        self._job = None
+        self._cols = 0
+        self._images = {}               # путь -> CTkImage (держим ссылки)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        head.grid_columnconfigure(1, weight=1)
+        title_widget(head, "Галерея", 18).grid(row=0, column=0, sticky="w", padx=(0, 14))
+        self.search = ctk.CTkEntry(head, height=34,
+                                   placeholder_text="🔍  Поиск по названию…")
+        self.search.grid(row=0, column=1, sticky="ew")
+        self.search.bind("<KeyRelease>", lambda e: self._schedule_refresh())
+        ctk.CTkButton(head, text="📂 Папка", width=90, height=34, fg_color="transparent",
+                      border_width=1, text_color=C.OUTLINE_TEXT,
+                      command=app.open_folder).grid(row=0, column=2, padx=(8, 0))
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+        bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkSegmentedButton(bar, values=["Все", "Видео", "Музыка", "Обрезки"],
+                               variable=self.kind, command=lambda v: self.refresh()
+                               ).grid(row=0, column=0, sticky="w")
+        self.info = ctk.CTkLabel(bar, text="", text_color=GRAY_TEXT, anchor="e")
+        self.info.grid(row=0, column=1, sticky="e")
+
+        self.grid_frame = ctk.CTkScrollableFrame(self, corner_radius=R(12))
+        self.grid_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 14))
+        self.grid_frame.bind("<Configure>", lambda e: self._schedule_reflow())
+        self.refresh()
+        self.after(150, self.lift)
+
+    # ---------- данные
+    def _schedule_refresh(self):
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(250, self.refresh)
+
+    def _matches(self, path, rec, q):
+        kind = self.kind.get()
+        ext = path.lower()
+        if kind == "Видео" and not ext.endswith(editor.VIDEO_EXTS):
+            return False
+        if kind == "Музыка" and not ext.endswith(editor.AUDIO_EXTS):
+            return False
+        if kind == "Обрезки" and "(обрезка" not in os.path.basename(path):
+            return False
+        if q and q not in (rec.get("title") or "").lower() and \
+                q not in os.path.basename(path).lower():
+            return False
+        return True
+
+    def refresh(self):
+        self._job = None
+        self._gen += 1
+        for t in self.tiles:
+            t.destroy()
+        self.tiles = []
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        q = self.search.get().strip().lower()
+        self.items = [(p, r) for p, r in downloaded_media(self.app.history)
+                      if self._matches(p, r, q)]
+        self.shown = 0
+        self.more_btn = None
+        if not self.items:
+            ctk.CTkLabel(self.grid_frame, text=("Ничего не найдено" if q or
+                                                self.kind.get() != "Все" else
+                                                "Здесь появятся скачанные видео и музыка"),
+                         text_color=C.MUTED).grid(row=0, column=0, pady=40, padx=20)
+            self.info.configure(text="")
+            return
+        self.show_more()
+
+    def show_more(self):
+        if self.more_btn is not None:
+            self.more_btn.destroy()
+            self.more_btn = None
+        end = min(len(self.items), self.shown + self.PAGE)
+        new = [self._tile(*self.items[n]) for n in range(self.shown, end)]
+        self.tiles += new
+        self.shown = end
+        self._reflow(force=True)
+        threading.Thread(target=self._load_thumbs, args=(self._gen, new), daemon=True).start()
+        total = sum(os.path.getsize(p) for p, _ in self.items if os.path.isfile(p))
+        self.info.configure(text=f"Файлов: {len(self.items)}   ·   {human_size(total) or '0 Б'}")
+
+    # ---------- плитки
+    def _columns(self):
+        width = self.grid_frame.winfo_width() or 960
+        return max(1, (width - 20) // (self.TILE_W + 20))
+
+    def _schedule_reflow(self):
+        cols = self._columns()
+        if cols != self._cols:
+            self.after(60, self._reflow)
+
+    def _reflow(self, force=False):
+        cols = self._columns()
+        if cols == self._cols and not force:
+            return
+        self._cols = cols
+        for c in range(12):
+            self.grid_frame.grid_columnconfigure(c, weight=1 if c < cols else 0)
+        for n, t in enumerate(self.tiles):
+            t.grid(row=n // cols, column=n % cols, padx=8, pady=8, sticky="n")
+        left = len(self.items) - self.shown
+        if left > 0:
+            if self.more_btn is None:
+                self.more_btn = ctk.CTkButton(self.grid_frame, text=f"Показать ещё ({left})",
+                                              height=34, fg_color=C.BTN2,
+                                              hover_color=C.BTN2_HOVER, text_color=C.BTN2_TEXT,
+                                              command=self.show_more)
+            self.more_btn.grid(row=len(self.tiles) // cols + 1, column=0, columnspan=cols,
+                               sticky="ew", padx=8, pady=8)
+
+    def _tile(self, path, rec):
+        is_audio = path.lower().endswith(editor.AUDIO_EXTS)
+        tile = ctk.CTkFrame(self.grid_frame, width=self.TILE_W + 12, corner_radius=R(10),
+                            fg_color=C.CARD, border_width=2, border_color=C.CARD)
+        tile.path, tile.rec = path, rec
+        ext = os.path.splitext(path)[1][1:].upper()
+        tile.pic = ctk.CTkLabel(tile, text=("♪\n" if is_audio else "▶\n") + ext,
+                                width=self.TILE_W, height=self.TILE_H, corner_radius=R(8),
+                                fg_color=C.BADGE, text_color=C.BADGE_TEXT,
+                                font=ctk.CTkFont(size=20, weight="bold"), cursor="hand2")
+        tile.pic.grid(row=0, column=0, padx=6, pady=(6, 4))
+        name = os.path.splitext(os.path.basename(path))[0]
+        if os.path.isdir(rec.get("file") or ""):
+            title = name
+        else:
+            title = rec.get("title") or name
+        title = title if len(title) <= 52 else title[:50] + "…"
+        ctk.CTkLabel(tile, text=title, width=self.TILE_W, wraplength=self.TILE_W, anchor="w",
+                     justify="left", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=1, column=0, sticky="w", padx=8)
+        try:
+            size = human_size(os.path.getsize(path))
+        except OSError:
+            size = None
+        tile.meta = ctk.CTkLabel(tile, text="   ·   ".join(x for x in (
+            ext, size, (rec.get("date") or "").split(" ")[0]) if x),
+            anchor="w", text_color=GRAY_TEXT, font=ctk.CTkFont(size=11))
+        tile.meta.grid(row=2, column=0, sticky="w", padx=8)
+        btns = ctk.CTkFrame(tile, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=4, pady=(2, 6))
+        small = dict(height=26, fg_color="transparent", hover_color=C.ICON_HOVER,
+                     text_color=C.OUTLINE_TEXT)
+        ctk.CTkButton(btns, text="▶ Смотреть" if not is_audio else "▶ Слушать", width=96,
+                      command=lambda: self.play(path), **small).pack(side="left")
+        ctk.CTkButton(btns, text="✂", width=34, command=lambda: self.edit(path, rec),
+                      **small).pack(side="left")
+        ctk.CTkButton(btns, text="📂", width=34,
+                      command=lambda: self.app.show_in_folder(path), **small).pack(side="left")
+        tile.pic.bind("<Button-1>", lambda e: self.play(path))
+        for w in (tile, tile.pic):
+            w.bind("<Enter>", lambda e, t=tile: t.configure(border_color=ACCENT), add="+")
+            w.bind("<Leave>", lambda e, t=tile: t.configure(border_color=C.CARD), add="+")
+        self.after(50, lambda: bind_right_click(tile, lambda e: self.show_menu(e, path, rec)))
+        return tile
+
+    def _load_thumbs(self, gen, tiles):
+        """Фон: кадры и длительность для плиток (по одной, с низким приоритетом)."""
+        for tile in tiles:
+            if gen != self._gen:
+                return
+            dur, video = media_details(tile.path)
+            img = gallery_thumb(tile.path, dur, video)
+            if img is None and tile.rec.get("thumb") and os.path.isfile(tile.rec["thumb"]):
+                try:
+                    img = Image.open(tile.rec["thumb"]).convert("RGB")
+                except OSError:
+                    img = None
+            self.app.events.put(("call", lambda t=tile, i=img, d=dur, g=gen:
+                                 self._apply_thumb(g, t, i, d)))
+
+    def _apply_thumb(self, gen, tile, img, dur):
+        if gen != self._gen or not tile.winfo_exists():
+            return
+        if img is not None:
+            if dur:
+                img = img.copy()
+                d = ImageDraw.Draw(img)
+                text = human_duration(dur)
+                font = phantom_style._font("arialbd.ttf", 20)
+                tw = int(d.textlength(text, font=font)) + 14
+                # плашка длительности в углу кадра, как на YouTube
+                d.rectangle((img.width - tw - 8, img.height - 34, img.width - 8,
+                             img.height - 8), fill=ACCENT if PHANTOM else "#000000")
+                d.text((img.width - tw + 7 - 8, img.height - 32), text, fill="#FFFFFF",
+                       font=font)
+            cimg = ctk.CTkImage(light_image=img, dark_image=img,
+                                size=(self.TILE_W, self.TILE_H))
+            self._images[tile.path] = cimg
+            tile.pic.configure(image=cimg, text="", fg_color="transparent")
+        elif dur:
+            tile.pic.configure(text=tile.pic.cget("text") + f"\n{human_duration(dur)}")
+
+    # ---------- действия
+    def play(self, path):
+        if os.path.isfile(path):
+            os.startfile(path)
+        else:
+            self.refresh()
+
+    def edit(self, path, rec):
+        self.app.open_editor(path, rec.get("url"), rec.get("title"))
+
+    def show_menu(self, event, path, rec):
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="▶  Открыть", command=lambda: self.play(path))
+        m.add_command(label="✂  Обрезать в редакторе", command=lambda: self.edit(path, rec))
+        m.add_command(label="📂  Показать в папке", command=lambda: self.app.show_in_folder(path))
+        if rec.get("url"):
+            m.add_command(label="🔗  Копировать ссылку", command=lambda: (
+                self.app.clipboard_clear(), self.app.clipboard_append(rec["url"]),
+                setattr(self.app, "_last_clip", rec["url"])))
+        m.add_separator()
+        m.add_command(label="🗑  Удалить файл…", command=lambda: self.delete(path, rec))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def delete(self, path, rec):
+        if delete_download(self.app, path, rec.get("title") or os.path.basename(path)):
+            self.refresh()
+            self.app.refresh_history_window()
+
+
 # ================================================================ выбор качества
 class FormatPicker(ctk.CTkToplevel):
     """Все варианты качества у одной ссылки, с размерами. Клик — выбрать."""
@@ -2431,8 +2771,8 @@ class App(ctk.CTk):
         qhead.grid(row=4, column=0, sticky="ew", pady=(8, 0), **pad)
         qhead.grid_columnconfigure(0, weight=1)
         title_widget(qhead, "Очередь", 15).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(qhead, text="✂ Редактор", width=100, height=26,
-                      command=self.open_editor, **outline).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(qhead, text="🖼 Галерея", width=100, height=26,
+                      command=self.open_gallery, **outline).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(qhead, text="🕘 История", width=100, height=26,
                       command=self.open_history, **outline).grid(row=0, column=2, padx=(0, 8))
         ctk.CTkButton(qhead, text="Убрать готовые", width=120, height=26,
@@ -2829,19 +3169,28 @@ class App(ctk.CTk):
             wave_color="#FFFFFF" if PHANTOM else "#9BC3FF",
             on_saved=on_saved, show_in_folder=self.show_in_folder)
 
-    def open_editor(self, path=None, url=None, title=None):
-        """✂ Редактор: обрезать видео или аудио. Без пути — выбрать файл."""
+    def is_downloaded(self, path):
+        """Файл скачан этой программой (есть в истории, в том числе трек из папки с главами)."""
+        key = os.path.normcase(os.path.abspath(path))
+        for rec in self.history:
+            f = rec.get("file")
+            if not f:
+                continue
+            base = os.path.normcase(os.path.abspath(f))
+            if key == base or key.startswith(base + os.sep):
+                return True
+        return False
+
+    def open_editor(self, path, url=None, title=None):
+        """✂ Редактор: только для файлов, скачанных программой (из очереди, истории, галереи)."""
         if not FFMPEG:
             self.set_main_status("Для редактора нужен ffmpeg — нажмите «Обновить компоненты»",
                                  ACCENT)
             return
-        if not path:
-            path = filedialog.askopenfilename(
-                title="Какой файл обрезать?", initialdir=self.settings["folder"],
-                filetypes=[("Видео и аудио", " ".join("*" + e for e in editor.MEDIA_EXTS)),
-                           ("Все файлы", "*.*")])
-            if not path:
-                return
+        if not path or not self.is_downloaded(path):
+            self.set_main_status("Редактор работает только со скачанными здесь файлами — "
+                                 "откройте их в «🖼 Галерее»", ACCENT)
+            return
         if not os.path.isfile(path):
             self.set_main_status("Файл не найден: " + path, ACCENT)
             return
@@ -3521,6 +3870,8 @@ class App(ctk.CTk):
                     changed = True
                 elif kind == "title":
                     e[1].set_title(e[2])
+                elif kind == "call":                 # поручение окну из фонового потока
+                    e[1]()
                 elif kind == "meta":
                     if e[1].winfo_exists():
                         e[1].set_title(e[2])
@@ -3756,7 +4107,7 @@ class App(ctk.CTk):
         """Файлы и ссылки, переданные программе («Открыть с помощью», повторный запуск)."""
         for arg in args:
             if os.path.isfile(arg) and arg.lower().endswith(editor.MEDIA_EXTS):
-                self.open_editor(arg)
+                self.open_editor(arg)           # откроется, только если файл скачан здесь
             elif arg.startswith("http"):
                 self.add_item(arg)
 
@@ -3799,17 +4150,29 @@ class App(ctk.CTk):
     # ------------------------------------------------------------ история
     def _add_history(self, item):
         rec = {"url": item.url, "title": item.full_title or item.url,
-               "file": item.file_path,
+               "file": item.file_path, "thumb": item.thumb_file,
                "date": datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
                "opts": {k: v for k, v in item.opts.items() if k != "cookies"}}
         self.history.insert(0, rec)
         save_history(self.history)
+        win = getattr(self, "gallery_win", None)
+        if win and win.winfo_exists():
+            win.refresh()
         if self.history_win and self.history_win.winfo_exists():
             self.history_win.refresh()
 
     def refresh_history_window(self):
         if self.history_win and self.history_win.winfo_exists():
             self.history_win.refresh()
+
+    def open_gallery(self):
+        win = getattr(self, "gallery_win", None)
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.refresh()
+            return
+        self.gallery_win = GalleryWindow(self)
 
     def open_history(self):
         if self.history_win and self.history_win.winfo_exists():
@@ -3852,7 +4215,7 @@ class App(ctk.CTk):
                 paths = []
             media = [p for p in paths if os.path.isfile(p) and p.lower().endswith(editor.MEDIA_EXTS)]
             if media:
-                self.open_editor(media[0])
+                self.open_editor(media[0])      # только файлы, скачанные этой программой
                 return "copy"
             for path in paths:
                 if os.path.isfile(path) and path.lower().endswith((".url", ".txt")):
@@ -4181,6 +4544,7 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             FORCE_STYLE = "phantom"
             app = App()
             app.update()
+            app.history.insert(0, {"url": "", "title": "test", "file": src})
             app.open_editor(src)
             win = app.editor_win
             win._check_focus = lambda: None     # на сервере сборки окно может быть без фокуса
@@ -4199,6 +4563,29 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             pl = win.player
             diag = (f"прочитано {pl.frames_read}, отдано {pl.frames_sent}, ошибка {pl.error}"
                     if pl else "проигрыватель не создан")
+            # галерея: плитка со скачанным файлом получает кадр; чужие файлы редактор не берёт
+            try:
+                win.destroy()
+                app.open_gallery()
+                gal = app.gallery_win
+                deadline = time.time() + 20
+                while time.time() < deadline and not (gal.tiles and gal.tiles[0].pic.cget("text") == ""):
+                    app.update()
+                    time.sleep(0.05)
+                got = bool(gal.tiles) and gal.tiles[0].pic.cget("text") == ""
+                outsider = os.path.join(os.path.dirname(src), "чужой.mp4")
+                shutil.copyfile(src, outsider)
+                app.editor_win = None
+                app.open_editor(outsider)
+                refused = app.editor_win is None
+                ok = got and refused
+                failed += 0 if ok else 1
+                log(f"{'OK  ' if ok else 'FAIL'} галерея: плиток {len(gal.tiles)}, кадр "
+                    f"{'есть' if got else 'НЕТ'}; чужой файл в редакторе "
+                    f"{'не открылся' if refused else 'ОТКРЫЛСЯ'}")
+            except Exception as e:
+                failed += 1
+                log(f"FAIL галерея: {e!r}")
             app.quit_app()
             FORCE_STYLE = None
             good = shown >= 10
@@ -4231,7 +4618,25 @@ def screenshot(out_path, style, urls):
     from PIL import ImageGrab
     app = App()
     app.geometry("900x760+0+0")
+    if extra == "gallery":
+        for n, f in enumerate(urls):
+            app.history.insert(0, {"url": "", "title": f"Тестовое видео {n + 1}", "file": f,
+                                   "date": "27.10.2026 08:40"})
+        app.open_gallery()
+
+        def grab_gallery():
+            win = app.gallery_win
+            win.geometry("1000x700+0+0")
+            win.update()
+            x, y = win.winfo_rootx(), win.winfo_rooty()
+            ImageGrab.grab(bbox=(x, y, x + win.winfo_width(), y + win.winfo_height()),
+                           all_screens=True).save(out_path)
+            app.quit_app()
+        app.after(7000, grab_gallery)
+        app.mainloop()
+        return 0
     if extra == "editor":
+        app.history.insert(0, {"url": "", "title": "test", "file": urls[0]})
         app.open_editor(urls[0])
 
         def prepare_editor():

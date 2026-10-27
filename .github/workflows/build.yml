@@ -238,6 +238,8 @@ jobs:
             Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\$style.png",$style,'http://127.0.0.1:8765/clip.html','http://127.0.0.1:8765/test.mp4' -Wait
           }
           Start-Process Downloader/Downloader.exe -ArgumentList '--screenshot',"$PWD\shots\phantom-editor.png",'phantom-editor',"$PWD\testdata\test.mp4" -Wait
+          $media = @("$PWD\testdata\test.mp4") + @(Get-ChildItem selftest -Recurse -Include *.mkv, *.mp3, *.flac -ErrorAction SilentlyContinue | Select-Object -First 5 | ForEach-Object { $_.FullName })
+          Start-Process Downloader/Downloader.exe -ArgumentList (@('--screenshot',"$PWD\shots\phantom-gallery.png",'phantom-gallery') + ($media | ForEach-Object { "`"$_`"" })) -Wait
           Stop-Process $srv -ErrorAction SilentlyContinue
           Get-ChildItem shots
           git config user.name "github-actions"
