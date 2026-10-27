@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.13.2"
+APP_VERSION = "1.13.3"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -320,6 +320,7 @@ AUDIO_FORMATS = {           # формат: (расширение, битрей�
 }
 NO_THUMB_FORMATS = {"WEBM", "WAV"}      # в эти форматы обложку не вшить
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+FIREFOX_PROFILES = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
 COOKIE_SOURCES = {
     "Нет": None,
     "Firefox": "firefox",
@@ -1275,9 +1276,44 @@ def format_choices(info, mode, container="MP4"):
     return choices
 
 
-def explain_error(err, code, url="", proxy=None):
+def is_bot_check(err):
+    """YouTube просит «подтвердить, что вы не бот» — чаще всего из-за адреса VPN."""
+    low = (err or "").lower()
+    return "not a bot" in low or "confirm you" in low and "bot" in low
+
+
+def is_cookie_error(err):
+    """yt-dlp не смог прочитать cookies браузера (браузер открыт, шифрование Chrome и т.п.)."""
+    low = (err or "").lower()
+    return any(k in low for k in ("could not copy", "cookie database", "cookies database",
+                                  "failed to decrypt", "dpapi", "could not find firefox",
+                                  "could not find chrome", "could not find edge",
+                                  "could not find opera", "could not find brave",
+                                  "could not find chromium", "cookies from browser",
+                                  "permission denied", "unsupported browser"))
+
+
+def firefox_cookies_available():
+    """Есть ли Firefox с профилем — из него cookies берутся надёжно, даже когда он открыт."""
+    try:
+        return any(os.path.isfile(os.path.join(FIREFOX_PROFILES, d, "cookies.sqlite"))
+                   for d in os.listdir(FIREFOX_PROFILES))
+    except OSError:
+        return False
+
+
+FIREFOX_COOKIES = ["--cookies-from-browser", "firefox"]
+
+
+def explain_error(err, code, url="", proxy=None, cookies=None):
     """Короткое понятное описание ошибки yt-dlp."""
     low = err.lower()
+    if is_bot_check(err):
+        if cookies:
+            return ("YouTube просит вход («вы не бот?») — войдите в YouTube в браузере "
+                    "из «Cookies» или смените сервер VPN")
+        return ("YouTube просит вход («вы не бот?») — ⚙ → Cookies: Firefox, где вы вошли "
+                "в YouTube, или cookies.txt; либо другой сервер VPN")
     if any(k in low for k in NET_ERRORS):
         if proxy:
             if "ssl" in low or "eof" in low or "reset" in low:
@@ -1287,7 +1323,7 @@ def explain_error(err, code, url="", proxy=None):
         if is_youtube(url):
             return "YouTube не открывается напрямую — включите прокси: ⚙ Настройки → Сеть"
         return "Нет связи с сайтом — проверьте интернет"
-    if "cookie" in low:
+    if is_cookie_error(err) or "cookie" in low and "--cookies" not in low:
         return ("Не удалось взять cookies: закройте браузер полностью "
                 "или выберите Firefox / файл cookies.txt")
     if "sign in" in low or "age" in low and "confirm" in low or "login" in low \
@@ -2756,11 +2792,14 @@ class App(ctk.CTk):
                 with self.lock:
                     self._previews -= 1
 
-    def _preview_once(self, item, proxy):
-        """Один запуск yt-dlp за сведениями. Возвращает (сведения или None, текст ошибки)."""
+    def _preview_once(self, item, proxy, cookies=False):
+        """Один запуск yt-dlp за сведениями. Возвращает (сведения или None, текст ошибки).
+        cookies — подставить другие cookies (False — как в настройках ссылки)."""
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         try:
             opts = dict(item.opts, proxy_url=proxy)
+            if cookies is not False:
+                opts["cookies"] = cookies
             p = subprocess.run(preview_command(item.url, opts), capture_output=True,
                                cwd=BASE_DIR, env=env, timeout=90,
                                creationflags=NO_WINDOW)
@@ -2789,10 +2828,24 @@ class App(ctk.CTk):
                              f"Сбой связи — пробую ещё раз ({attempt + 1}/{NET_ATTEMPTS})…",
                              None))
             time.sleep(2 * attempt)
+        if not info and is_bot_check(err) and not item.opts.get("cookies") \
+                and firefox_cookies_available() and item in self.items:
+            # YouTube просит войти: пробуем cookies из Firefox — если там есть вход в YouTube,
+            # проверка проходит, и дальше загрузка тоже идёт с ними
+            self.events.put(("log", f"Превью {item.url}: YouTube просит подтвердить, что вы "
+                                    "не бот — пробую cookies из Firefox"))
+            self.events.put(("meta", item, None, "YouTube просит вход — пробую cookies "
+                                                 "из Firefox…", None))
+            info2, err2 = self._preview_once(item, proxy, FIREFOX_COOKIES)
+            if info2:
+                info, err = info2, ""
+                item.opts["cookies"] = list(FIREFOX_COOKIES)
+            else:
+                self.events.put(("log", f"Превью {item.url} (cookies Firefox): {err2}"))
         if not info:
             if err:
                 self.events.put(("log", f"Превью {item.url}: {err}"))
-            text = explain_error(err, 1, item.url, proxy) if err else ""
+            text = explain_error(err, 1, item.url, proxy, item.opts.get("cookies")) if err else ""
             if not text or text.startswith("Ошибка: "):
                 # непонятная ошибка — показываем её начало, полностью она в журнале
                 text = "Не удалось получить информацию" + (f": {err[:60]}" if err else "")
@@ -3007,6 +3060,13 @@ class App(ctk.CTk):
             if self._stopped(item):
                 break
             code, last_error, files = self._run_ytdlp(item, opts, info)
+        if code not in (0, None) and is_bot_check(last_error) and not opts.get("cookies") \
+                and firefox_cookies_available() and not self._stopped(item):
+            ev(("log", f"YouTube просит подтвердить, что вы не бот — пробую cookies из Firefox: "
+                       f"{item.url}"))
+            ev(("item_status", item, "YouTube просит вход — пробую cookies из Firefox…", None))
+            opts["cookies"] = item.opts["cookies"] = list(FIREFOX_COOKIES)
+            code, last_error, files = self._run_ytdlp(item, opts, None)
         if code is None:
             return False
 
@@ -3033,7 +3093,8 @@ class App(ctk.CTk):
             ev(("item_status", item, "✓ Готово", GREEN))
             return True
         ev(("state", item, "error"))
-        ev(("item_status", item, explain_error(last_error, code, item.url, proxy), ACCENT))
+        ev(("item_status", item, explain_error(last_error, code, item.url, proxy,
+                                                    opts.get("cookies")), ACCENT))
         return False
 
     def _stopped(self, item):
@@ -3720,6 +3781,15 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     else:
         failed += 1
         log("FAIL сбой SSL не распознан")
+    bot_err = ("[youtube] yxkQ-jaCm-E: Sign in to confirm you\u2019re not a bot. This helps "
+               "protect our community. Use --cookies-from-browser or --cookies for the "
+               "authentication.")
+    if is_bot_check(bot_err) and not is_cookie_error(bot_err) and \
+            "не бот" in explain_error(bot_err, 1, "https://youtu.be/x"):
+        log("OK   проверка «вы не бот» распознаётся (не путается с ошибкой cookies)")
+    else:
+        failed += 1
+        log("FAIL проверка «вы не бот» не распознана")
 
     # 1. окно открывается без ошибок — в обоих оформлениях, с окнами настроек и истории
     for style in ("phantom", "classic"):
