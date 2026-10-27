@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.13.3"
+APP_VERSION = "1.13.4"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -3304,7 +3304,8 @@ class App(ctk.CTk):
                              "«Отмена», затем обновите.", "Обновить", self.run_updater)
             return
         # update.bat закроет программу, заменит exe и запустит новую версию
-        subprocess.Popen(f'start "Обновление Downloader" "{path}" /auto',
+        # cmd /c — окно закроется само, когда обновление закончится
+        subprocess.Popen(f'start "Обновление Downloader" cmd /c ""{path}" /auto"',
                          shell=True, cwd=BASE_DIR, env=clean_env())
         self.quit_app()
 

@@ -1,6 +1,6 @@
 @echo off
-title Обновление Downloader
 chcp 65001 >nul
+title Обновление Downloader
 cd /d "%~dp0"
 :: Запуск из программы: update.bat /auto — без вопросов, в конце сразу открывает Downloader
 :: Если update.bat запустила сама программа — сбрасываем переменные её распаковки,
@@ -169,6 +169,11 @@ choice /c YN /m "Запустить Downloader"
 if errorlevel 2 goto selfupdate
 :launch
 start "" "%~dp0Downloader.exe"
+if /i "%~1"=="/auto" (
+    echo.
+    echo Программа запущена, это окно закроется само.
+    timeout /t 2 >nul
+)
 
 :selfupdate
 :: если в сборке пришла новая версия update.bat — подменяем себя последним действием
@@ -176,6 +181,11 @@ if exist "%TMPD%\update.bat" (
     fc /b "%TMPD%\update.bat" "%~f0" >nul 2>nul || (copy /y "%TMPD%\update.bat" "%~dp0update.bat.new" >nul)
 )
 rmdir /s /q "%TMPD%" >nul 2>nul
+:: при запуске из программы закрываем окно целиком (exit без /b)
+if /i "%~1"=="/auto" (
+    if exist "%~dp0update.bat.new" (move /y "%~dp0update.bat.new" "%~f0" >nul & exit)
+    exit
+)
 if exist "%~dp0update.bat.new" (move /y "%~dp0update.bat.new" "%~f0" >nul & exit /b 0)
 exit /b 0
 
