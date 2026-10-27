@@ -40,7 +40,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.13.4"
+APP_VERSION = "1.14.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -280,6 +280,8 @@ def install_tool(name, progress=None):
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
+# обложки карточек — чтобы после перезапуска готовые загрузки показывались с картинкой
+THUMB_CACHE = os.path.join(tempfile.gettempdir(), "Downloader-thumbs")
 HISTORY_LIMIT = 2000
 # по умолчанию — «Загрузки\Downloader» пользователя (после установки программа лежит в AppData)
 _user_downloads = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -416,20 +418,48 @@ CTRL_KEYCODES = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAl
 
 
 def load_history():
+    for path in (HISTORY_FILE, HISTORY_FILE + ".bak"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [h for h in data if isinstance(h, dict) and h.get("url")]
+        except (OSError, ValueError):
+            continue
+    return []
+
+
+def write_json(path, data, indent=1):
+    """Надёжная запись: сначала во временный файл, потом подмена. Если программу закрыли
+    или выключили посреди записи, старый файл остаётся целым."""
+    tmp = path + ".tmp"
     try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, ValueError):
-        return []
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent, default=str)
+        for _ in range(10):         # антивирус может на миг держать файл
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:
+                time.sleep(0.2)
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
 
 
 def save_history(items):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(items[:HISTORY_LIMIT], f, ensure_ascii=False, indent=1)
-    except OSError:
-        pass
+    if NO_SAVE:
+        return
+    if write_json(HISTORY_FILE, items[:HISTORY_LIMIT]) and items:
+        # запасная копия — на случай, если основной файл испортится
+        try:
+            shutil.copyfile(HISTORY_FILE, HISTORY_FILE + ".bak")
+        except OSError:
+            pass
 
 
 def play_sound():
@@ -821,11 +851,7 @@ def restart_program(app):
 def save_settings(s):
     if NO_SAVE:
         return
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+    write_json(SETTINGS_FILE, s, indent=2)
 
 
 # ---------------------------------------------------------------- команды yt-dlp
@@ -1093,7 +1119,19 @@ def normalize_audio(path, fmt):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise RuntimeError(p.stderr.decode("utf-8", "replace").strip()[-300:])
-    os.replace(tmp, path)
+    replace_retry(tmp, path)
+
+
+def replace_retry(src, dst, tries=15):
+    """os.replace, который ждёт, пока антивирус или проводник отпустят файл."""
+    for n in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if n == tries - 1:
+                raise
+            time.sleep(0.4)
 
 
 def postprocess_audio(paths, opts, status=None):
@@ -1204,6 +1242,14 @@ NET_ERRORS = ("timed out", "timeout", "connection", "unable to download webpage"
 
 
 NET_ATTEMPTS = 3
+
+
+def is_locked_error(err):
+    """Файл занят: его держит плеер, редактор, проводник или антивирус."""
+    low = (err or "").lower()
+    return "winerror 5]" in low or "winerror 32]" in low or "access is denied" in low \
+        or "being used by another process" in low or "permission denied" in low \
+        and "cookie" not in low
 
 
 def is_net_error(err):
@@ -1323,6 +1369,9 @@ def explain_error(err, code, url="", proxy=None, cookies=None):
         if is_youtube(url):
             return "YouTube не открывается напрямую — включите прокси: ⚙ Настройки → Сеть"
         return "Нет связи с сайтом — проверьте интернет"
+    if is_locked_error(err):
+        return ("Нет доступа к файлу: он открыт в плеере или редакторе, либо его держит "
+                "антивирус — закройте файл и нажмите ▶")
     if is_cookie_error(err) or "cookie" in low and "--cookies" not in low:
         return ("Не удалось взять cookies: закройте браузер полностью "
                 "или выберите Firefox / файл cookies.txt")
@@ -1374,6 +1423,81 @@ def kill_tree(proc):
 
 
 # ================================================================ элемент очереди
+def item_tag(opts):
+    """Надпись на месте обложки: «1080p / MP4», «MP3», «✂ 0:28–0:51»…"""
+    if opts["mode"] == "Аудио":
+        tag = opts["fmt"]
+    else:
+        tag = opts["quality"].split(" ")[0] + "\n" + opts["fmt"]
+    if opts.get("playlist"):
+        tag += "\nплейлист"
+    if opts.get("cut"):
+        start, end = opts["cut"]
+        tag += f"\n✂ {fmt_time(start or 0)}–{fmt_time(end) if end else 'конец'}"
+    return tag
+
+
+def kind_text(opts):
+    """«Видео 1080p MP4» / «Аудио MP3 320 kbps» — для подсказок."""
+    if opts["mode"] == "Аудио":
+        q = "" if opts["quality"] == "Лучшее" else " " + opts["quality"]
+        return f"Аудио {opts['fmt']}{q}"
+    return f"Видео {opts['quality'].split(' ')[0]} {opts['fmt']}"
+
+
+def with_kind(opts, mode=None, quality=None, fmt=None):
+    """Копия настроек ссылки с другим видом загрузки (видео/аудио, качество, формат)."""
+    o = dict(opts)
+    if mode:
+        o["mode"] = mode
+    if quality:
+        o["quality"] = quality
+    if fmt:
+        o["fmt"] = fmt
+    if o["mode"] == "Аудио":
+        if o["fmt"] not in AUDIO_FORMATS:
+            o["fmt"] = "MP3"
+        if o["quality"] not in AUDIO_QUALITIES:
+            o["quality"] = "Лучшее"
+        o["subs"] = False
+    else:
+        if o["fmt"] not in VIDEO_FORMATS:
+            o["fmt"] = "MP4"
+        if o["quality"] not in VIDEO_QUALITIES:
+            o["quality"] = "1080p"
+    o.pop("format_id", None)            # ручной выбор качества относился к прежнему виду
+    o.pop("format_label", None)
+    return o
+
+
+def add_kind_menu(menu, opts, on_pick):
+    """Пункты «Видео ▸ / Аудио ▸» с качеством и форматом. on_pick(новые настройки)."""
+    cur_video = opts["mode"] != "Аудио"
+
+    def mark(ok):
+        return "● " if ok else "    "
+
+    vm = tk.Menu(menu, tearoff=0)
+    for q in VIDEO_QUALITIES:
+        vm.add_command(label=mark(cur_video and opts["quality"] == q) + q,
+                       command=lambda q=q: on_pick(with_kind(opts, "Видео", quality=q)))
+    vm.add_separator()
+    for f in VIDEO_FORMATS:
+        vm.add_command(label=mark(cur_video and opts["fmt"] == f) + f,
+                       command=lambda f=f: on_pick(with_kind(opts, "Видео", fmt=f)))
+    am = tk.Menu(menu, tearoff=0)
+    for f in AUDIO_FORMATS:
+        am.add_command(label=mark(not cur_video and opts["fmt"] == f) + f,
+                       command=lambda f=f: on_pick(with_kind(opts, "Аудио", fmt=f)))
+    am.add_separator()
+    for q in AUDIO_QUALITIES:
+        am.add_command(label=mark(not cur_video and opts["quality"] == q) + q,
+                       command=lambda q=q: on_pick(with_kind(opts, "Аудио", quality=q)))
+    menu.add_cascade(label=("● " if cur_video else "    ") + "🎬  Видео", menu=vm)
+    menu.add_cascade(label=("● " if not cur_video else "    ") + "🎵  Аудио (только звук)",
+                     menu=am)
+
+
 class QueueItem(ctk.CTkFrame):
     def __init__(self, master, app, url, opts):
         super().__init__(master, corner_radius=R(10), fg_color=C.CARD,
@@ -1391,15 +1515,7 @@ class QueueItem(ctk.CTkFrame):
 
         self.grid_columnconfigure(1, weight=1)
 
-        if opts["mode"] == "Аудио":
-            self.tag = opts["fmt"]
-        else:
-            self.tag = opts["quality"].split(" ")[0] + "\n" + opts["fmt"]
-        if opts["playlist"]:
-            self.tag += "\nплейлист"
-        if opts.get("cut"):
-            start, end = opts["cut"]
-            self.tag += f"\n✂ {fmt_time(start or 0)}–{fmt_time(end) if end else 'конец'}"
+        self.tag = item_tag(opts)
         self.thumb = ctk.CTkLabel(self, text=self.tag, width=THUMB_W, height=THUMB_H,
                                   corner_radius=R(8), fg_color=C.BADGE,
                                   text_color=C.BADGE_TEXT,
@@ -1438,6 +1554,7 @@ class QueueItem(ctk.CTkFrame):
         self.btn.grid(row=0, column=4, rowspan=4, padx=(0, 8))
         self.after(100, lambda: bind_right_click(self, self.show_menu))
         self.video_key = None            # «сайт:код видео» — чтобы не качать одно видео дважды
+        self.thumb_file = None           # обложка в кэше (для восстановления после перезапуска)
         self.pause_requested = False     # пауза нажата во время скачивания
         self.user_paused = False         # поставлена на паузу вручную (кнопкой ⏸)
 
@@ -1541,6 +1658,14 @@ class QueueItem(ctk.CTkFrame):
                       state="normal" if done and exists else "disabled",
                       command=lambda: self.app.show_in_folder(self.file_path))
         m.add_separator()
+        if self.st in ("wait", "paused", "error"):
+            # как скачать — можно поменять прямо здесь, не выбирая всё заранее
+            m.add_command(label=f"Скачать как:  {kind_text(self.opts)}", state="disabled")
+            add_kind_menu(m, self.opts, self.change_kind)
+            if self.choices:
+                m.add_command(label="    🎚  Точное качество…",
+                              command=lambda: self.app.open_format_picker(self))
+            m.add_separator()
         if self.st == "run":
             m.add_command(label="⏸  Пауза", command=lambda: self.app.toggle_pause(self))
         elif self.st in ("paused", "error"):
@@ -1556,6 +1681,9 @@ class QueueItem(ctk.CTkFrame):
                           command=lambda: self.app.open_editor(self.file_path, self.url,
                                                                self.full_title))
             m.add_command(label="⟳  Скачать снова", command=self.redownload)
+            again = tk.Menu(m, tearoff=0)
+            add_kind_menu(again, self.opts, self.redownload)
+            m.add_cascade(label="⟳  Скачать снова как…", menu=again)
         m.add_command(label="🔗  Копировать ссылку", command=self.copy_url)
         m.add_separator()
         m.add_command(label="Убрать из списка", state="disabled" if self.st == "run" else "normal",
@@ -1574,10 +1702,27 @@ class QueueItem(ctk.CTkFrame):
         self.app._last_clip = self.url        # чтобы перехват буфера не добавил её снова
         self.app.set_main_status("Ссылка скопирована")
 
-    def redownload(self):
-        opts = dict(self.opts)
+    def redownload(self, opts=None):
+        opts = dict(opts or self.opts)
         opts["cookies"] = self.app.cookie_args()
         self.app.add_item(self.url, opts)
+
+    def change_kind(self, opts):
+        """Другой вид загрузки для ссылки в очереди (видео/аудио, качество, формат)."""
+        if self.st not in ("wait", "paused", "error"):
+            return
+        cookies = self.opts.get("cookies")
+        self.opts = opts
+        self.opts["cookies"] = cookies
+        self.tag = item_tag(opts)
+        if not self.thumb_image:
+            self.thumb.configure(text=self.tag)
+        self.info_json = None             # сведения из превью были для прежнего вида
+        self.choices = []
+        self.update_qbtn()
+        self.set_status(f"Будет скачано: {kind_text(opts)}")
+        self.app.refetch_preview(self)
+        self.app.save_queue()
 
     def delete_file(self):
         if delete_download(self.app, self.file_path, self.full_title or self.url):
@@ -2725,8 +2870,8 @@ class App(ctk.CTk):
                 return i
         return None
 
-    def add_item(self, url, opts=None):
-        same = self.find_active(url)
+    def add_item(self, url, opts=None, fetch=True):
+        same = self.find_active(url) if fetch else None
         if same:
             self.set_main_status("Эта ссылка уже в очереди: " + (same.full_title or url))
             return same
@@ -2744,12 +2889,17 @@ class App(ctk.CTk):
             self.items.append(item)
         if self.dnd_ready:
             self.after(50, lambda: self._register_drop_tree(item))
-        threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
+        if fetch:
+            threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
         # если загрузка уже идёт, а свободные потоки закончились — запускаем ещё один
         if self.workers_alive and self.workers_alive < int(self.v_parallel.get()):
             self._spawn_worker()
         self.save_queue()
         return item
+
+    def refetch_preview(self, item):
+        """Заново узнать размер и варианты качества — после смены вида загрузки."""
+        threading.Thread(target=self._fetch_preview, args=(item,), daemon=True).start()
 
     def remove_item(self, item):
         with self.lock:
@@ -2873,8 +3023,16 @@ class App(ctk.CTk):
                              format_choices(info, item.opts["mode"], item.opts["fmt"])))
         if s.get("thumb"):
             try:
-                self.events.put(("thumb", item, load_thumbnail(s["thumb"],
-                                                                self.proxy_for(s["thumb"]))))
+                img = load_thumbnail(s["thumb"], self.proxy_for(s["thumb"]))
+                self.events.put(("thumb", item, img))
+                try:
+                    os.makedirs(THUMB_CACHE, exist_ok=True)
+                    path = os.path.join(THUMB_CACHE, uuid.uuid5(uuid.NAMESPACE_URL,
+                                                                s["thumb"]).hex + ".png")
+                    img.save(path)
+                    item.thumb_file = path
+                except OSError:
+                    pass
             except Exception as e:
                 self.events.put(("log", f"Обложка {item.url}: {e}"))
 
@@ -2974,18 +3132,23 @@ class App(ctk.CTk):
     def save_queue(self):
         if NO_SAVE:
             return
-        data = [{"url": i.url, "title": i.full_title, "frac": i.frac,
-                 "user_paused": i.user_paused,
-                 "opts": {k: v for k, v in i.opts.items() if k != "cookies"}}
-                for i in self.items if i.st != "done"]
-        try:
-            if data:
-                with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=1)
-            elif os.path.exists(QUEUE_FILE):
+        data = []
+        for i in self.items:
+            rec = {"url": i.url, "title": i.full_title, "frac": i.frac,
+                   "user_paused": i.user_paused,
+                   "opts": {k: v for k, v in i.opts.items() if k != "cookies"}}
+            if i.st == "done":
+                # готовые карточки тоже остаются в списке после закрытия и обновления
+                rec.update(st="done", file=i.file_path, meta=i.meta_lbl.cget("text"),
+                           status=i.last_text, thumb=i.thumb_file)
+            data.append(rec)
+        if data:
+            write_json(QUEUE_FILE, data)
+        else:
+            try:
                 os.remove(QUEUE_FILE)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
     def restore_queue(self):
         """Возвращает недокачанное с прошлого запуска — на паузе, продолжить кнопкой «Скачать»."""
@@ -2995,6 +3158,9 @@ class App(ctk.CTk):
                 continue
             opts = dict(rec["opts"])
             opts["cookies"] = self.cookie_args()
+            if rec.get("st") == "done":
+                self._restore_done(rec, opts)
+                continue
             item = self.add_item(rec["url"], opts)
             if not item:
                 continue
@@ -3007,6 +3173,29 @@ class App(ctk.CTk):
         if restored:
             self.set_main_status(f"Недокачанное с прошлого раза: {restored} — "
                                  "нажмите «Скачать», чтобы продолжить")
+
+    def _restore_done(self, rec, opts):
+        """Готовая загрузка с прошлого запуска — карточка без повторного обращения к сайту."""
+        try:
+            item = self.add_item(rec["url"], opts, fetch=False)
+            if not item:
+                return
+            item.set_title(rec.get("title"))
+            item.set_meta(rec.get("meta") or "")
+            item.file_path = rec.get("file")
+            item.frac = 1.0
+            item.set_state("done")
+            if item.file_path and not os.path.exists(item.file_path):
+                item.set_status("Файла больше нет на месте", GRAY_TEXT)
+                item.btn.configure(text="✕")
+            else:
+                item.set_status(rec.get("status") or "✓ Готово", GREEN)
+            thumb = rec.get("thumb")
+            if thumb and os.path.isfile(thumb):
+                item.thumb_file = thumb
+                item.set_thumb(Image.open(thumb).copy())
+        except Exception as e:
+            self.log(f"Не удалось вернуть карточку {rec.get('url')}: {e}")
 
     def _take_item(self):
         with self.lock:
@@ -3067,6 +3256,13 @@ class App(ctk.CTk):
             ev(("item_status", item, "YouTube просит вход — пробую cookies из Firefox…", None))
             opts["cookies"] = item.opts["cookies"] = list(FIREFOX_COOKIES)
             code, last_error, files = self._run_ytdlp(item, opts, None)
+        if code not in (0, None) and is_locked_error(last_error) and not self._stopped(item):
+            # файл на миг заблокирован (антивирус, проводник строит эскиз) — ещё раз
+            ev(("log", f"Файл занят, повтор через 3 с: {last_error}"))
+            ev(("item_status", item, "Файл занят другой программой — пробую ещё раз…", None))
+            time.sleep(3)
+            if not self._stopped(item):
+                code, last_error, files = self._run_ytdlp(item, opts, info)
         if code is None:
             return False
 
@@ -3808,6 +4004,18 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             app.add_item("https://example.com/test-video")        # та же ссылка ещё раз
             if len(app.items) != before:
                 raise RuntimeError("одна и та же ссылка добавилась в очередь дважды")
+            it = app.items[-1]                                  # «Скачать как» из меню ПКМ
+            add_kind_menu(tk.Menu(app, tearoff=0), it.opts, lambda o: None)
+            it.change_kind(with_kind(it.opts, "Аудио", fmt="FLAC"))
+            if it.opts["mode"] != "Аудио" or not it.tag.startswith("FLAC"):
+                raise RuntimeError("смена вида загрузки через меню не сработала")
+            it.change_kind(with_kind(it.opts, "Видео", quality="720p"))
+            if it.opts["fmt"] != "MP4" or not it.tag.startswith("720p"):
+                raise RuntimeError("обратная смена на видео не сработала")
+            app._restore_done({"url": "https://example.com/done", "title": "Готовое",
+                               "st": "done", "status": "✓ Готово"}, dict(it.opts))
+            if app.items[-1].st != "done" or app.items[-1].full_title != "Готовое":
+                raise RuntimeError("готовая карточка не восстановилась")
             app.items[-1].set_choices(SAMPLE_CHOICES)
             app.open_format_picker(app.items[-1])
             app.picker_win.pick(SAMPLE_CHOICES[2])
@@ -3975,6 +4183,7 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
             app.update()
             app.open_editor(src)
             win = app.editor_win
+            win._check_focus = lambda: None     # на сервере сборки окно может быть без фокуса
             deadline = time.time() + 15
             while time.time() < deadline and not win.player:
                 app.update()

@@ -23,6 +23,34 @@ VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".ts", ".
 AUDIO_EXTS = (".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac", ".wma")
 MEDIA_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
+# ffmpeg редактора работает с пониженным приоритетом: игры, браузер и сама Windows
+# не тормозят, пока строится шкала кадров или идёт предпросмотр
+LOW_PRIORITY = 0x00004000 if os.name == "nt" else 0      # BELOW_NORMAL_PRIORITY_CLASS
+
+
+def proc_flags(ctx):
+    return ctx.no_window | LOW_PRIORITY
+
+
+def run_proc(ctx, cmd, timeout):
+    """subprocess.run, но процесс запоминается — при закрытии редактора его сразу убивают."""
+    if getattr(ctx, "closed", False):
+        return subprocess.CompletedProcess(cmd, -1, b"", b"")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         stdin=subprocess.DEVNULL, creationflags=proc_flags(ctx))
+    procs = getattr(ctx, "procs", None)
+    if procs is not None:
+        procs.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+    finally:
+        if procs is not None:
+            procs.discard(p)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
 AUDIO_CODECS = {        # чем кодировать звук при «Точной» обрезке, по расширению файла
     ".mp3": ["-c:a", "libmp3lame", "-q:a", "0"],
     ".m4a": ["-c:a", "aac", "-b:a", "256k"],
@@ -159,7 +187,7 @@ def run_trim(ctx, src, dst, start, end, exact, with_audio, info, progress=None, 
     """Запускает ffmpeg и сообщает прогресс 0..1. Возвращает (ok, текст ошибки)."""
     cmd = trim_command(ctx, src, dst, start, end, exact, with_audio, info)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, creationflags=ctx.no_window)
+                            stdin=subprocess.DEVNULL, creationflags=proc_flags(ctx))
     total = max(0.05, end - start)
     for raw in proc.stdout:
         line = raw.decode("utf-8", "replace").strip()
@@ -196,10 +224,11 @@ def make_filmstrip(ctx, path, info, count=16, height=56, on_progress=None):
     got = 0
     for i in range(count):
         t = (i + 0.5) * info.duration / count
-        p = subprocess.run([ctx.ffmpeg, "-v", "error", "-noaccurate_seek", "-ss", f"{t:.3f}",
-                            "-i", path, "-frames:v", "1", "-an", "-vf", f"scale={w}:{height}",
-                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-                           capture_output=True, timeout=30, creationflags=ctx.no_window)
+        if getattr(ctx, "closed", False):            # редактор закрыли — дальше не строим
+            return None
+        p = run_proc(ctx, [ctx.ffmpeg, "-v", "error", "-noaccurate_seek", "-ss", f"{t:.3f}",
+                           "-i", path, "-frames:v", "1", "-an", "-vf", f"scale={w}:{height}",
+                           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], 30)
         if len(p.stdout) >= w * height * 3:
             strip.paste(Image.frombytes("RGB", (w, height), p.stdout[:w * height * 3]),
                         (i * w, 0))
@@ -212,12 +241,11 @@ def make_filmstrip(ctx, path, info, count=16, height=56, on_progress=None):
 def make_waveform(ctx, path, info, width=1200, height=40, color="#FFFFFF"):
     if not info.has_audio:
         return None
-    p = subprocess.run([ctx.ffmpeg, "-v", "error", "-vn", "-sn", "-dn", "-i", path,
+    p = run_proc(ctx, [ctx.ffmpeg, "-v", "error", "-vn", "-sn", "-dn", "-i", path,
                         "-filter_complex",
                         f"[0:a:0]aformat=channel_layouts=mono,showwavespic=s={width}x{height}"
                         f":colors={color}", "-frames:v", "1", "-f", "image2pipe",
-                        "-vcodec", "png", "-"],
-                       capture_output=True, timeout=120, creationflags=ctx.no_window)
+                        "-vcodec", "png", "-"], 120)
     if p.returncode != 0 or not p.stdout:
         return None
     from io import BytesIO
@@ -234,7 +262,7 @@ def grab_frame(ctx, path, t, w, h, cover=False):
     cmd += ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                    f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-    p = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=ctx.no_window)
+    p = run_proc(ctx, cmd, 30)
     if len(p.stdout) < w * h * 3:
         return None
     return Image.frombytes("RGB", (w, h), p.stdout[:w * h * 3])
@@ -285,7 +313,7 @@ class Player:
                  f"pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2:color=black",
                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                creationflags=nw)
+                creationflags=nw | LOW_PRIORITY)
             threading.Thread(target=self._read_video, args=(gen, fps), daemon=True).start()
         else:
             self._start_clock()                    # только звук — часы сразу
@@ -300,7 +328,7 @@ class Player:
                  "-ss", f"{self.pos0:.3f}", "-t", f"{max(0.05, self.end - self.pos0):.3f}",
                  self.path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                creationflags=self.ctx.no_window)
+                creationflags=self.ctx.no_window | LOW_PRIORITY)
 
     def _read_video(self, gen, fps):
         try:
@@ -365,6 +393,7 @@ class VideoEditor(ctk.CTkToplevel):
     def __init__(self, parent, ctx, path):
         super().__init__(parent)
         self.ctx, self.path = ctx, path
+        ctx.procs, ctx.closed = set(), False    # все ffmpeg редактора — закрываются вместе с ним
         self.title("Редактор — " + os.path.basename(path))
         self.geometry("880x820")
         self.minsize(720, 640)
@@ -390,6 +419,10 @@ class VideoEditor(ctk.CTkToplevel):
         self._calls = queue.Queue()      # поручения окну из фоновых потоков
         self._build()
         self.bind("<Destroy>", self._on_destroy)
+        # редактор работает, только пока он на экране: свернули его или ушли в другую
+        # программу — предпросмотр встаёт на паузу и не грузит компьютер
+        self.bind("<Unmap>", lambda e: e.widget is self and self._pause_bg())
+        self.bind("<FocusOut>", lambda e: self.after(150, self._check_focus), add="+")
         self.after(150, self.lift)
         self.set_status("Загружаю видео…")
         threading.Thread(target=self._load, daemon=True).start()
@@ -888,8 +921,29 @@ class VideoEditor(ctk.CTkToplevel):
         if self.result:
             self.ctx.show_in_folder(self.result)
 
+    def _pause_bg(self):
+        if self.player and self.player.playing:
+            self.toggle_play()
+
+    def _check_focus(self):
+        try:
+            if not self.winfo_exists():
+                return
+            focused = self.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+        # фокус ушёл в другую программу (а не в меню или окно самой программы)
+        if focused is None:
+            self._pause_bg()
+
     def _on_destroy(self, e):
         if e.widget is self:
             self._export_stop = True
+            self.ctx.closed = True
             if self.player:
                 self.player.stop()
+            for p in list(getattr(self.ctx, "procs", ())):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
