@@ -532,7 +532,12 @@ object Engine {
     suspend fun selftest(url: String, out: File) {
         val lines = mutableListOf<String>()
         var failed = 0
-        fun w(s: String) { lines += s; out.writeText(lines.joinToString("\n")) ; log(s) }
+        fun w(s: String) {
+            lines += s
+            runCatching { out.writeText(lines.joinToString("\n")) }
+            android.util.Log.i("DLSELFTEST", s)      // сервер сборки читает отчёт через logcat
+            log(s)
+        }
         w("Самопроверка Downloader для Android ${BuildConfig.VERSION_NAME}")
         repeat(240) { if (!ready.value && initError.value == null) delay(500) }
         if (!ready.value) {
