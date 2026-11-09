@@ -1,0 +1,62 @@
+package com.severeclaw.downloader
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.launch
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+    private val tab = mutableStateOf("main")
+    private val askPerms = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        requestPermissions()
+        if (savedInstanceState == null) handleIntent(intent)
+        // автопроверка на сервере сборки: am start ... --es selftest_url http://...
+        intent.getStringExtra("selftest_url")?.let { url ->
+            val out = File(getExternalFilesDir(null), "selftest.log")
+            Engine.scope.launch { Engine.selftest(url, out) }
+        }
+        // незаконченные загрузки прошлого запуска
+        if (Engine.items.value.any { it.state == State.WAIT }) Engine.startService()
+        setContent { DownloaderApp(tab.value) { tab.value = it } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    /** «Поделиться» → Downloader из YouTube, VK, браузера… — ссылка сразу в очередь. */
+    private fun handleIntent(i: Intent?) {
+        i ?: return
+        i.getStringExtra("tab")?.let { tab.value = it }
+        if (i.action == Intent.ACTION_SEND) {
+            val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
+            tab.value = "main"
+            val n = Engine.add(text)
+            if (n > 0) Engine.message.value = "Добавлено: ${Engine.settings.value.opts.describe()} " +
+                    "— удерживайте карточку, чтобы выбрать другое"
+        }
+    }
+
+    private fun requestPermissions() {
+        val need = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.POST_NOTIFICATIONS
+        if (Build.VERSION.SDK_INT <= 28) need += Manifest.permission.WRITE_EXTERNAL_STORAGE
+        val missing = need.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) askPerms.launch(missing.toTypedArray())
+    }
+}
