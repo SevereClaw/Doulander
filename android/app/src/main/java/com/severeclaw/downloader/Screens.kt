@@ -162,6 +162,11 @@ fun MainScreen() {
                 verticalAlignment = Alignment.CenterVertically) {
                 PTitle(R.drawable.t_queue)
                 Spacer(Modifier.weight(1f))
+                if (items.any { it.state == State.RUN || it.state == State.WAIT }) {
+                    TextButton(onClick = { Engine.pauseAll() }) { Text("⏸ Все", color = P.WHITE) }
+                } else if (items.any { it.state == State.PAUSED }) {
+                    TextButton(onClick = { Engine.resumeAll() }) { Text("▶ Все", color = P.WHITE) }
+                }
                 if (items.any { it.state == State.DONE }) {
                     TextButton(onClick = { Engine.clearDone() }) {
                         Text("Убрать готовые", color = P.MUTED)
@@ -241,6 +246,7 @@ fun ItemCard(item: Item) {
         State.DONE -> P.GREEN
         State.ERROR -> P.RED
         State.RUN -> P.RED
+        State.PAUSED -> P.MUTED
         else -> P.CARD2
     }
     Box(Modifier.padding(bottom = 8.dp)) {
@@ -270,10 +276,10 @@ fun ItemCard(item: Item) {
                         Text(item.meta, color = P.MUTED, fontSize = 12.sp, maxLines = 2,
                             overflow = TextOverflow.Ellipsis)
                     }
-                    if (item.state == State.RUN) {
+                    if (item.state == State.RUN || (item.state == State.PAUSED && item.progress > 0f)) {
                         LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) },
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).height(4.dp),
-                            color = P.RED, trackColor = P.CARD2)
+                            color = if (item.state == State.RUN) P.RED else P.MUTED, trackColor = P.CARD2)
                     }
                     Text(item.status, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
                         color = when (item.state) {
@@ -286,8 +292,8 @@ fun ItemCard(item: Item) {
                     }
                 }
                 val (icon, action) = when (item.state) {
-                    State.RUN -> "■" to { Engine.stop(item.id) }
-                    State.WAIT -> "✕" to { Engine.remove(item.id) }
+                    State.RUN, State.WAIT -> "⏸" to { Engine.pause(item.id) }
+                    State.PAUSED -> "▶" to { Engine.resume(item.id) }
                     State.ERROR, State.STOPPED -> "⟳" to { Engine.retry(item.id) }
                     State.DONE -> "▶" to { item.files.firstOrNull()?.let { openFile(ctx, it) }; Unit }
                 }
@@ -301,9 +307,18 @@ fun ItemCard(item: Item) {
                     onClick = {}, enabled = false)
                 MenuItem("🎚  Скачать как…") { menu = false; kind = "change" }
             }
-            if (item.state == State.RUN) MenuItem("■  Остановить") { menu = false; Engine.stop(item.id) }
+            if (item.state == State.RUN || item.state == State.WAIT) {
+                MenuItem("⏸  Пауза") { menu = false; Engine.pause(item.id) }
+            }
+            if (item.state == State.PAUSED) MenuItem("▶  Продолжить") { menu = false; Engine.resume(item.id) }
             if (item.state == State.ERROR || item.state == State.STOPPED) {
-                MenuItem("⟳  Повторить") { menu = false; Engine.retry(item.id) }
+                MenuItem("⟳  Повторить с места остановки") { menu = false; Engine.retry(item.id) }
+            }
+            if (item.state in listOf(State.RUN, State.PAUSED, State.ERROR)) {
+                MenuItem("⟲  Начать заново") { menu = false; Engine.restart(item.id) }
+            }
+            if (item.state in listOf(State.RUN, State.WAIT, State.PAUSED)) {
+                MenuItem("✕  Отменить") { menu = false; Engine.stop(item.id) }
             }
             if (item.state == State.DONE) {
                 item.files.firstOrNull()?.let { f ->

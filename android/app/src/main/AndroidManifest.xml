@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
@@ -32,13 +33,76 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- «Поделиться» из YouTube, браузера, VK, TikTok… -->
-            <intent-filter android:label="Скачать">
+        </activity>
+
+        <!-- «Поделиться» из YouTube, браузера, VK, TikTok… — без открытия приложения -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:label="Скачать видео"
+            android:icon="@mipmap/ic_launcher"
+            android:theme="@style/Theme.Downloader.Invisible"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="">
+            <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <activity-alias
+            android:name=".ShareAudio"
+            android:targetActivity=".ShareActivity"
+            android:exported="true"
+            android:label="Скачать звук"
+            android:icon="@mipmap/ic_launcher">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity-alias>
+        <activity
+            android:name=".ClipActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Downloader.Invisible"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
+        <!-- плитки в шторке: скачать ссылку из буфера -->
+        <service
+            android:name=".VideoTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat"
+            android:label="Скачать ссылку"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".AudioTile"
+            android:exported="true"
+            android:icon="@drawable/ic_note"
+            android:label="Скачать звук"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".NotifActionReceiver"
+            android:exported="false" />
 
         <activity
             android:name=".LoginActivity"

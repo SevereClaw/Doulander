@@ -29,6 +29,7 @@ class DownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        NotificationManagerCompat.from(this).cancel(ID_PAUSED)
         val n = progressNotification(this, "Загрузка…", 0, 0, true)
         ServiceCompat.startForeground(this, ID_PROGRESS, n,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
@@ -44,6 +45,8 @@ class DownloadService : Service() {
                     val run = list.filter { it.state == State.RUN }
                     val wait = list.count { it.state == State.WAIT }
                     if (run.isEmpty() && wait == 0) {
+                        val paused = list.count { it.state == State.PAUSED }
+                        if (paused > 0) notifyPaused(this@DownloadService, paused)
                         stopSelf()
                         return@collectLatest
                     }
@@ -113,7 +116,27 @@ class DownloadService : Service() {
                 .setOnlyAlertOnce(true)
                 .setProgress(max, p, indeterminate)
                 .setContentIntent(openApp(c))
+                .addAction(0, "⏸ Пауза", action(c, NotifActionReceiver.ACTION_PAUSE_ALL))
                 .build()
+
+        private fun action(c: Context, a: String): PendingIntent =
+            PendingIntent.getBroadcast(c, a.hashCode(),
+                Intent(c, NotifActionReceiver::class.java).setAction(a),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        const val ID_PAUSED = 4
+
+        fun notifyPaused(c: Context, n: Int) {
+            val nt = NotificationCompat.Builder(c, CH_DONE_SILENT)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setColor(0xFFE60012.toInt())
+                .setContentTitle("На паузе: $n")
+                .setContentText("Скачанное сохранено — продолжу с того же места")
+                .setContentIntent(openApp(c))
+                .addAction(0, "▶ Продолжить", action(c, NotifActionReceiver.ACTION_RESUME_ALL))
+                .build()
+            runCatching { NotificationManagerCompat.from(c).notify(ID_PAUSED, nt) }
+        }
 
         const val ID_UPDATE = 3
 

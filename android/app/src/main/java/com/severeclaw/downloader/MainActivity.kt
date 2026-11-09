@@ -26,7 +26,8 @@ class MainActivity : ComponentActivity() {
         intent.getStringExtra("selftest_url")?.let { url ->
             val out = File(getExternalFilesDir(null), "selftest.log")
             Engine.scope.launch {
-                Engine.selftest(url, out, intent.getStringExtra("sync_host"), intent.getStringExtra("sync_code"))
+                Engine.selftest(url, out, intent.getStringExtra("sync_host"), intent.getStringExtra("sync_code"),
+                    intent.getStringExtra("slow_url"))
             }
         }
         // незаконченные загрузки прошлого запуска

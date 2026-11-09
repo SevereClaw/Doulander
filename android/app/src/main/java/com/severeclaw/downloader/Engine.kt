@@ -144,7 +144,8 @@ object Engine {
     fun changeKind(id: String, opts: Opts) {
         val it = item(id) ?: return
         if (it.state == State.RUN) return
-        update(id) { i -> i.copy(opts = opts, status = "Будет скачано: ${opts.describe()}",
+        partDir(id).deleteRecursively()      // недокачанное было в другом формате
+        update(id) { i -> i.copy(opts = opts, status = "Будет скачано: ${opts.describe()}", progress = 0f,
             state = if (i.state == State.DONE) i.state else State.WAIT) }
         scope.launch { preview(id) }
         saveQueue()
@@ -158,25 +159,72 @@ object Engine {
 
     fun redownload(rec: Rec, opts: Opts? = null) = add(rec.url, opts ?: rec.opts)
 
-    fun stop(id: String) {
+    /** Недокачанное лежит здесь до конца загрузки — отсюда она продолжается после паузы,
+     *  ошибки связи или перезагрузки телефона. */
+    fun partDir(id: String) = File(app.noBackupFilesDir, "dl/$id")
+
+    private fun kill(id: String) {
         stopped.add(id)
         runCatching { YoutubeDL.getInstance().destroyProcessById(id) }
         jobs.remove(id)?.cancel()
-        update(id) { it.copy(state = State.STOPPED, status = "Остановлено") }
+    }
+
+    /** Пауза: загрузка останавливается, скачанное сохраняется. */
+    fun pause(id: String) {
+        val it = item(id) ?: return
+        if (it.state != State.RUN && it.state != State.WAIT) return
+        kill(id)
+        update(id) { i -> i.copy(state = State.PAUSED, status = pausedText(i)) }
         saveQueue()
         pump()
     }
 
-    fun retry(id: String) {
+    private fun pausedText(i: Item) =
+        "⏸ Пауза" + if (i.progress > 0f) " — ${(i.progress * 100).toInt()}%" else ""
+
+    /** Продолжить с того же места (после паузы, ошибки или остановки). */
+    fun resume(id: String) {
         stopped.remove(id)
-        update(id) { it.copy(state = State.WAIT, status = "В очереди") }
+        update(id) { it.copy(state = State.WAIT, status = "В очереди — продолжу с места остановки") }
         saveQueue()
         startService()
         pump()
     }
 
+    fun retry(id: String) = resume(id)
+
+    /** Начать заново: выбросить скачанное. */
+    fun restart(id: String) {
+        kill(id)
+        partDir(id).deleteRecursively()
+        stopped.remove(id)
+        update(id) { it.copy(state = State.WAIT, status = "В очереди", progress = 0f) }
+        saveQueue()
+        startService()
+        pump()
+    }
+
+    /** Отменить: остановить и удалить недокачанное. */
+    fun stop(id: String) {
+        kill(id)
+        partDir(id).deleteRecursively()
+        update(id) { it.copy(state = State.STOPPED, status = "Отменено", progress = 0f) }
+        saveQueue()
+        pump()
+    }
+
+    fun pauseAll() {
+        items.value.filter { it.state == State.RUN || it.state == State.WAIT }.forEach { pause(it.id) }
+    }
+
+    fun resumeAll() {
+        items.value.filter { it.state == State.PAUSED }.forEach { resume(it.id) }
+    }
+
     fun remove(id: String) {
-        if (item(id)?.state == State.RUN) stop(id)
+        val st = item(id)?.state
+        if (st == State.RUN) kill(id)
+        if (st != State.DONE) partDir(id).deleteRecursively()
         synchronized(lock) { items.value = items.value.filter { it.id != id } }
         saveQueue()
     }
@@ -357,7 +405,9 @@ object Engine {
 
     private suspend fun download(id: String) {
         val start = item(id) ?: return
-        val tmp = File(app.cacheDir, "dl/$id").apply { deleteRecursively(); mkdirs() }
+        // не очищаем: если там есть недокачанное — yt-dlp продолжит с того же места
+        val tmp = partDir(id).apply { mkdirs() }
+        if (tmp.walkTopDown().any { it.isFile }) log("Продолжаю с места остановки: ${start.label}")
         if (start.pcId != null) {
             // файл с ПК — забираем по Wi-Fi
             val err = pullFromPc(id, start, tmp)
@@ -431,21 +481,26 @@ object Engine {
     private fun pullFromPc(id: String, it: Item, tmp: File): String? {
         val name = (it.pcName ?: "файл").replace(Regex("""[\\/:*?"<>|]"""), "_")
         val out = File(tmp, name)
+        val part = File(tmp, "$name.part")             // недокачанное — докачивается с места остановки
         try {
             update(id) { i -> i.copy(status = "Подключаюсь к ПК…") }
+            val have = if (part.exists()) part.length() else 0L
             val c = Sync.conn(Sync.fileUrl(it.pcId!!), timeout = 8000)
+            if (have > 0) c.setRequestProperty("Range", "bytes=$have-")
+            val resumed = c.responseCode == 206
             when (c.responseCode) {
-                200 -> {}
+                200, 206 -> {}
                 401 -> return "ПК не принимает этот телефон — подключитесь заново в настройках"
                 404 -> return "Этого файла больше нет на ПК"
                 else -> return "ПК ответил: ${c.responseCode}"
             }
-            val total = c.contentLengthLong
+            val offset = if (resumed) have else 0L
+            val total = c.contentLengthLong.let { if (it > 0) it + offset else it }
             val started = System.currentTimeMillis()
             c.inputStream.use { inp ->
-                out.outputStream().use { o ->
+                java.io.FileOutputStream(part, resumed).use { o ->
                     val buf = ByteArray(256 * 1024)
-                    var done = 0L
+                    var done = offset
                     var last = 0L
                     while (true) {
                         if (id in stopped) return null
@@ -456,7 +511,7 @@ object Engine {
                         if (done - last > 1024 * 1024 || done == total) {
                             last = done
                             val sec = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
-                            val speed = humanSize((done / sec).toLong())
+                            val speed = humanSize(((done - offset) / sec).toLong())
                             update(id) { i ->
                                 i.copy(progress = if (total > 0) done.toFloat() / total else 0f,
                                     status = listOfNotNull(
@@ -465,9 +520,10 @@ object Engine {
                             }
                         }
                     }
-                    if (total > 0 && done != total) return "Связь с ПК оборвалась — нажмите ⟳"
+                    if (total > 0 && done != total) return "Связь с ПК оборвалась — нажмите ⟳, продолжу с места"
                 }
             }
+            part.renameTo(out)
             return null
         } catch (e: Throwable) {
             return if (id in stopped) null else "ПК не отвечает — он включён и в той же сети Wi-Fi?"
@@ -494,6 +550,8 @@ object Engine {
     }
 
     private fun onLine(id: String, progress: Float, line: String) {
+        if (id in stopped) return                  // пауза: поздние строки не трогают карточку
+        if ("Resuming download at byte" in line || "Resuming download from" in line) log(line.trim())
         when {
             progress >= 0 && line.contains("[download]") -> {
                 val speed = speedRe.find(line)?.groupValues?.get(1)
@@ -557,7 +615,8 @@ object Engine {
     private fun moveOut(tmp: File, dest: File): List<File> {
         val out = mutableListOf<File>()
         tmp.walkTopDown().filter { it.isFile && !it.name.endsWith(".part") &&
-                !it.name.endsWith(".ytdl") && !it.name.endsWith(".json") }.forEach { f ->
+                !it.name.contains(".part-Frag") && !it.name.endsWith(".ytdl") &&
+                !it.name.endsWith(".json") && !it.name.endsWith(".temp") }.forEach { f ->
             val rel = f.relativeTo(tmp).path
             var target = File(dest, rel)
             target.parentFile?.mkdirs()
@@ -662,7 +721,8 @@ object Engine {
 
     // ------------------------------------------------------------------ самопроверка (CI)
     /** Запуск из автосборки: скачивает тестовое видео в MP4 и MP3 и пишет итог в файл. */
-    suspend fun selftest(url: String, out: File, syncHost: String? = null, syncCode: String? = null) {
+    suspend fun selftest(url: String, out: File, syncHost: String? = null, syncCode: String? = null,
+                         slowUrl: String? = null) {
         val lines = mutableListOf<String>()
         var failed = 0
         fun w(s: String) {
@@ -729,6 +789,35 @@ object Engine {
         if (!pickOk) failed++
         w("${if (pickOk) "OK  " else "FAIL"} обновления: выбор релиза ($r64)")
         YouTubeCookies.file.delete()
+        // пауза и продолжение с места остановки (медленная раздача ~1,3 МБ/с)
+        if (slowUrl != null) {
+            synchronized(lock) { items.value = emptyList() }
+            add(slowUrl, Opts("video", "best", "mp4"))
+            val id = items.value.firstOrNull()?.id ?: ""
+            var t = 0
+            while (t < 240 && (item(id)?.progress ?: 0f) < 0.25f && item(id)?.state != State.DONE) {
+                delay(250); t++
+            }
+            val at = item(id)?.progress ?: 0f
+            pause(id)
+            delay(2000)
+            val partBytes = partDir(id).walkTopDown().filter { it.isFile }.sumOf { it.length() }
+            val savedPaused = Store.loadQueue(app).firstOrNull { it.id == id }?.state == State.PAUSED
+            val pausedOk = item(id)?.state == State.PAUSED && partBytes > 0 && savedPaused
+            if (!pausedOk) failed++
+            w("${if (pausedOk) "OK  " else "FAIL"} пауза на ${(at * 100).toInt()}%: ${item(id)?.status}, " +
+                    "сохранено $partBytes Б, в очереди после перезапуска: ${if (savedPaused) "пауза" else "НЕТ"}")
+            resume(id)
+            t = 0
+            while (t < 240 && item(id)?.state.let { it == State.WAIT || it == State.RUN }) { delay(500); t++ }
+            val it = item(id)
+            val f = it?.files?.firstOrNull()?.let { File(it) }
+            val resumedLog = log.value.any { "Resuming download" in it }
+            val resumeOk = it?.state == State.DONE && f != null && f.length() > 5_000_000 && resumedLog
+            if (!resumeOk) failed++
+            w("${if (resumeOk) "OK  " else "FAIL"} продолжение с места остановки: ${it?.state} " +
+                    "${f?.name} ${f?.length()} Б, yt-dlp продолжил: ${if (resumedLog) "да" else "НЕТ"}")
+        }
         // синхронизация с ПК (на сервере сборки — тестовый «ПК» из sync_server.py)
         if (syncHost != null && syncCode != null) {
             val wrong = Sync.pair(syncHost, "000000")

@@ -57,7 +57,7 @@ data class Opts(
     }
 }
 
-enum class State { WAIT, RUN, DONE, ERROR, STOPPED }
+enum class State { WAIT, RUN, PAUSED, DONE, ERROR, STOPPED }
 
 /** Ссылка в очереди. */
 data class Item(

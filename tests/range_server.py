@@ -9,6 +9,7 @@ import http.server
 import os
 import re
 import sys
+import time
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
@@ -53,15 +54,23 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         return f
 
     def copyfile(self, source, outputfile):
-        if self._remaining is None:
+        # /slow/… — медленная раздача (~1,3 МБ/с): проверка паузы и продолжения загрузки
+        slow = self.path.startswith("/slow/")
+        if self._remaining is None and not slow:
             return super().copyfile(source, outputfile)
         left = self._remaining
-        while left > 0:
-            chunk = source.read(min(65536, left))
+        while left is None or left > 0:
+            chunk = source.read(65536 if left is None else min(65536, left))
             if not chunk:
                 break
-            outputfile.write(chunk)
-            left -= len(chunk)
+            try:
+                outputfile.write(chunk)
+            except OSError:
+                return
+            if left is not None:
+                left -= len(chunk)
+            if slow:
+                time.sleep(0.05)
 
     def log_message(self, *args):
         pass

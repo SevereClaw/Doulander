@@ -11,7 +11,7 @@ on:
         default: false
   push:
     branches: [main]
-    paths: ["android/**", ".github/workflows/android.yml", "tests/android_selftest.sh", "sync_server.py", "tests/sync_mock.py"]
+    paths: ["android/**", ".github/workflows/android.yml", "tests/android_selftest.sh", "sync_server.py", "tests/sync_mock.py", "tests/range_server.py"]
 
 permissions:
   contents: write
@@ -81,6 +81,9 @@ jobs:
           sudo apt-get install -y -qq ffmpeg > /dev/null
           mkdir -p testdata
           ffmpeg -loglevel error -f lavfi -i testsrc=duration=6:size=1280x720:rate=25 -f lavfi -i sine=frequency=440:duration=6 -c:v libx264 -c:a aac -shortest -y testdata/test.mp4
+          mkdir -p testdata/slow
+          ffmpeg -loglevel error -f lavfi -i testsrc2=duration=20:size=1280x720:rate=30 -f lavfi -i sine=frequency=330:duration=20 -c:v libx264 -b:v 4M -c:a aac -shortest -y testdata/slow/big.mp4
+          ls -la testdata/slow
           nohup python3 tests/range_server.py testdata 8765 > server.log 2>&1 &
           nohup python3 tests/sync_mock.py testdata/test.mp4 sync-received.json > sync.log 2>&1 &
 
