@@ -11,7 +11,7 @@ on:
         default: false
   push:
     branches: [main]
-    paths: ["android/**", ".github/workflows/android.yml", "tests/android_selftest.sh"]
+    paths: ["android/**", ".github/workflows/android.yml", "tests/android_selftest.sh", "sync_server.py", "tests/sync_mock.py"]
 
 permissions:
   contents: write
@@ -82,6 +82,7 @@ jobs:
           mkdir -p testdata
           ffmpeg -loglevel error -f lavfi -i testsrc=duration=6:size=1280x720:rate=25 -f lavfi -i sine=frequency=440:duration=6 -c:v libx264 -c:a aac -shortest -y testdata/test.mp4
           nohup python3 tests/range_server.py testdata 8765 > server.log 2>&1 &
+          nohup python3 tests/sync_mock.py testdata/test.mp4 sync-received.json > sync.log 2>&1 &
 
       - name: Автопроверка в эмуляторе
         id: selftest

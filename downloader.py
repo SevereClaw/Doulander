@@ -20,6 +20,7 @@ import tkinter as tk
 import hashlib
 import tempfile
 import uuid
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -30,6 +31,7 @@ from PIL import Image, ImageDraw
 
 import editor
 import phantom_style
+import sync_server
 
 try:                                # звук уведомления (только Windows)
     import winsound
@@ -40,7 +42,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -279,6 +281,7 @@ def install_tool(name, progress=None):
                     os.replace(target + ".part", target)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+REMOTE_FILE = os.path.join(BASE_DIR, "phone_history.json")   # история, пришедшая с телефонов
 QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
 # обложки карточек — чтобы после перезапуска готовые загрузки показывались с картинкой
 THUMB_CACHE = os.path.join(tempfile.gettempdir(), "Downloader-thumbs")
@@ -405,6 +408,9 @@ DEFAULTS = {
     "proxy": "",            # например socks5://127.0.0.1:10808
     "auto_ytdlp": True,     # тихо обновлять yt-dlp раз в день
     "ytdlp_checked": 0,     # когда последний раз проверяли (время в секундах)
+    "sync": False,          # синхронизация истории с телефоном по Wi-Fi
+    "sync_key": "",         # ключ, который получает телефон после ввода кода
+    "sync_devices": {},     # подключённые телефоны: код устройства -> название
 }
 
 ACCENT = "#E5484D"
@@ -1777,7 +1783,10 @@ class HistoryWindow(ctk.CTkToplevel):
         for w in self.list.winfo_children():
             w.destroy()
         q = self.search.get().strip().lower()
-        self.rows = [h for h in self.app.history
+        phone = remote_items(self.app.remote)
+        rows = sorted(self.app.history + phone, key=hist_time, reverse=True) if phone \
+            else self.app.history
+        self.rows = [h for h in rows
                      if not q or q in (h.get("title") or "").lower()
                      or q in h.get("url", "").lower()]
         self.shown = 0
@@ -1815,10 +1824,12 @@ class HistoryWindow(ctk.CTkToplevel):
                                                                    padx=12, pady=(6, 0))
         path = rec.get("file")
         exists = bool(path) and os.path.exists(path)
-        meta = [rec.get("date", ""), describe_opts(rec.get("opts") or {}),
-                None if exists else "файл удалён или перемещён"]
+        phone = rec.get("remote")
+        meta = [rec.get("date", ""),
+                (rec.get("ext") or "").upper() if phone else describe_opts(rec.get("opts") or {}),
+                "📱 " + phone if phone else None if exists else "файл удалён или перемещён"]
         ctk.CTkLabel(row, text="   •   ".join(m for m in meta if m), anchor="w",
-                     text_color=GRAY_TEXT if exists else ACCENT,
+                     text_color=GRAY_TEXT if exists or phone else ACCENT,
                      font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="ew",
                                                     padx=12, pady=(0, 6))
         btns = ctk.CTkFrame(row, fg_color="transparent")
@@ -1868,7 +1879,10 @@ class HistoryWindow(ctk.CTkToplevel):
             self.refresh()
 
     def redownload(self, rec):
-        opts = dict(rec.get("opts") or {})
+        if rec.get("remote"):               # с телефона — переводим его настройки в настройки ПК
+            opts = phone_to_pc_opts(rec.get("phone_opts") or {}, self.app.current_opts())
+        else:
+            opts = dict(rec.get("opts") or {})
         opts["cookies"] = self.app.cookie_args()     # cookies берём текущие
         if self.app.add_item(rec["url"], opts):
             self.app.set_main_status("Добавлено из истории: " + (rec.get("title") or rec["url"]))
@@ -1977,6 +1991,96 @@ def downloaded_media(history):
     return out
 
 
+# ---------------------------------------------------------------- синхронизация с телефоном
+def sync_id(path):
+    """Постоянный код файла для телефона."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, os.path.normcase(os.path.abspath(path))).hex[:16]
+
+
+def hist_time(rec):
+    """Время записи истории в секундах (ПК хранит «27.10.2026 08:40», телефон — миллисекунды)."""
+    if isinstance(rec.get("date_ms"), (int, float)):
+        return rec["date_ms"] / 1000
+    try:
+        return datetime.datetime.strptime(rec.get("date") or "", "%d.%m.%Y %H:%M").timestamp()
+    except ValueError:
+        return 0
+
+
+def pc_to_phone_opts(o):
+    """Настройки ссылки ПК -> формат телефона (mode/quality/fmt)."""
+    audio = o.get("mode") == "Аудио"
+    q = re.match(r"\d+", o.get("quality") or "")
+    return {"mode": "audio" if audio else "video", "quality": q.group(0) if q else "best",
+            "fmt": (o.get("fmt") or ("MP3" if audio else "MP4")).lower(),
+            "playlist": bool(o.get("playlist"))}
+
+
+def phone_to_pc_opts(o, base):
+    """Настройки с телефона -> настройки ссылки на ПК (остальное — как сейчас в программе)."""
+    opts = dict(base)
+    audio = o.get("mode") == "audio"
+    opts["mode"] = "Аудио" if audio else "Видео"
+    fmt = (o.get("fmt") or "").upper()
+    q = str(o.get("quality") or "best")
+    if audio:
+        opts["fmt"] = fmt if fmt in AUDIO_FORMATS else "MP3"
+        opts["quality"] = next((k for k in AUDIO_QUALITIES if k.startswith(q + " ")), "Лучшее")
+    else:
+        opts["fmt"] = fmt if fmt in VIDEO_FORMATS else "MP4"
+        opts["quality"] = next((k for k in VIDEO_QUALITIES if k.startswith(q + "p")), "Лучшее")
+    opts["playlist"] = bool(o.get("playlist"))
+    opts.pop("format_id", None)
+    return opts
+
+
+def export_records(history):
+    """История ПК для телефона: только файлы, которые лежат на месте."""
+    out = []
+    for path, rec in downloaded_media(history):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        hit = _media_cache.get(path)
+        name = os.path.basename(path)
+        whole = os.path.isdir(rec.get("file") or "")
+        out.append({"id": sync_id(path), "url": rec.get("url") or "",
+                    "title": os.path.splitext(name)[0] if whole else (rec.get("title") or name),
+                    "name": name, "ext": os.path.splitext(name)[1][1:].lower(), "size": size,
+                    "date": int(hist_time(rec) * 1000),
+                    "opts": pc_to_phone_opts(rec.get("opts") or {}),
+                    "duration": int(hit[1]) if hit and hit[1] else None, "source": "pc"})
+    return out
+
+
+def load_remote():
+    try:
+        with open(REMOTE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remote_items(remote):
+    """Записи с телефонов в виде истории ПК (с пометкой, откуда)."""
+    out = []
+    for dev in remote.values():
+        for it in dev.get("items") or []:
+            if not it.get("title"):
+                continue
+            out.append({"url": it.get("url") or "", "title": it["title"], "file": None,
+                        "remote": dev.get("name") or "Телефон", "ext": it.get("ext") or "",
+                        "size": it.get("size"), "date_ms": it.get("date") or 0,
+                        "date": datetime.datetime.fromtimestamp((it.get("date") or 0) / 1000)
+                        .strftime("%d.%m.%Y %H:%M"),
+                        "thumb_url": it.get("thumb"), "duration": it.get("duration"),
+                        "phone_opts": it.get("opts") or {}})
+    out.sort(key=hist_time, reverse=True)
+    return out
+
+
 class GalleryWindow(ctk.CTkToplevel):
     """Всё, что скачала программа: плитки с кадром, длительностью и размером."""
     TILE_W, TILE_H = 208, 117
@@ -2014,7 +2118,7 @@ class GalleryWindow(ctk.CTkToplevel):
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
         bar.grid_columnconfigure(1, weight=1)
-        ctk.CTkSegmentedButton(bar, values=["Все", "Видео", "Музыка", "Обрезки"],
+        ctk.CTkSegmentedButton(bar, values=["Все", "Видео", "Музыка", "Обрезки", "📱 Телефон"],
                                variable=self.kind, command=lambda v: self.refresh()
                                ).grid(row=0, column=0, sticky="w")
         self.info = ctk.CTkLabel(bar, text="", text_color=GRAY_TEXT, anchor="e")
@@ -2034,6 +2138,12 @@ class GalleryWindow(ctk.CTkToplevel):
 
     def _matches(self, path, rec, q):
         kind = self.kind.get()
+        if path is None:                    # загрузка с телефона
+            if kind not in ("Все", "📱 Телефон"):
+                return False
+            return not q or q in (rec.get("title") or "").lower()
+        if kind == "📱 Телефон":
+            return False
         ext = path.lower()
         if kind == "Видео" and not ext.endswith(editor.VIDEO_EXTS):
             return False
@@ -2055,8 +2165,14 @@ class GalleryWindow(ctk.CTkToplevel):
         for w in self.grid_frame.winfo_children():
             w.destroy()
         q = self.search.get().strip().lower()
-        self.items = [(p, r) for p, r in downloaded_media(self.app.history)
-                      if self._matches(p, r, q)]
+        local = downloaded_media(self.app.history)
+        have = {(r.get("url"), os.path.splitext(p)[1][1:].lower()) for p, r in local if r.get("url")}
+        # загрузки с телефона, которых нет на ПК (та же ссылка в том же формате — уже есть)
+        phone = [(None, r) for r in remote_items(self.app.remote)
+                 if not r["url"] or (r["url"], r["ext"]) not in have]
+        merged = sorted(local + phone, key=lambda pr: hist_time(pr[1]), reverse=True) \
+            if phone else local
+        self.items = [(p, r) for p, r in merged if self._matches(p, r, q)]
         self.shown = 0
         self.more_btn = None
         if not self.items:
@@ -2073,13 +2189,17 @@ class GalleryWindow(ctk.CTkToplevel):
             self.more_btn.destroy()
             self.more_btn = None
         end = min(len(self.items), self.shown + self.PAGE)
-        new = [self._tile(*self.items[n]) for n in range(self.shown, end)]
+        new = [self._tile(*self.items[n]) if self.items[n][0] else self._tile_phone(self.items[n][1])
+               for n in range(self.shown, end)]
         self.tiles += new
         self.shown = end
         self._reflow(force=True)
         threading.Thread(target=self._load_thumbs, args=(self._gen, new), daemon=True).start()
-        total = sum(os.path.getsize(p) for p, _ in self.items if os.path.isfile(p))
-        self.info.configure(text=f"Файлов: {len(self.items)}   ·   {human_size(total) or '0 Б'}")
+        total = sum(os.path.getsize(p) for p, _ in self.items if p and os.path.isfile(p))
+        on_phone = sum(1 for p, _ in self.items if p is None)
+        self.info.configure(text=f"Файлов: {len(self.items) - on_phone}   ·   "
+                                 f"{human_size(total) or '0 Б'}" +
+                                 (f"   ·   📱 на телефоне: {on_phone}" if on_phone else ""))
 
     # ---------- плитки
     def _columns(self):
@@ -2155,11 +2275,60 @@ class GalleryWindow(ctk.CTkToplevel):
         self.after(50, lambda: bind_right_click(tile, lambda e: self.show_menu(e, path, rec)))
         return tile
 
+    def _tile_phone(self, rec):
+        """Плитка загрузки с телефона: обложка с сайта и «Скачать на ПК»."""
+        tile = ctk.CTkFrame(self.grid_frame, width=self.TILE_W + 12, corner_radius=R(10),
+                            fg_color=C.CARD, border_width=2, border_color=C.CARD)
+        tile.path, tile.rec = None, rec
+        ext = (rec.get("ext") or "").upper()
+        audio = rec.get("ext") in ("mp3", "m4a", "opus", "flac", "wav", "ogg")
+        tile.pic = ctk.CTkLabel(tile, text=("♪\n" if audio else "▶\n") + ext, width=self.TILE_W,
+                                height=self.TILE_H, corner_radius=R(8), fg_color=C.BADGE,
+                                text_color=C.BADGE_TEXT, font=ctk.CTkFont(size=20, weight="bold"))
+        tile.pic.grid(row=0, column=0, padx=6, pady=(6, 4))
+        title = rec["title"] if len(rec["title"]) <= 52 else rec["title"][:50] + "…"
+        ctk.CTkLabel(tile, text=title, width=self.TILE_W, wraplength=self.TILE_W, anchor="w",
+                     justify="left", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=1, column=0, sticky="w", padx=8)
+        tile.meta = ctk.CTkLabel(tile, text="   ·   ".join(x for x in (
+            "📱 " + rec["remote"], ext, human_size(rec.get("size")),
+            rec["date"].split(" ")[0]) if x), anchor="w", text_color=GRAY_TEXT,
+            font=ctk.CTkFont(size=11))
+        tile.meta.grid(row=2, column=0, sticky="w", padx=8)
+        btns = ctk.CTkFrame(tile, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=4, pady=(2, 6))
+        small = dict(height=26, fg_color="transparent", hover_color=C.ICON_HOVER,
+                     text_color=C.OUTLINE_TEXT)
+        ctk.CTkButton(btns, text="⬇ Скачать на ПК", width=130,
+                      state="normal" if rec["url"] else "disabled",
+                      command=lambda: self.download_phone(rec), **small).pack(side="left")
+        for w in (tile, tile.pic):
+            w.bind("<Enter>", lambda e, t=tile: t.configure(border_color=ACCENT), add="+")
+            w.bind("<Leave>", lambda e, t=tile: t.configure(border_color=C.CARD), add="+")
+        return tile
+
+    def download_phone(self, rec):
+        opts = phone_to_pc_opts(rec.get("phone_opts") or {}, self.app.current_opts())
+        self.app.add_item(rec["url"], opts)
+        self.app.set_main_status(f"Добавлено в очередь: {rec['title']}")
+
     def _load_thumbs(self, gen, tiles):
         """Фон: кадры и длительность для плиток (по одной, с низким приоритетом)."""
         for tile in tiles:
             if gen != self._gen:
                 return
+            if tile.path is None:           # с телефона — обложка с сайта
+                img, dur = None, tile.rec.get("duration")
+                if tile.rec.get("thumb_url"):
+                    try:
+                        img = load_thumbnail(tile.rec["thumb_url"],
+                                             self.app.proxy_for(tile.rec["thumb_url"]))
+                        img = img.convert("RGB").resize((416, 234), Image.LANCZOS)
+                    except Exception:
+                        img = None
+                self.app.events.put(("call", lambda t=tile, i=img, d=dur, g=gen:
+                                     self._apply_thumb(g, t, i, d)))
+                continue
             dur, video = media_details(tile.path)
             img = gallery_thumb(tile.path, dur, video)
             if img is None and tile.rec.get("thumb") and os.path.isfile(tile.rec["thumb"]):
@@ -2187,7 +2356,7 @@ class GalleryWindow(ctk.CTkToplevel):
                        font=font)
             cimg = ctk.CTkImage(light_image=img, dark_image=img,
                                 size=(self.TILE_W, self.TILE_H))
-            self._images[tile.path] = cimg
+            self._images[id(tile)] = cimg
             tile.pic.configure(image=cimg, text="", fg_color="transparent")
         elif dur:
             tile.pic.configure(text=tile.pic.cget("text") + f"\n{human_duration(dur)}")
@@ -2416,6 +2585,29 @@ class SettingsWindow(ctk.CTkToplevel):
                   "сайты — напрямую. VPN-программа должна быть запущена, но включать VPN для "
                   "всего компьютера не обязательно. «Найти» ищет такой прокси сама.")
 
+        self.section("Телефон — общая история по Wi-Fi")
+        self.v_sync = ctk.BooleanVar(value=bool(app.settings.get("sync")))
+        self.switch("Синхронизация с телефоном (Downloader для Android)", self.v_sync,
+                    self.toggle_sync)
+        self.sync_info = ctk.CTkLabel(body, text="", anchor="w", justify="left",
+                                      font=ctk.CTkFont(size=14, weight="bold"), text_color=C.TEXT)
+        self.sync_info.grid(row=self.next(), column=0, sticky="ew", padx=24, pady=(2, 2))
+        line = self.line()
+        ctk.CTkButton(line, text="Новый код", width=110, height=30, fg_color="transparent",
+                      border_width=1, text_color=C.OUTLINE_TEXT,
+                      command=lambda: (app.sync and app.sync.new_code(), self.update_sync())
+                      ).pack(side="left")
+        ctk.CTkButton(line, text="Отключить все телефоны", width=190, height=30,
+                      fg_color="transparent", border_width=1, text_color=C.OUTLINE_TEXT,
+                      command=lambda: (app.forget_phones(), self.update_sync())
+                      ).pack(side="left", padx=(8, 0))
+        self.sync_devices = self.hint("")
+        self.hint("В телефоне: ⚙ Настройки → «Синхронизация с ПК» → «Найти ПК» и ввести код. "
+                  "Телефон и компьютер должны быть в одной сети Wi-Fi. Если Windows спросит "
+                  "про брандмауэр — разрешите «Частные сети». Загрузки с телефона появятся в "
+                  "галерее и истории с пометкой 📱, а телефон сможет забирать файлы с ПК.")
+        self.update_sync()
+
         self.section("Папки и имена файлов")
         line = self.line()
         ctk.CTkLabel(line, text="Раскладывать:").pack(side="left")
@@ -2443,6 +2635,28 @@ class SettingsWindow(ctk.CTkToplevel):
             row=1, column=0, sticky="e", padx=20, pady=12)
         self.update_layout()
         self.after(150, self.lift)
+
+    def toggle_sync(self):
+        on = self.v_sync.get()
+        ok = self.app.start_sync() if on else (self.app.stop_sync() or True)
+        if on and not ok:
+            self.v_sync.set(False)
+        self.app.settings["sync"] = self.v_sync.get()
+        save_settings(self.app.settings)
+        self.update_sync()
+
+    def update_sync(self):
+        sync = self.app.sync
+        if not sync:
+            self.sync_info.configure(text="Выключена")
+            self.sync_devices.configure(text="")
+            return
+        code = f"{sync.code[:3]} {sync.code[3:]}"
+        addrs = ", ".join(sync_server.local_addresses()) or "не найден — проверьте Wi-Fi"
+        self.sync_info.configure(text=f"Код для телефона:  {code}\nАдрес ПК:  {addrs}")
+        devs = list((self.app.settings.get("sync_devices") or {}).values())
+        self.sync_devices.configure(text=("Подключены: " + ", ".join(devs)) if devs
+                                    else "Телефоны пока не подключены")
 
     # маленькие помощники для вёрстки
     def next(self):
@@ -2572,6 +2786,8 @@ class App(ctk.CTk):
         self._previews = 0                            # сколько превью идёт прямо сейчас
         self._tools_busy = False                      # обновляются компоненты
         self.history = load_history()
+        self.remote = load_remote()         # история с телефонов
+        self.sync = None
         self.history_win = None
         self.tray = None
         self.dnd_ready = False
@@ -2606,6 +2822,8 @@ class App(ctk.CTk):
             threading.Thread(target=cleanup_old_temp, daemon=True).start()
             threading.Thread(target=cleanup_info_cache, daemon=True).start()
             self.restore_queue()
+            if self.settings.get("sync"):
+                self.start_sync()
             if self.v_autostart.get():
                 set_autostart(True)          # обновить путь, если папку с программой перенесли
         if "--tray" in sys.argv:             # запуск вместе с Windows — сразу в трей
@@ -4012,6 +4230,8 @@ class App(ctk.CTk):
         self.save_queue()
         self.cancel()
         self._save()
+        if self.sync:
+            self.sync.stop()
         if self.tray:
             try:
                 self.tray.stop()
@@ -4173,6 +4393,83 @@ class App(ctk.CTk):
             win.refresh()
             return
         self.gallery_win = GalleryWindow(self)
+
+    # ------------------------------------------------------------ синхронизация с телефоном
+    def start_sync(self):
+        if self.sync:
+            return True
+        if not self.settings.get("sync_key"):
+            self.settings["sync_key"] = uuid.uuid4().hex + uuid.uuid4().hex
+            save_settings(self.settings)
+        ids = {}
+
+        def records():
+            recs = export_records(self.history)
+            ids.clear()
+            for path, _ in downloaded_media(self.history):
+                ids[sync_id(path)] = path
+            return recs
+
+        def file_path(fid):
+            if fid not in ids:
+                records()
+            return ids.get(fid)
+
+        def thumb(fid):
+            path = file_path(fid)
+            if not path:
+                return None
+            img = gallery_thumb(path, *media_details(path))
+            if img is None:
+                return None
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            return buf.getvalue()
+
+        def on_remote(dev, name, items):
+            self.remote[dev] = {"name": name, "updated": time.time(), "items": items}
+            write_json(REMOTE_FILE, self.remote)
+            self.events.put(("call", self._remote_changed))
+
+        def on_paired(dev, name):
+            self.settings.setdefault("sync_devices", {})[dev] = name
+            save_settings(self.settings)
+            self.events.put(("call", lambda: self.set_main_status(f"📱 Подключён телефон: {name}")))
+            self.events.put(("call", self._remote_changed))
+
+        self.sync = sync_server.SyncServer(self.settings["sync_key"], records, file_path, thumb,
+                                           on_remote, on_paired,
+                                           log=lambda t: self.events.put(("log", t)))
+        if not self.sync.start():
+            err = self.sync.error
+            self.sync = None
+            self.log(f"Синхронизация не запустилась: {err}")
+            return False
+        self.log(f"Синхронизация с телефоном: адрес {', '.join(sync_server.local_addresses()) or '?'}"
+                 f", порт {sync_server.HTTP_PORT}")
+        return True
+
+    def stop_sync(self):
+        if self.sync:
+            self.sync.stop()
+            self.sync = None
+
+    def forget_phones(self):
+        """Отключить все телефоны: новый ключ, старый перестаёт подходить."""
+        self.settings["sync_key"] = uuid.uuid4().hex + uuid.uuid4().hex
+        self.settings["sync_devices"] = {}
+        save_settings(self.settings)
+        if self.sync:
+            self.sync.key = self.settings["sync_key"]
+            self.sync.new_code()
+
+    def _remote_changed(self):
+        win = getattr(self, "gallery_win", None)
+        if win and win.winfo_exists():
+            win.refresh()
+        self.refresh_history_window()
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.update_sync()
 
     def open_history(self):
         if self.history_win and self.history_win.winfo_exists():
@@ -4350,6 +4647,63 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     else:
         failed += 1
         log("FAIL проверка «вы не бот» не распознана")
+
+    # синхронизация с телефоном: код, история, файл, история с телефона
+    try:
+        tmpd = os.path.join(out_dir, "sync")
+        os.makedirs(tmpd, exist_ok=True)
+        fpath = os.path.join(tmpd, "Песня.mp3")
+        with open(fpath, "wb") as f:
+            f.write(os.urandom(300000))
+        hist = [{"url": "https://youtu.be/x", "title": "Песня", "file": fpath,
+                 "date": "27.10.2026 08:40", "opts": {"mode": "Аудио", "fmt": "MP3",
+                                                      "quality": "320 kbps"}}]
+        got = {}
+        ids = {sync_id(fpath): fpath}
+        srv = sync_server.SyncServer("k" * 64, lambda: export_records(hist), ids.get,
+                                     lambda i: None, lambda d, n, it: got.update(items=it),
+                                     lambda d, n: got.update(paired=n), port=47714, udp_port=47715,
+                                     log=lambda t: None)
+        srv.start()
+        base = "http://127.0.0.1:47714"
+
+        def call(path, data=None, key=None, headers=None):
+            req = urllib.request.Request(base + path, data=json.dumps(data).encode() if data else None,
+                                         headers=dict({"X-Key": key} if key else {}, **(headers or {})))
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        bad = call("/api/pair", {"code": "000000" if srv.code != "000000" else "111111"})[0]
+        st, body = call("/api/pair", {"code": srv.code, "device": "t1", "name": "Тест"})
+        key = json.loads(body).get("key") if st == 200 else None
+        noauth = call("/api/history")[0]
+        st2, body2 = call("/api/history", key=key)
+        items = json.loads(body2)["items"] if st2 == 200 else []
+        st3, data = call(f"/api/file/{items[0]['id']}", key=key) if items else (0, b"")
+        st4, part = call(f"/api/file/{items[0]['id']}", key=key,
+                         headers={"Range": "bytes=1000-"}) if items else (0, b"")
+        with open(fpath, "rb") as f:
+            original = f.read()
+        st5 = call("/api/history", {"device": "t1", "name": "Тест", "items": [
+            {"url": "https://youtu.be/y", "title": "С телефона", "ext": "mp4", "date": 1,
+             "opts": {"mode": "video", "quality": "720", "fmt": "mp4"}}]}, key=key)[0]
+        srv.stop()
+        pc = phone_to_pc_opts({"mode": "video", "quality": "720", "fmt": "mkv"}, dict(DEFAULTS))
+        ok = (bad == 403 and key == "k" * 64 and noauth == 401 and len(items) == 1 and
+              items[0]["opts"] == {"mode": "audio", "quality": "320", "fmt": "mp3",
+                                   "playlist": False} and
+              data == original and st4 == 206 and part == original[1000:] and st5 == 200 and
+              got.get("items", [{}])[0].get("title") == "С телефона" and got.get("paired") == "Тест"
+              and pc["quality"] == "720p" and pc["fmt"] == "MKV" and pc["mode"] == "Видео")
+        failed += 0 if ok else 1
+        log(f"{'OK  ' if ok else 'FAIL'} синхронизация с телефоном: код {bad}/{st}, история {st2} "
+            f"({len(items)}), файл {st3} {len(data)} Б, докачка {st4}, с телефона {st5}")
+    except Exception as e:
+        failed += 1
+        log(f"FAIL синхронизация с телефоном: {e!r}")
 
     # 1. окно открывается без ошибок — в обоих оформлениях, с окнами настроек и истории
     for style in ("phantom", "classic"):

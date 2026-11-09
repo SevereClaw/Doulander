@@ -7,7 +7,7 @@ APK=$1
 OUT=$2
 mkdir -p "$OUT"
 adb install -r -g "$APK" || { echo "FAIL не удалось установить APK" > "$OUT/selftest.log"; exit 1; }
-adb shell am start -n $PKG/.MainActivity --es selftest_url http://10.0.2.2:8765/test.mp4
+adb shell am start -n $PKG/.MainActivity --es selftest_url http://10.0.2.2:8765/test.mp4 --es sync_host 10.0.2.2:47614 --es sync_code 424242
 for i in $(seq 1 180); do
   sleep 5
   adb logcat -d -s DLSELFTEST:I -v raw 2>/dev/null | grep -v "^-----" > "$OUT/selftest.log"
@@ -28,9 +28,14 @@ adb exec-out screencap -p > "$OUT/android-login.png"
 adb shell input keyevent KEYCODE_BACK
 adb shell ls -la /sdcard/Download/Downloader >> "$OUT/selftest.log" 2>&1
 adb logcat -d -t 400 > "$OUT/logcat.txt" 2>&1
+if [ -f sync-received.json ]; then
+  echo "ПК получил с телефона: $(python3 -c "import json;d=json.load(open('sync-received.json'));print(d['name'], len(d['items']), 'записей')")" >> "$OUT/selftest.log"
+else
+  echo "FAIL ПК не получил историю с телефона" >> "$OUT/selftest.log"
+fi
 cat "$OUT/selftest.log"
 if ! grep -q "ВСЁ ХОРОШО" "$OUT/selftest.log"; then
   echo "----- logcat (Downloader) -----"
   grep -iE "downloader|AndroidRuntime|youtubedl" "$OUT/logcat.txt" | tail -n 80
 fi
-grep -q "ВСЁ ХОРОШО" "$OUT/selftest.log"
+grep -q "ВСЁ ХОРОШО" "$OUT/selftest.log" && test -f sync-received.json

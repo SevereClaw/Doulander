@@ -25,7 +25,9 @@ class MainActivity : ComponentActivity() {
         // автопроверка на сервере сборки: am start ... --es selftest_url http://...
         intent.getStringExtra("selftest_url")?.let { url ->
             val out = File(getExternalFilesDir(null), "selftest.log")
-            Engine.scope.launch { Engine.selftest(url, out) }
+            Engine.scope.launch {
+                Engine.selftest(url, out, intent.getStringExtra("sync_host"), intent.getStringExtra("sync_code"))
+            }
         }
         // незаконченные загрузки прошлого запуска
         if (Engine.items.value.any { it.state == State.WAIT }) Engine.startService()

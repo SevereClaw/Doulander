@@ -71,13 +71,15 @@ data class Item(
     val progress: Float = 0f,
     val status: String = "В очереди",
     val files: List<String> = emptyList(),
+    val pcId: String? = null,           // файл с ПК (забирается по Wi-Fi, а не с сайта)
+    val pcName: String? = null,
 ) {
     val label get() = title ?: url
 
     fun toJson() = JSONObject().put("id", id).put("url", url).put("opts", opts.toJson())
         .put("title", title).put("thumb", thumb).put("meta", meta).put("state", state.name)
         .put("progress", progress.toDouble()).put("status", status)
-        .put("files", JSONArray(files))
+        .put("files", JSONArray(files)).put("pcId", pcId).put("pcName", pcName)
 
     companion object {
         fun fromJson(j: JSONObject) = Item(
@@ -92,6 +94,8 @@ data class Item(
             status = j.optString("status"),
             files = j.optJSONArray("files")?.let { a -> List(a.length()) { a.getString(it) } }
                 ?: emptyList(),
+            pcId = j.optString("pcId").ifEmpty { null }.takeIf { it != "null" },
+            pcName = j.optString("pcName").ifEmpty { null }.takeIf { it != "null" },
         )
     }
 }
@@ -131,10 +135,16 @@ data class Settings(
     val lastYtdlpUpdate: Long = 0,
     val githubToken: String = "",        // токен только для чтения — чтобы видеть релизы закрытого репозитория
     val autoUpdate: Boolean = true,
+    val deviceId: String = "",           // код этого телефона для ПК
+    val syncHost: String = "",           // адрес ПК, например 192.168.1.5:47614
+    val syncKey: String = "",
+    val syncName: String = "",           // имя ПК
 ) {
     fun toJson() = JSONObject().put("opts", opts.toJson()).put("proxy", proxy)
         .put("parallel", parallel).put("sound", sound).put("lastYtdlpUpdate", lastYtdlpUpdate)
         .put("githubToken", githubToken).put("autoUpdate", autoUpdate)
+        .put("deviceId", deviceId).put("syncHost", syncHost).put("syncKey", syncKey)
+        .put("syncName", syncName)
 
     companion object {
         fun fromJson(j: JSONObject?) = if (j == null) Settings() else Settings(
@@ -145,6 +155,10 @@ data class Settings(
             lastYtdlpUpdate = j.optLong("lastYtdlpUpdate"),
             githubToken = j.optString("githubToken"),
             autoUpdate = j.optBoolean("autoUpdate", true),
+            deviceId = j.optString("deviceId"),
+            syncHost = j.optString("syncHost"),
+            syncKey = j.optString("syncKey"),
+            syncName = j.optString("syncName"),
         )
     }
 }

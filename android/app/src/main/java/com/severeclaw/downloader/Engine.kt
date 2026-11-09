@@ -63,6 +63,7 @@ object Engine {
         app = c.applicationContext
         settings.value = Store.loadSettings(app)
         history.value = Store.loadHistory(app)
+        Sync.init()
         // незаконченные загрузки прошлого запуска — снова в очередь
         items.value = Store.loadQueue(app).map {
             if (it.state == State.RUN) it.copy(state = State.WAIT, status = "В очереди") else it
@@ -357,31 +358,41 @@ object Engine {
     private suspend fun download(id: String) {
         val start = item(id) ?: return
         val tmp = File(app.cacheDir, "dl/$id").apply { deleteRecursively(); mkdirs() }
-        var attempt = 1
-        var lastErr = ""
-        while (true) {
-            val it = item(id) ?: return
-            val req = buildRequest(it, tmp)
-            try {
-                update(id) { i -> i.copy(status = "Подключаюсь…") }
-                ytdlp {
-                    YoutubeDL.getInstance().execute(req, id) { progress, _, line ->
-                        onLine(id, progress, line)
-                    }
-                }
-                break
-            } catch (e: Throwable) {
-                if (id in stopped) return
-                lastErr = lastError(e.message ?: e.toString())
-                log("Ошибка ${it.url}: $lastErr")
-                if (isNetError(lastErr) && attempt < 3) {
-                    attempt++
-                    update(id) { i -> i.copy(status = "Сбой связи — пробую ещё раз ($attempt/3)…") }
-                    delay(3000L * attempt)
-                    continue
-                }
-                update(id) { i -> i.copy(state = State.ERROR, status = explain(lastErr)) }
+        if (start.pcId != null) {
+            // файл с ПК — забираем по Wi-Fi
+            val err = pullFromPc(id, start, tmp)
+            if (id in stopped) return
+            if (err != null) {
+                update(id) { it.copy(state = State.ERROR, status = err) }
                 return
+            }
+        } else {
+            var attempt = 1
+            var lastErr = ""
+            while (true) {
+                val it = item(id) ?: return
+                val req = buildRequest(it, tmp)
+                try {
+                    update(id) { i -> i.copy(status = "Подключаюсь…") }
+                    ytdlp {
+                        YoutubeDL.getInstance().execute(req, id) { progress, _, line ->
+                            onLine(id, progress, line)
+                        }
+                    }
+                    break
+                } catch (e: Throwable) {
+                    if (id in stopped) return
+                    lastErr = lastError(e.message ?: e.toString())
+                    log("Ошибка ${it.url}: $lastErr")
+                    if (isNetError(lastErr) && attempt < 3) {
+                        attempt++
+                        update(id) { i -> i.copy(status = "Сбой связи — пробую ещё раз ($attempt/3)…") }
+                        delay(3000L * attempt)
+                        continue
+                    }
+                    update(id) { i -> i.copy(state = State.ERROR, status = explain(lastErr)) }
+                    return
+                }
             }
         }
         if (id in stopped) return
@@ -413,6 +424,73 @@ object Engine {
         Store.saveHistory(app, history.value)
         finishedInSession++
         log("Скачано: ${saved.joinToString { it.name }}")
+        if (Sync.paired) scope.launch { Sync.sync(quiet = true) }   // чтобы ПК сразу увидел
+    }
+
+    /** Забрать файл с ПК по Wi-Fi. null — получилось, иначе текст ошибки. */
+    private fun pullFromPc(id: String, it: Item, tmp: File): String? {
+        val name = (it.pcName ?: "файл").replace(Regex("""[\\/:*?"<>|]"""), "_")
+        val out = File(tmp, name)
+        try {
+            update(id) { i -> i.copy(status = "Подключаюсь к ПК…") }
+            val c = Sync.conn(Sync.fileUrl(it.pcId!!), timeout = 8000)
+            when (c.responseCode) {
+                200 -> {}
+                401 -> return "ПК не принимает этот телефон — подключитесь заново в настройках"
+                404 -> return "Этого файла больше нет на ПК"
+                else -> return "ПК ответил: ${c.responseCode}"
+            }
+            val total = c.contentLengthLong
+            val started = System.currentTimeMillis()
+            c.inputStream.use { inp ->
+                out.outputStream().use { o ->
+                    val buf = ByteArray(256 * 1024)
+                    var done = 0L
+                    var last = 0L
+                    while (true) {
+                        if (id in stopped) return null
+                        val n = inp.read(buf)
+                        if (n < 0) break
+                        o.write(buf, 0, n)
+                        done += n
+                        if (done - last > 1024 * 1024 || done == total) {
+                            last = done
+                            val sec = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+                            val speed = humanSize((done / sec).toLong())
+                            update(id) { i ->
+                                i.copy(progress = if (total > 0) done.toFloat() / total else 0f,
+                                    status = listOfNotNull(
+                                        if (total > 0) "${done * 100 / total}%" else humanSize(done),
+                                        speed?.let { s -> "$s/с" }, "💻 по Wi-Fi").joinToString("  •  "))
+                            }
+                        }
+                    }
+                    if (total > 0 && done != total) return "Связь с ПК оборвалась — нажмите ⟳"
+                }
+            }
+            return null
+        } catch (e: Throwable) {
+            return if (id in stopped) null else "ПК не отвечает — он включён и в той же сети Wi-Fi?"
+        }
+    }
+
+    /** Забрать файл с ПК (из галереи). */
+    fun addFromPc(r: PcRec) {
+        if (items.value.any { it.pcId == r.id && it.state in listOf(State.WAIT, State.RUN) }) {
+            message.value = "Этот файл уже забирается"
+            return
+        }
+        val item = Item(id = UUID.randomUUID().toString(), url = r.url.ifEmpty { "pc:${r.id}" },
+            opts = r.opts, title = r.title, thumb = Sync.thumbUrl(r.id),
+            meta = listOfNotNull("💻 с ПК", humanDuration(r.duration), humanSize(r.size), r.ext.uppercase())
+                .joinToString("  •  "),
+            pcId = r.id, pcName = r.name)
+        if (r.duration != null) durations[item.id] = r.duration
+        synchronized(lock) { items.value = listOf(item) + items.value }
+        saveQueue()
+        startService()
+        pump()
+        message.value = "Забираю с ПК: ${r.title}"
     }
 
     private fun onLine(id: String, progress: Float, line: String) {
@@ -584,7 +662,7 @@ object Engine {
 
     // ------------------------------------------------------------------ самопроверка (CI)
     /** Запуск из автосборки: скачивает тестовое видео в MP4 и MP3 и пишет итог в файл. */
-    suspend fun selftest(url: String, out: File) {
+    suspend fun selftest(url: String, out: File, syncHost: String? = null, syncCode: String? = null) {
         val lines = mutableListOf<String>()
         var failed = 0
         fun w(s: String) {
@@ -651,6 +729,32 @@ object Engine {
         if (!pickOk) failed++
         w("${if (pickOk) "OK  " else "FAIL"} обновления: выбор релиза ($r64)")
         YouTubeCookies.file.delete()
+        // синхронизация с ПК (на сервере сборки — тестовый «ПК» из sync_server.py)
+        if (syncHost != null && syncCode != null) {
+            val wrong = Sync.pair(syncHost, "000000")
+            val err = Sync.pair(syncHost, syncCode)
+            val pcList = Sync.pcItems.value
+            val okPair = wrong != null && err == null && pcList.isNotEmpty()
+            if (!okPair) failed++
+            w("${if (okPair) "OK  " else "FAIL"} синхронизация: подключение (неверный код: $wrong; " +
+                    "верный: ${err ?: "ок"}), файлов на ПК: ${pcList.size}")
+            pcList.firstOrNull()?.let { r ->
+                synchronized(lock) { items.value = emptyList() }
+                addFromPc(r)
+                val id = items.value.firstOrNull()?.id ?: ""
+                var t = 0
+                while (t < 120 && item(id)?.state.let { it == State.WAIT || it == State.RUN }) { delay(500); t++ }
+                val it = item(id)
+                val f = it?.files?.firstOrNull()?.let { File(it) }
+                val okPull = it?.state == State.DONE && f != null && f.length() == r.size
+                if (!okPull) failed++
+                w("${if (okPull) "OK  " else "FAIL"} синхронизация: файл с ПК ${it?.status} " +
+                        "${f?.name} ${f?.length()} из ${r.size} Б")
+            }
+            val pushed = Sync.sync(quiet = true)
+            if (!pushed) failed++
+            w("${if (pushed) "OK  " else "FAIL"} синхронизация: история отправлена на ПК (${Sync.localRecords().length()})")
+        }
         val inHistory = history.value.size >= 3
         if (!inHistory) failed++
         w("${if (inHistory) "OK  " else "FAIL"} история: записей ${history.value.size}")

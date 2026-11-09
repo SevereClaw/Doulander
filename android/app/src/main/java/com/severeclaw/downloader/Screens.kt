@@ -329,6 +329,7 @@ fun ItemCard(item: Item) {
 @Composable
 fun GalleryScreen() {
     val history by Engine.history.collectAsState()
+    val pc by Sync.pcItems.collectAsState()
     var filter by remember { mutableStateOf("all") }
     var query by remember { mutableStateOf("") }
     var tick by remember { mutableStateOf(0) }       // перерисовать после удаления
@@ -337,32 +338,97 @@ fun GalleryScreen() {
         history.filter { r ->
             val f = File(r.file)
             val audio = r.file.substringAfterLast('.').lowercase() in AUDIO_EXT
-            f.isFile && seen.add(r.file) &&
+            f.isFile && seen.add(r.file) && filter != "pc" &&
                 (filter == "all" || (filter == "audio") == audio) &&
                 (query.isBlank() || r.title.contains(query, true) || f.name.contains(query, true))
         }
+    }
+    // загрузки с ПК, которых нет в телефоне (та же ссылка в том же формате — уже есть)
+    val fromPc = remember(history, pc, filter, query) {
+        val have = history.filter { it.url.isNotEmpty() }
+            .map { it.url to it.file.substringAfterLast('.').lowercase() }.toSet()
+        pc.filter { r ->
+            (r.url.isEmpty() || (r.url to r.ext) !in have) &&
+                (filter == "all" || filter == "pc" || (filter == "audio") == (r.ext in AUDIO_EXT)) &&
+                (query.isBlank() || r.title.contains(query, true))
+        }
+    }
+    val all: List<Any> = remember(files, fromPc) {
+        (files.map { it.date to it as Any } + fromPc.map { it.date to it as Any })
+            .sortedByDescending { it.first }.map { it.second }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             PTitle(R.drawable.t_gallery)
             Spacer(Modifier.weight(1f))
-            Text("Файлов: ${files.size}  •  ${humanSize(files.sumOf { File(it.file).length() }) ?: "0 Б"}",
+            Text("Файлов: ${files.size}  •  ${humanSize(files.sumOf { File(it.file).length() }) ?: "0 Б"}" +
+                    if (fromPc.isNotEmpty()) "\n💻 на ПК: ${fromPc.size}" else "",
                 color = P.MUTED, fontSize = 12.sp)
         }
         PField(query, { query = it }, "Поиск по названию", Modifier.fillMaxWidth().padding(top = 6.dp))
-        Row(Modifier.padding(top = 8.dp)) {
+        Row(Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState())) {
             PChip("Все", filter == "all") { filter = "all" }
             PChip("🎬 Видео", filter == "video") { filter = "video" }
             PChip("🎵 Музыка", filter == "audio") { filter = "audio" }
+            if (pc.isNotEmpty() || Sync.paired) PChip("💻 С ПК", filter == "pc") { filter = "pc" }
         }
-        if (files.isEmpty()) {
-            Text(if (history.isEmpty()) "Здесь появятся скачанные видео и музыка" else "Ничего не найдено",
-                color = P.MUTED, modifier = Modifier.fillMaxWidth().padding(30.dp))
+        if (all.isEmpty()) {
+            Text(when {
+                filter == "pc" && !Sync.paired -> "Подключите ПК: ⚙ Настройки → «Синхронизация с ПК»"
+                history.isEmpty() && pc.isEmpty() -> "Здесь появятся скачанные видео и музыка"
+                else -> "Ничего не найдено"
+            }, color = P.MUTED, modifier = Modifier.fillMaxWidth().padding(30.dp))
         }
         LazyVerticalGrid(GridCells.Adaptive(160.dp), Modifier.fillMaxSize(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(files, key = { it.file }) { r -> Tile(r) { tick++ } }
+            items(all, key = { if (it is Rec) it.file else "pc:" + (it as PcRec).id }) { e ->
+                if (e is Rec) Tile(e) { tick++ } else PcTile(e as PcRec)
+            }
+        }
+    }
+}
+
+/** Плитка файла, который лежит на ПК: забрать по Wi-Fi или скачать с сайта. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun PcTile(r: PcRec) {
+    val ctx = LocalContext.current
+    val audio = r.ext in AUDIO_EXT
+    var menu by remember { mutableStateOf(false) }
+    Box {
+        Column(Modifier.background(P.CARD).combinedClickable(onClick = { menu = true },
+            onLongClick = { menu = true })) {
+            Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(P.CARD2),
+                contentAlignment = Alignment.Center) {
+                Text((if (audio) "♪\n" else "▶\n") + r.ext.uppercase(), color = P.WHITE, style = Heavy,
+                    fontSize = 18.sp)
+                AsyncImage(Sync.thumbUrl(r.id), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                Text("💻 ПК", color = P.WHITE, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.TopStart).padding(4.dp)
+                        .background(Color.Black).padding(horizontal = 5.dp, vertical = 1.dp))
+                humanDuration(r.duration)?.let {
+                    Text(it, color = P.WHITE, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)
+                            .background(P.RED).padding(horizontal = 5.dp, vertical = 1.dp))
+                }
+            }
+            Text(r.title, color = P.WHITE, fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 2,
+                overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp))
+            Text(listOfNotNull(r.ext.uppercase(), humanSize(r.size),
+                SimpleDateFormat("dd.MM.yyyy", Locale.ROOT).format(Date(r.date))).joinToString("  •  "),
+                color = P.MUTED, fontSize = 11.sp, modifier = Modifier.padding(8.dp))
+        }
+        DropdownMenu(menu, { menu = false }, Modifier.background(P.CARD)) {
+            MenuItem("⬇  Забрать с ПК по Wi-Fi") { menu = false; Engine.addFromPc(r) }
+            if (r.url.isNotEmpty()) {
+                MenuItem("⟳  Скачать с сайта") {
+                    menu = false
+                    Engine.add(r.url, r.opts)
+                    Engine.message.value = "Добавлено в очередь"
+                }
+                MenuItem("🔗  Копировать ссылку") { menu = false; copyText(ctx, r.url) }
+            }
         }
     }
 }
@@ -453,6 +519,8 @@ fun SettingsScreen() {
         PTitle(R.drawable.t_settings, Modifier.padding(top = 8.dp))
 
         YouTubeAccount()
+
+        PcSync()
 
         PLabel("Одновременно загрузок")
         Row { (1..3).forEach { n -> PChip("$n", s.parallel == n) { Engine.saveSettings(s.copy(parallel = n)) } } }
@@ -578,6 +646,62 @@ fun UpdateSettings(s: Settings) {
             }
         }
     }
+}
+
+/** Раздел «Синхронизация с ПК». */
+@Composable
+fun PcSync() {
+    val s by Engine.settings.collectAsState()
+    val status by Sync.status.collectAsState()
+    val busy by Sync.busy.collectAsState()
+    var host by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var found by remember { mutableStateOf<List<Pair<String, String>>?>(null) }
+    var searching by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    PLabel("Синхронизация с ПК")
+    if (s.syncKey.isNotEmpty()) {
+        Text(status.ifEmpty { "Подключено к ${s.syncName}" }, color = P.GREEN, fontSize = 13.sp)
+        Text("История общая: загрузки с ПК видны в галерее (💻), их можно забрать по Wi-Fi.",
+            color = P.MUTED, fontSize = 12.sp)
+        Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = P.RED, strokeWidth = 2.dp)
+            else PButton("Синхронизировать", height = 36.dp) {
+                Engine.scope.launch { Sync.sync(quiet = false) }
+            }
+            Spacer(Modifier.width(8.dp))
+            PButton("Отключить", primary = false, height = 36.dp) { Sync.unpair() }
+        }
+        return
+    }
+    Text("На ПК: ⚙ Настройки → «Телефон» → включите синхронизацию — там будет код. " +
+            "Телефон и ПК должны быть в одной сети Wi-Fi.", color = P.MUTED, fontSize = 12.sp)
+    Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        PButton(if (searching) "Ищу…" else "Найти ПК", height = 36.dp, enabled = !searching) {
+            searching = true
+            Engine.scope.launch {
+                val r = Sync.discover()
+                found = r
+                if (r.size == 1) host = r[0].first
+                searching = false
+            }
+        }
+    }
+    found?.let { list ->
+        if (list.isEmpty()) Text("ПК не найден. Включена ли синхронизация на ПК? Можно ввести адрес вручную " +
+                "(он написан на ПК под кодом).", color = P.MUTED, fontSize = 12.sp)
+        Row(Modifier.horizontalScroll(rememberScrollState())) {
+            list.forEach { (h, name) -> PChip("💻 $name", host == h) { host = h } }
+        }
+    }
+    PField(host, { host = it }, "Адрес ПК, например 192.168.1.5", Modifier.fillMaxWidth().padding(top = 6.dp))
+    PField(code, { code = it }, "Код с экрана ПК (6 цифр)", Modifier.fillMaxWidth().padding(top = 6.dp))
+    PButton("Подключить", height = 36.dp, enabled = host.isNotBlank() && code.count { it.isDigit() } == 6,
+        modifier = Modifier.padding(top = 6.dp)) {
+        error = null
+        Engine.scope.launch { error = Sync.pair(host, code) }
+    }
+    error?.let { Text(it, color = P.RED, fontSize = 12.sp) }
 }
 
 fun openLogin(ctx: Context) {
