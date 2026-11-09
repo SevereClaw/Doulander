@@ -26,6 +26,7 @@ fun optsFor(mode: String?): Opts {
 fun quickAdd(c: Context, text: String?, mode: String?): Boolean {
     if (text.isNullOrBlank() || !Regex("""https?://""").containsMatchIn(text)) {
         Toast.makeText(c, "Downloader: в тексте нет ссылки", Toast.LENGTH_SHORT).show()
+        android.util.Log.i("DLSHARE", "nolink")
         return false
     }
     val opts = optsFor(mode)
@@ -41,7 +42,8 @@ fun quickAdd(c: Context, text: String?, mode: String?): Boolean {
 class ShareActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val mode = if (componentName.className.endsWith("ShareAudio")) "audio" else "video"
+        val alias = intent?.component?.className ?: componentName.className
+        val mode = if (alias.endsWith("ShareAudio")) "audio" else "video"
         if (intent?.action == Intent.ACTION_SEND) {
             quickAdd(this, intent.getStringExtra(Intent.EXTRA_TEXT), mode)
         }

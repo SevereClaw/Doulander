@@ -17,7 +17,7 @@ done
 sleep 2
 # «Поделиться» → «Скачать звук»: ссылка встаёт в очередь как аудио, приложение не открывается
 adb logcat -c
-adb shell am start -n $PKG/.ShareAudio -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT "Смотри: http://10.0.2.2:8765/test.mp4"
+adb shell am start -n $PKG/.ShareAudio -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT "'Смотри: http://10.0.2.2:8765/test.mp4'"
 sleep 4
 SHARE=$(adb logcat -d -s DLSHARE:I -v raw | grep -v "^-----" | tail -1)
 if [ "$SHARE" = "audio 1" ]; then echo "OK   поделиться → «Скачать звук»: в очереди как аудио" >> "$OUT/selftest.log"
