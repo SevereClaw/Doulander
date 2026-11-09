@@ -25,6 +25,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Всё, что делает программа: очередь, превью, загрузка, история, обновление yt-dlp. */
+/** Подсказка в ошибках; по ней карточка показывает кнопку «Войти». */
+const val LOGIN_HINT = "войдите в YouTube"
+
 object Engine {
     lateinit var app: Context
         private set
@@ -247,6 +250,23 @@ object Engine {
         val proxy = settings.value.proxy.trim()
         if (proxy.isNotEmpty()) req.addOption("--proxy", proxy)
         if (qjs.exists()) req.addOption("--js-runtimes", "quickjs:${qjs.absolutePath}")
+        // вход в YouTube (⚙ Настройки → «Войти в YouTube»)
+        if (YouTubeCookies.present) req.addOption("--cookies", YouTubeCookies.file.absolutePath)
+    }
+
+    /** Ошибка из-за того, что YouTube просит вход. */
+    fun isLoginError(err: String): Boolean {
+        val low = err.lowercase()
+        return "not a bot" in low || "confirm you" in low || "sign in to confirm your age" in low ||
+            "age-restricted" in low || "members-only" in low || "join this channel" in low ||
+            "login required" in low || "use --cookies" in low
+    }
+
+    /** После входа — повторить загрузки, которые упали из-за просьбы войти. */
+    fun retryLoginErrors() {
+        items.value.filter { it.state == State.ERROR && it.status.contains("войдите") }
+            .forEach { retry(it.id) }
+        items.value.filter { it.meta.contains("войдите") }.forEach { i -> scope.launch { preview(i.id) } }
     }
 
     private fun formatOptions(req: YoutubeDLRequest, o: Opts) {
@@ -496,9 +516,14 @@ object Engine {
         val low = err.lowercase()
         return when {
             "not a bot" in low || "confirm you" in low && "bot" in low ->
-                "YouTube просит вход («вы не бот?») — смените сервер VPN или попробуйте позже"
+                if (YouTubeCookies.present) "YouTube всё равно просит вход — войдите заново " +
+                    "(⚙ Настройки) или смените сервер VPN"
+                else "YouTube просит вход («вы не бот?») — $LOGIN_HINT"
             "sign in to confirm your age" in low || "age-restricted" in low ->
-                "Видео 18+ — YouTube отдаёт его только после входа в аккаунт"
+                if (YouTubeCookies.present) "Видео 18+: аккаунту нужно подтвердить возраст в YouTube"
+                else "Видео 18+ — $LOGIN_HINT"
+            "members-only" in low || "join this channel" in low ->
+                "Видео только для спонсоров канала" + if (YouTubeCookies.present) "" else " — $LOGIN_HINT"
             "private video" in low -> "Это закрытое видео"
             "video unavailable" in low || "not available" in low -> "Видео недоступно"
             "unsupported url" in low -> "Этот сайт не поддерживается"
@@ -585,6 +610,14 @@ object Engine {
         } catch (e: Throwable) {
             failed++; w("FAIL QuickJS: $e")
         }
+        // вход в YouTube: файл cookies в формате yt-dlp; загрузка MP4 ниже идёт уже с ним
+        val net = YouTubeCookies.toNetscape("PREF=f6=40000000; SAPISID=abc/def; __Host-3PLSID=x=y")
+        val netOk = YouTubeCookies.loggedIn("A=1; SAPISID=abc") && !YouTubeCookies.loggedIn("PREF=1") &&
+            ".youtube.com\tTRUE\t/\tTRUE\t" in net && "\tSAPISID\tabc/def" in net &&
+            "www.youtube.com\tFALSE\t/\tTRUE\t" in net && "\t__Host-3PLSID\tx=y" in net
+        if (!netOk) failed++
+        w("${if (netOk) "OK  " else "FAIL"} вход в YouTube: файл cookies")
+        YouTubeCookies.file.writeText(net)
         for ((name, opts, ext) in listOf(
             Triple("видео MP4 720p", Opts("video", "720", "mp4"), "mp4"),
             Triple("видео MKV", Opts("video", "best", "mkv"), "mkv"),
@@ -617,6 +650,7 @@ object Engine {
                 r7?.assetUrl == "u7" && Updater.pick(fake, listOf("x86")) == null
         if (!pickOk) failed++
         w("${if (pickOk) "OK  " else "FAIL"} обновления: выбор релиза ($r64)")
+        YouTubeCookies.file.delete()
         val inHistory = history.value.size >= 3
         if (!inHistory) failed++
         w("${if (inHistory) "OK  " else "FAIL"} история: записей ${history.value.size}")

@@ -22,7 +22,7 @@ android {
         minSdk = 24
         targetSdk = 34
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
-        versionName = "1.1.0"
+        versionName = "1.2.0"
     }
 
     signingConfigs {
@@ -82,4 +82,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-video:2.7.0")
+    implementation("androidx.webkit:webkit:1.12.1")
 }

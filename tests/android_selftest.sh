@@ -22,6 +22,10 @@ adb exec-out screencap -p > "$OUT/android-gallery.png"
 adb shell am start -n $PKG/.MainActivity --es tab settings
 sleep 3
 adb exec-out screencap -p > "$OUT/android-settings.png"
+adb shell am start -n $PKG/.MainActivity --ez login true
+sleep 12
+adb exec-out screencap -p > "$OUT/android-login.png"
+adb shell input keyevent KEYCODE_BACK
 adb shell ls -la /sdcard/Download/Downloader >> "$OUT/selftest.log" 2>&1
 adb logcat -d -t 400 > "$OUT/logcat.txt" 2>&1
 cat "$OUT/selftest.log"

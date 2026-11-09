@@ -279,6 +279,11 @@ fun ItemCard(item: Item) {
                         color = when (item.state) {
                             State.ERROR -> P.RED; State.DONE -> P.GREEN; else -> P.MUTED
                         })
+                    // YouTube просит вход — кнопка прямо в карточке
+                    if ((item.state == State.ERROR && "войдите" in item.status) || "войдите" in item.meta) {
+                        PButton("🔑 Войти в YouTube", primary = false, height = 30.dp,
+                            modifier = Modifier.padding(top = 4.dp)) { openLogin(ctx) }
+                    }
                 }
                 val (icon, action) = when (item.state) {
                     State.RUN -> "■" to { Engine.stop(item.id) }
@@ -447,6 +452,8 @@ fun SettingsScreen() {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp)) {
         PTitle(R.drawable.t_settings, Modifier.padding(top = 8.dp))
 
+        YouTubeAccount()
+
         PLabel("Одновременно загрузок")
         Row { (1..3).forEach { n -> PChip("$n", s.parallel == n) { Engine.saveSettings(s.copy(parallel = n)) } } }
 
@@ -571,6 +578,38 @@ fun UpdateSettings(s: Settings) {
             }
         }
     }
+}
+
+fun openLogin(ctx: Context) {
+    ctx.startActivity(Intent(ctx, LoginActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+}
+
+/** Раздел «Аккаунт YouTube». */
+@Composable
+fun YouTubeAccount() {
+    val ctx = LocalContext.current
+    // обновляем статус, когда пользователь вернулся из окна входа
+    val msg by Engine.message.collectAsState()
+    val saved = remember(msg) { YouTubeCookies.savedAt() }
+    PLabel("Аккаунт YouTube")
+    Text(if (saved != null) "✓ Вход выполнен ($saved) — «вы не бот?» и видео 18+ качаются"
+         else "Не выполнен. Войдите, если YouTube пишет «вы не бот?» или видео 18+",
+        color = if (saved != null) P.GREEN else P.MUTED, fontSize = 13.sp)
+    Row(Modifier.padding(top = 6.dp)) {
+        PButton(if (saved != null) "Войти заново" else "🔑 Войти в YouTube", height = 36.dp) {
+            openLogin(ctx)
+        }
+        if (saved != null) {
+            Spacer(Modifier.width(8.dp))
+            PButton("Выйти", primary = false, height = 36.dp) {
+                YouTubeCookies.logout()
+                Engine.message.value = "Вы вышли из YouTube"
+            }
+        }
+    }
+    Text("Совет: войдите в отдельный (не основной) аккаунт Google — YouTube иногда " +
+            "ограничивает аккаунты, через которые много скачивают.",
+        color = P.MUTED, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
 }
 
 @Composable

@@ -71,6 +71,7 @@ class MainActivity : ComponentActivity() {
             "update" -> { tab.value = "settings"; Updater.install(this) }
             else -> tab.value = t
         }
+        if (i.getBooleanExtra("login", false)) openLogin(this)
         if (i.action == Intent.ACTION_SEND) {
             val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
             tab.value = "main"
