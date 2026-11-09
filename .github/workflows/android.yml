@@ -28,7 +28,7 @@ jobs:
           java-version: "17"
 
       # QuickJS — движок JavaScript для yt-dlp (без него YouTube отдаёт не все видео).
-      # Собираем под телефоны сами и кладём как libqjs.so — Android разрешает запускать
+      # Собираем под телефоны сами и кладём как libqjsng.so — Android разрешает запускать
       # только программы из папки библиотек приложения.
       - name: Собрать QuickJS для Android
         run: |
@@ -43,7 +43,7 @@ jobs:
             BIN=$(find "qjs-$ABI" -maxdepth 2 -type f -name qjs | head -1)
             test -n "$BIN" || { echo "qjs не собрался для $ABI"; exit 1; }
             mkdir -p android/app/src/main/jniLibs/$ABI
-            cp "$BIN" android/app/src/main/jniLibs/$ABI/libqjs.so
+            cp "$BIN" android/app/src/main/jniLibs/$ABI/libqjsng.so
             ls -la android/app/src/main/jniLibs/$ABI
           done
 
@@ -114,18 +114,6 @@ jobs:
           name: Android-selftest
           path: selftest/
 
-      - name: Снимки экрана в ветку screenshots-android
-        if: always()
-        continue-on-error: true
-        run: |
-          ls selftest/*.png || exit 0
-          tmp=$RUNNER_TEMP/shots; mkdir -p $tmp; cp selftest/*.png $tmp/
-          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
-          git checkout --orphan screenshots-android
-          git rm -rfq . ; git clean -fdq -e selftest -e apk
-          cp $tmp/*.png .
-          git add *.png && git commit -qm "Снимки Android ${{ github.run_number }}" && git push -f origin screenshots-android
-
       - name: Релиз
         if: inputs.release && steps.selftest.outcome == 'success'
         env:
@@ -137,3 +125,15 @@ jobs:
             --repo ${{ github.repository }} --latest=false \
             --title "Downloader для Android $VER (сборка ${{ github.run_number }})" \
             --notes "Скачайте **Downloader-arm64.apk** (подходит почти всем телефонам последних лет). Для старых 32-битных телефонов — Downloader-armv7.apk."
+
+      - name: Снимки экрана в ветку screenshots-android
+        if: always()
+        continue-on-error: true
+        run: |
+          ls selftest/*.png || exit 0
+          tmp=$RUNNER_TEMP/shots; mkdir -p $tmp; cp selftest/*.png $tmp/
+          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan screenshots-android
+          git rm -rfq . ; git clean -fdq -e selftest -e apk
+          cp $tmp/*.png .
+          git add *.png && git commit -qm "Снимки Android ${{ github.run_number }}" && git push -f origin screenshots-android

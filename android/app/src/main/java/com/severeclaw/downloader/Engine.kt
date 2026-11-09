@@ -54,7 +54,7 @@ object Engine {
             "Downloader")
 
     /** QuickJS — движок JavaScript, без него YouTube отдаёт не все видео. */
-    val qjs: File get() = File(app.applicationInfo.nativeLibraryDir, "libqjs.so")
+    val qjs: File get() = File(app.applicationInfo.nativeLibraryDir, "libqjsng.so")
 
     fun init(c: Context) {
         app = c.applicationContext
