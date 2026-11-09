@@ -22,6 +22,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Всё, что делает программа: очередь, превью, загрузка, история, обновление yt-dlp. */
 object Engine {
@@ -43,6 +44,8 @@ object Engine {
     private val stopped = ConcurrentHashMap.newKeySet<String>()
     private val durations = ConcurrentHashMap<String, Int>()
     private val lock = Any()
+    private val gate = Any()                 // yt-dlp не обновляется, пока он работает, и наоборот
+    private val active = AtomicInteger(0)
     private var finishedInSession = 0
 
     /** Сюда складываются готовые файлы: «Загрузки/Downloader». */
@@ -188,7 +191,7 @@ object Engine {
     /** Запускает следующие загрузки, пока не занято «одновременно». */
     @Synchronized
     private fun pump() {
-        if (!ready.value) return
+        if (!ready.value || updating.value) return
         val limit = settings.value.parallel
         while (true) {
             val running = items.value.count { it.state == State.RUN }
@@ -220,6 +223,22 @@ object Engine {
     }
 
     // ------------------------------------------------------------------ yt-dlp
+    /** Запуск yt-dlp: ждёт, пока он подготовится и пока не идёт его обновление. */
+    private suspend fun <T> ytdlp(block: () -> T): T {
+        while (true) {
+            val ok = synchronized(gate) {
+                if (ready.value && !updating.value) { active.incrementAndGet(); true } else false
+            }
+            if (ok) break
+            delay(300)
+        }
+        try {
+            return block()
+        } finally {
+            active.decrementAndGet()
+        }
+    }
+
     private fun commonOptions(req: YoutubeDLRequest) {
         req.addOption("--no-warnings")
         req.addOption("--socket-timeout", "20")
@@ -256,7 +275,7 @@ object Engine {
         var err = ""
         for (attempt in 1..3) {
             try {
-                val out = YoutubeDL.getInstance().execute(req).out
+                val out = ytdlp { YoutubeDL.getInstance().execute(req).out }
                 info = JSONObject(out.substring(out.indexOf('{')))
                 break
             } catch (e: Throwable) {
@@ -325,8 +344,10 @@ object Engine {
             val req = buildRequest(it, tmp)
             try {
                 update(id) { i -> i.copy(status = "Подключаюсь…") }
-                YoutubeDL.getInstance().execute(req, id) { progress, _, line ->
-                    onLine(id, progress, line)
+                ytdlp {
+                    YoutubeDL.getInstance().execute(req, id) { progress, _, line ->
+                        onLine(id, progress, line)
+                    }
                 }
                 break
             } catch (e: Throwable) {
@@ -499,9 +520,17 @@ object Engine {
     }
 
     suspend fun updateYtdlp(manual: Boolean) {
-        if (updating.value) return
-        updating.value = true
+        synchronized(gate) {
+            if (updating.value) return
+            updating.value = true
+        }
         try {
+            // новые запуски уже ждут; дожидаемся, пока закончатся текущие загрузки
+            if (active.get() > 0) {
+                log("Обновление yt-dlp подождёт окончания загрузок")
+                if (manual) message.value = "yt-dlp обновится, когда закончатся загрузки"
+            }
+            while (active.get() > 0) delay(500)
             val status = YoutubeDL.getInstance().updateYoutubeDL(app, YoutubeDL.UpdateChannel.STABLE)
             ytdlpVersion.value = runCatching { YoutubeDL.getInstance().version(app) }.getOrNull()
             saveSettings(settings.value.copy(lastYtdlpUpdate = System.currentTimeMillis()))
@@ -512,6 +541,7 @@ object Engine {
             if (manual) message.value = "Не удалось обновить yt-dlp — нет связи с GitHub?"
         } finally {
             updating.value = false
+            pump()
         }
     }
 
@@ -543,6 +573,7 @@ object Engine {
         if (!ready.value) {
             w("FAIL yt-dlp не запустился: ${initError.value}"); w("Итог: ЕСТЬ ОШИБКИ"); return
         }
+        while (updating.value) delay(500)
         w("OK   yt-dlp ${ytdlpVersion.value}")
         // QuickJS — запускается ли на этом процессоре
         try {
