@@ -605,6 +605,18 @@ object Engine {
             w("${if (ok) "OK  " else "FAIL"} $name: ${it?.state} ${it?.status} " +
                     "${file?.let { f -> File(f).name + " " + File(f).length() + " Б" }}  [${it?.meta}]")
         }
+        // обновление приложения: выбор релиза под процессор и сравнение номера сборки
+        val fake = """[{"tag_name":"v1.15.0","assets":[{"name":"Downloader.zip","url":"x"}]},
+            {"tag_name":"android-v1.1.0-50","body":"новое","assets":[
+              {"name":"Downloader-arm64.apk","url":"u64","size":5},
+              {"name":"Downloader-armv7.apk","url":"u7","size":4}]},
+            {"tag_name":"android-v1.0.0-7","assets":[{"name":"Downloader-arm64.apk","url":"old"}]}]"""
+        val r64 = Updater.pick(fake, listOf("arm64-v8a", "armeabi-v7a"))
+        val r7 = Updater.pick(fake, listOf("armeabi-v7a"))
+        val pickOk = r64?.build == 50 && r64.assetUrl == "u64" && r64.version == "1.1.0" &&
+                r7?.assetUrl == "u7" && Updater.pick(fake, listOf("x86")) == null
+        if (!pickOk) failed++
+        w("${if (pickOk) "OK  " else "FAIL"} обновления: выбор релиза ($r64)")
         val inHistory = history.value.size >= 3
         if (!inHistory) failed++
         w("${if (inHistory) "OK  " else "FAIL"} история: записей ${history.value.size}")

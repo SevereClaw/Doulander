@@ -73,8 +73,10 @@ fun DownloaderApp(tab: String, onTab: (String) -> Unit) {
     LaunchedEffect(msg) {
         if (msg != null) { delay(3500); Engine.message.value = null }
     }
+    val upd by Updater.state.collectAsState()
     Column(Modifier.fillMaxSize().background(P.BG)) {
         Banner()
+        UpdateBar(upd)
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (tab) {
                 "gallery" -> GalleryScreen()
@@ -93,6 +95,25 @@ fun DownloaderApp(tab: String, onTab: (String) -> Unit) {
                 "settings" to "Настройки")) {
                 PChip(label.uppercase(), tab == key) { onTab(key) }
             }
+        }
+    }
+}
+
+/** Полоса «Вышла новая версия» над экраном. */
+@Composable
+fun UpdateBar(st: Updater.St) {
+    val ctx = LocalContext.current
+    val text = when (st) {
+        is Updater.St.Downloading -> "Скачиваю новую версию ${st.r.version}… ${(st.progress * 100).toInt()}%"
+        is Updater.St.Ready -> "Новая версия ${st.r.version} готова"
+        is Updater.St.Installing -> "Устанавливаю версию ${st.r.version}…"
+        else -> return
+    }
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).background(P.RED_DARK)
+        .padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(text, color = P.WHITE, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        if (st is Updater.St.Ready) {
+            PButton("Установить", primary = false, height = 32.dp) { Updater.install(ctx) }
         }
     }
 }
@@ -462,6 +483,8 @@ fun SettingsScreen() {
         Text("Обновляется сам раз в день — YouTube не «ломается» из-за старой версии.",
             color = P.MUTED, fontSize = 12.sp)
 
+        UpdateSettings(s)
+
         PLabel("Папка")
         Text("Загрузки/Downloader", color = P.WHITE, fontSize = 14.sp)
 
@@ -481,6 +504,72 @@ fun SettingsScreen() {
         }
         Text("Downloader для Android ${BuildConfig.VERSION_NAME} (сборка ${BuildConfig.VERSION_CODE})",
             color = P.MUTED, fontSize = 12.sp, modifier = Modifier.padding(vertical = 16.dp))
+    }
+}
+
+/** Раздел «Обновления приложения». */
+@Composable
+fun UpdateSettings(s: Settings) {
+    val ctx = LocalContext.current
+    val st by Updater.state.collectAsState()
+    var token by remember(s.githubToken) { mutableStateOf(s.githubToken) }
+    var help by remember { mutableStateOf(s.githubToken.isBlank()) }
+    PLabel("Обновления приложения")
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Switch(s.autoUpdate, { Engine.saveSettings(s.copy(autoUpdate = it)) },
+            colors = SwitchDefaults.colors(checkedTrackColor = P.RED, checkedThumbColor = P.WHITE))
+        Text("  Скачивать и ставить новые версии сами", color = P.WHITE, fontSize = 13.sp)
+    }
+    val status = when (val x = st) {
+        Updater.St.Idle -> "Версия ${BuildConfig.VERSION_NAME} (сборка ${BuildConfig.VERSION_CODE})"
+        Updater.St.NoToken -> "Нужен токен GitHub — см. ниже"
+        Updater.St.Checking -> "Проверяю…"
+        Updater.St.UpToDate -> "У вас последняя версия (сборка ${BuildConfig.VERSION_CODE})"
+        is Updater.St.Downloading -> "Скачиваю ${x.r.version}: ${(x.progress * 100).toInt()}%"
+        is Updater.St.Ready -> "Версия ${x.r.version} скачана — можно ставить"
+        is Updater.St.Installing -> "Устанавливаю ${x.r.version}…"
+        is Updater.St.Error -> x.text
+    }
+    Text(status, color = if (st is Updater.St.Error) P.RED else P.MUTED, fontSize = 13.sp,
+        modifier = Modifier.padding(vertical = 4.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        if (st is Updater.St.Ready) {
+            PButton("Установить", height = 36.dp) { Updater.install(ctx) }
+            Spacer(Modifier.width(8.dp))
+        }
+        PButton("Проверить", primary = st !is Updater.St.Ready, height = 36.dp,
+            enabled = st !is Updater.St.Checking && st !is Updater.St.Downloading) {
+            Engine.scope.launch { Updater.check(manual = true) }
+        }
+    }
+    Text("Токен GitHub (только чтение)", color = P.WHITE, fontSize = 13.sp,
+        modifier = Modifier.padding(top = 10.dp))
+    PField(token, { token = it }, "github_pat_…", Modifier.fillMaxWidth())
+    Row(Modifier.padding(top = 6.dp)) {
+        PButton("Сохранить", primary = false, height = 36.dp, enabled = token.trim() != s.githubToken) {
+            Engine.saveSettings(s.copy(githubToken = token.trim()))
+            Engine.scope.launch { Updater.check(manual = true) }
+        }
+        Spacer(Modifier.width(8.dp))
+        TextButton(onClick = { help = !help }) {
+            Text(if (help) "Скрыть подсказку" else "Как получить токен?", color = P.RED)
+        }
+    }
+    if (help) {
+        Text("Репозиторий с программой закрытый, поэтому телефону нужен ключ только для чтения:\n" +
+            "1. Нажмите «Создать токен» — откроется GitHub, имя, срок и право «Contents: Read» уже заполнены.\n" +
+            "2. В «Repository access» выберите «Only select repositories» → Doulander.\n" +
+            "3. Нажмите «Generate token», скопируйте его (начинается с github_pat_).\n" +
+            "4. Вставьте сюда и нажмите «Сохранить».\n" +
+            "Токен хранится только в этом телефоне и даёт лишь чтение Doulander.",
+            color = P.MUTED, fontSize = 12.sp)
+        PButton("Создать токен", primary = false, height = 36.dp,
+            modifier = Modifier.padding(top = 6.dp)) {
+            runCatching {
+                ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(Updater.TOKEN_URL))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+        }
     }
 }
 

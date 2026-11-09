@@ -124,7 +124,7 @@ jobs:
           gh release create "$TAG" apk/Downloader-arm64.apk apk/Downloader-armv7.apk \
             --repo ${{ github.repository }} --latest=false \
             --title "Downloader для Android $VER (сборка ${{ github.run_number }})" \
-            --notes "Скачайте **Downloader-arm64.apk** (подходит почти всем телефонам последних лет). Для старых 32-битных телефонов — Downloader-armv7.apk."
+            --notes "Скачайте **Downloader-arm64.apk** (подходит почти всем телефонам последних лет). Для старых 32-битных телефонов — Downloader-armv7.apk. Начиная с 1.1.0 приложение обновляется само (⚙ Настройки → Обновления приложения)."
 
       - name: Снимки экрана в ветку screenshots-android
         if: always()

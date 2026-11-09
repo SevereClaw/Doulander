@@ -30,6 +30,32 @@ class MainActivity : ComponentActivity() {
         // незаконченные загрузки прошлого запуска
         if (Engine.items.value.any { it.state == State.WAIT }) Engine.startService()
         setContent { DownloaderApp(tab.value) { tab.value = it } }
+        Updater.startAutoCheck()
+        // новая версия скачалась, пока приложение открыто, — сразу предлагаем поставить
+        updWatch = Engine.scope.launch {
+            Updater.state.collect { st ->
+                if (st is Updater.St.Ready && resumed) runOnUiThread { Updater.autoInstall(this@MainActivity) }
+            }
+        }
+    }
+
+    @Volatile private var resumed = false
+    private var updWatch: kotlinx.coroutines.Job? = null
+
+    override fun onDestroy() {
+        updWatch?.cancel()
+        super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        Updater.autoInstall(this)
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -40,7 +66,11 @@ class MainActivity : ComponentActivity() {
     /** «Поделиться» → Downloader из YouTube, VK, браузера… — ссылка сразу в очередь. */
     private fun handleIntent(i: Intent?) {
         i ?: return
-        i.getStringExtra("tab")?.let { tab.value = it }
+        when (val t = i.getStringExtra("tab")) {
+            null -> {}
+            "update" -> { tab.value = "settings"; Updater.install(this) }
+            else -> tab.value = t
+        }
         if (i.action == Intent.ACTION_SEND) {
             val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
             tab.value = "main"

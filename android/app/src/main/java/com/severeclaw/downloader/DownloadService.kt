@@ -115,6 +115,20 @@ class DownloadService : Service() {
                 .setContentIntent(openApp(c))
                 .build()
 
+        const val ID_UPDATE = 3
+
+        fun notifyUpdate(c: Context, version: String) {
+            val nt = NotificationCompat.Builder(c, CH_DONE_SILENT)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setColor(0xFFE60012.toInt())
+                .setContentTitle("Обновление Downloader $version")
+                .setContentText("Нажмите, чтобы установить")
+                .setAutoCancel(true)
+                .setContentIntent(openApp(c, "update"))
+                .build()
+            runCatching { NotificationManagerCompat.from(c).notify(ID_UPDATE, nt) }
+        }
+
         fun notifyDone(c: Context, n: Int, sound: Boolean) {
             val nt = NotificationCompat.Builder(c, if (sound) CH_DONE else CH_DONE_SILENT)
                 .setSmallIcon(R.drawable.ic_stat)

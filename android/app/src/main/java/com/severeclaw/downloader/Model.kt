@@ -129,9 +129,12 @@ data class Settings(
     val parallel: Int = 2,
     val sound: Boolean = true,
     val lastYtdlpUpdate: Long = 0,
+    val githubToken: String = "",        // токен только для чтения — чтобы видеть релизы закрытого репозитория
+    val autoUpdate: Boolean = true,
 ) {
     fun toJson() = JSONObject().put("opts", opts.toJson()).put("proxy", proxy)
         .put("parallel", parallel).put("sound", sound).put("lastYtdlpUpdate", lastYtdlpUpdate)
+        .put("githubToken", githubToken).put("autoUpdate", autoUpdate)
 
     companion object {
         fun fromJson(j: JSONObject?) = if (j == null) Settings() else Settings(
@@ -140,6 +143,8 @@ data class Settings(
             parallel = j.optInt("parallel", 2).coerceIn(1, 3),
             sound = j.optBoolean("sound", true),
             lastYtdlpUpdate = j.optLong("lastYtdlpUpdate"),
+            githubToken = j.optString("githubToken"),
+            autoUpdate = j.optBoolean("autoUpdate", true),
         )
     }
 }
