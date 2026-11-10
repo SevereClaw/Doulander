@@ -840,6 +840,11 @@ object Engine {
                 w("${if (okPull) "OK  " else "FAIL"} синхронизация: файл с ПК ${it?.status} " +
                         "${f?.name} ${f?.length()} из ${r.size} Б")
             }
+            val pcApk = Updater.fromPc()
+            val apkOk = pcApk?.build == 999 && pcApk.assetName == "Downloader-x86_64.apk"
+            if (!apkOk) failed++
+            w("${if (apkOk) "OK  " else "FAIL"} обновление с ПК: ${pcApk?.version} (сборка ${pcApk?.build}) " +
+                    "${pcApk?.assetName}; открытый репозиторий: ${Updater.fromPublic()?.tag ?: "пока пуст"}")
             val pushed = Sync.sync(quiet = true)
             if (!pushed) failed++
             w("${if (pushed) "OK  " else "FAIL"} синхронизация: история отправлена на ПК (${Sync.localRecords().length()})")

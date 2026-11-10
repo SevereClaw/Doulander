@@ -19,10 +19,13 @@ def on_remote(dev, name, items):
         json.dump({"device": dev, "name": name, "items": items}, f, ensure_ascii=False)
 
 
+apk = {"tag": "android-v9.9.9-999", "build": 999, "version": "9.9.9",
+       "assets": [{"name": "Downloader-x86_64.apk", "size": os.path.getsize(media), "path": media}]}
+
 srv = sync_server.SyncServer("testkey" * 8, lambda: [rec],
                              lambda i: media if i == "test0001" else None, lambda i: None,
                              on_remote, lambda d, n: print("подключён", n, flush=True),
-                             name="Тестовый ПК")
+                             name="Тестовый ПК", apk_info=lambda: apk)
 srv.code = "424242"
 srv.start()
 print("sync mock ready", flush=True)

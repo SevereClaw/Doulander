@@ -19,6 +19,8 @@ import java.net.URL
 /** Обновление самого приложения из релизов GitHub (теги android-v1.2.0-<сборка>). */
 object Updater {
     const val REPO = "SevereClaw/Doulander"
+    /** Открытый репозиторий только с APK — обновления без токена и без ПК. */
+    const val PUBLIC_REPO = "SevereClaw/Doulander-Releases"
 
     /** Ссылка на создание токена: имя, срок «без окончания» и право «только чтение» уже заполнены. */
     const val TOKEN_URL = "https://github.com/settings/personal-access-tokens/new" +
@@ -26,11 +28,12 @@ object Updater {
         "&target_name=SevereClaw&expires_in=none&contents=read"
 
     data class Release(val tag: String, val build: Int, val version: String, val notes: String,
-                       val assetUrl: String, val assetName: String, val size: Long)
+                       val assetUrl: String, val assetName: String, val size: Long,
+                       val source: String = "github")      // github | public | pc
 
     sealed class St {
         object Idle : St()
-        object NoToken : St()
+        object NoToken : St()                 // нет ни одного источника обновлений
         object Checking : St()
         object UpToDate : St()
         data class Downloading(val r: Release, val progress: Float) : St()
@@ -99,37 +102,93 @@ object Updater {
         return c
     }
 
-    /** Проверить и, если включено, сразу скачать и поставить. */
+    private fun wantedNames() = Build.SUPPORTED_ABIS.mapNotNull { abi ->
+        when (abi) {
+            "arm64-v8a" -> "Downloader-arm64.apk"
+            "armeabi-v7a" -> "Downloader-armv7.apk"
+            "x86_64" -> "Downloader-x86_64.apk"
+            else -> null
+        }
+    }
+
+    /** Открытый репозиторий с APK (без токена). */
+    fun fromPublic(): Release? = runCatching {
+        val c = open("https://api.github.com/repos/$PUBLIC_REPO/releases?per_page=10", null,
+            "application/vnd.github+json")
+        if (c.responseCode != 200) null
+        else pick(c.inputStream.bufferedReader().readText(), Build.SUPPORTED_ABIS.toList())?.copy(source = "public")
+    }.getOrNull()
+
+    /** ПК по Wi-Fi: программа на ПК сама скачивает свежий APK и отдаёт его телефону. */
+    fun fromPc(): Release? = runCatching {
+        if (!Sync.paired) return null
+        val c = Sync.conn("${Sync.base()}/api/apk")
+        if (c.responseCode != 200) return null
+        val j = org.json.JSONObject(c.inputStream.bufferedReader().readText())
+        val assets = j.getJSONArray("assets")
+        val list = List(assets.length()) { assets.getJSONObject(it) }
+        val a = wantedNames().firstNotNullOfOrNull { w -> list.firstOrNull { it.optString("name") == w } }
+            ?: return null
+        Release(j.optString("tag"), j.optInt("build"), j.optString("version"), "",
+            "${Sync.base()}/api/apk/${a.optString("name")}", a.optString("name"), a.optLong("size"), "pc")
+    }.getOrNull()
+
+    /** Закрытый репозиторий — только если вставлен токен (запасной вариант). */
+    private fun fromPrivate(token: String): Pair<Release?, String?> {
+        val c = open("https://api.github.com/repos/$REPO/releases?per_page=30", token,
+            "application/vnd.github+json")
+        val code = c.responseCode
+        if (code == 401) return null to "Токен не подходит или истёк"
+        if (code == 403 || code == 404) return null to "У токена нет доступа к Doulander"
+        if (code != 200) return null to "GitHub ответил: $code"
+        return pick(c.inputStream.bufferedReader().readText(), Build.SUPPORTED_ABIS.toList()) to null
+    }
+
+    fun sourceName(r: Release) = when (r.source) {
+        "pc" -> "с ПК по Wi-Fi"
+        "public" -> "с GitHub"
+        else -> "с GitHub (токен)"
+    }
+
+    /** Проверить все источники и, если включено, сразу скачать и поставить. */
     suspend fun check(manual: Boolean) {
         val s = Engine.settings.value
         val token = s.githubToken.trim()
-        if (token.isEmpty()) { state.value = St.NoToken; return }
-        if (state.value is St.Downloading || state.value is St.Installing) return
-        if (!manual && System.currentTimeMillis() - lastCheck < 3 * 3600 * 1000L &&
+        if (state.value is St.Downloading || state.value is St.Installing || state.value is St.Ready) {
+            if (!manual || state.value !is St.Ready) return
+        }
+        if (!manual && System.currentTimeMillis() - lastCheck < 3600 * 1000L &&
             state.value !is St.Error) return
         lastCheck = System.currentTimeMillis()
         state.value = St.Checking
         try {
-            val c = open("https://api.github.com/repos/$REPO/releases?per_page=30", token,
-                "application/vnd.github+json")
-            val code = c.responseCode
-            if (code == 401 || code == 403 || code == 404) {
-                state.value = St.Error(if (code == 401) "Токен не подходит или истёк — создайте новый"
-                    else "У токена нет доступа к репозиторию Doulander")
+            val found = mutableListOf<Release>()
+            var err: String? = null
+            fromPublic()?.let { found += it }
+            fromPc()?.let { found += it }
+            if (token.isNotEmpty()) {
+                val (r, e) = runCatching { fromPrivate(token) }.getOrElse { null to it.message }
+                r?.let { found += it }
+                err = e
+            }
+            // при одинаковой версии: с ПК быстрее (по Wi-Fi), потом открытый репозиторий
+            val best = found.maxWithOrNull(compareBy<Release> { it.build }
+                .thenBy { when (it.source) { "pc" -> 2; "public" -> 1; else -> 0 } })
+            if (best == null) {
+                state.value = if (err != null) St.Error(err)
+                    else if (!Sync.paired && token.isEmpty()) St.NoToken else St.UpToDate
+                if (manual && state.value == St.UpToDate) Engine.message.value = "У вас последняя версия"
                 return
             }
-            if (code != 200) { state.value = St.Error("GitHub ответил: $code"); return }
-            val json = c.inputStream.bufferedReader().readText()
-            val r = pick(json, Build.SUPPORTED_ABIS.toList())
-            if (r == null || r.build <= BuildConfig.VERSION_CODE) {
+            if (best.build <= BuildConfig.VERSION_CODE) {
                 state.value = St.UpToDate
                 if (manual) Engine.message.value = "У вас последняя версия"
                 return
             }
-            Engine.log("Вышла новая версия ${r.version} (сборка ${r.build})")
-            if (manual || s.autoUpdate) download(r, token) else state.value = St.Idle
+            Engine.log("Вышла новая версия ${best.version} (сборка ${best.build}) — беру ${sourceName(best)}")
+            if (manual || s.autoUpdate) download(best, token) else state.value = St.Idle
         } catch (e: Throwable) {
-            state.value = St.Error("Нет связи с GitHub: ${e.message}")
+            state.value = St.Error("Не удалось проверить обновления: ${e.message}")
         }
     }
 
@@ -139,7 +198,9 @@ object Updater {
         state.value = St.Downloading(r, 0f)
         try {
             // GitHub отдаёт файл через переадресацию на хранилище — туда токен не передаём
-            var c = open(r.assetUrl, token, "application/octet-stream")
+            var c = if (r.source == "pc") Sync.conn(r.assetUrl, timeout = 8000).apply {
+                    readTimeout = 60000 }
+                else open(r.assetUrl, if (r.source == "github") token else null, "application/octet-stream")
             var hops = 0
             while (c.responseCode in 301..308 && hops < 5) {
                 val loc = c.getHeaderField("Location")

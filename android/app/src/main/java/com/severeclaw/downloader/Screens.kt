@@ -603,7 +603,8 @@ fun UpdateSettings(s: Settings) {
     val ctx = LocalContext.current
     val st by Updater.state.collectAsState()
     var token by remember(s.githubToken) { mutableStateOf(s.githubToken) }
-    var help by remember { mutableStateOf(s.githubToken.isBlank()) }
+    var help by remember { mutableStateOf(false) }
+    var showToken by remember { mutableStateOf(s.githubToken.isNotBlank()) }
     PLabel("Обновления приложения")
     Row(verticalAlignment = Alignment.CenterVertically) {
         Switch(s.autoUpdate, { Engine.saveSettings(s.copy(autoUpdate = it)) },
@@ -612,10 +613,10 @@ fun UpdateSettings(s: Settings) {
     }
     val status = when (val x = st) {
         Updater.St.Idle -> "Версия ${BuildConfig.VERSION_NAME} (сборка ${BuildConfig.VERSION_CODE})"
-        Updater.St.NoToken -> "Нужен токен GitHub — см. ниже"
+        Updater.St.NoToken -> "Новых версий не найдено — подключите ПК (ниже) или проверьте позже"
         Updater.St.Checking -> "Проверяю…"
         Updater.St.UpToDate -> "У вас последняя версия (сборка ${BuildConfig.VERSION_CODE})"
-        is Updater.St.Downloading -> "Скачиваю ${x.r.version}: ${(x.progress * 100).toInt()}%"
+        is Updater.St.Downloading -> "Скачиваю ${x.r.version} ${Updater.sourceName(x.r)}: ${(x.progress * 100).toInt()}%"
         is Updater.St.Ready -> "Версия ${x.r.version} скачана — можно ставить"
         is Updater.St.Installing -> "Устанавливаю ${x.r.version}…"
         is Updater.St.Error -> x.text
@@ -632,7 +633,16 @@ fun UpdateSettings(s: Settings) {
             Engine.scope.launch { Updater.check(manual = true) }
         }
     }
-    Text("Токен GitHub (только чтение)", color = P.WHITE, fontSize = 13.sp,
+    Text("Новые версии приходят сами: с GitHub из открытого репозитория с APK и с ПК по Wi-Fi " +
+            "(если включена синхронизация). Ничего настраивать не нужно.",
+        color = P.MUTED, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+    if (!showToken) {
+        TextButton(onClick = { showToken = true }) {
+            Text("Запасной вариант: токен GitHub", color = P.MUTED, fontSize = 12.sp)
+        }
+        return
+    }
+    Text("Токен GitHub (запасной вариант, только чтение)", color = P.WHITE, fontSize = 13.sp,
         modifier = Modifier.padding(top = 10.dp))
     PField(token, { token = it }, "github_pat_…", Modifier.fillMaxWidth())
     Row(Modifier.padding(top = 6.dp)) {

@@ -62,8 +62,11 @@ class SyncServer:
     """
 
     def __init__(self, key, records, file_path, thumb, on_remote, on_paired,
-                 name=None, log=print, port=HTTP_PORT, udp_port=UDP_PORT):
+                 name=None, log=print, port=HTTP_PORT, udp_port=UDP_PORT, apk_info=None):
         self.key = key
+        # обновления приложения для телефона: apk_info() -> {"tag", "build", "version",
+        # "assets": [{"name", "size", "path"}]} или None
+        self.apk_info = apk_info
         self.records, self.file_path, self.thumb = records, file_path, thumb
         self.on_remote, self.on_paired = on_remote, on_paired
         self.name = name or socket.gethostname()
@@ -180,12 +183,23 @@ class SyncServer:
                     return self._send(200, png, "image/png") if png else self._send(404, {})
                 if path.startswith("/api/file/"):
                     return self._file(path.rsplit("/", 1)[1])
+                if path == "/api/apk":
+                    info = srv.apk_info() if srv.apk_info else None
+                    if not info:
+                        return self._send(404, {"error": "на ПК нет APK"})
+                    return self._send(200, {k: v for k, v in info.items() if k != "assets"} | {
+                        "assets": [{"name": a["name"], "size": a["size"]} for a in info["assets"]]})
+                if path.startswith("/api/apk/"):
+                    info = srv.apk_info() if srv.apk_info else None
+                    name = urllib.parse.unquote(path.rsplit("/", 1)[1])
+                    a = next((a for a in (info or {}).get("assets", []) if a["name"] == name), None)
+                    return self._file(None, a["path"] if a else None)
                 self._send(404, {"error": "нет такого"})
 
             do_HEAD = do_GET
 
-            def _file(self, fid):
-                p = srv.file_path(fid)
+            def _file(self, fid, p=None):
+                p = p or (srv.file_path(fid) if fid else None)
                 if not p or not os.path.isfile(p):
                     return self._send(404, {"error": "файла нет на ПК"})
                 size = os.path.getsize(p)

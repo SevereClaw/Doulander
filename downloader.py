@@ -42,7 +42,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -282,6 +282,7 @@ def install_tool(name, progress=None):
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 REMOTE_FILE = os.path.join(BASE_DIR, "phone_history.json")   # история, пришедшая с телефонов
+APK_DIR = os.path.join(BASE_DIR, "android-apk")   # свежий APK для телефона — отдаётся по Wi-Fi
 QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")      # очередь — чтобы продолжить после перезапуска
 # обложки карточек — чтобы после перезапуска готовые загрузки показывались с картинкой
 THUMB_CACHE = os.path.join(tempfile.gettempdir(), "Downloader-thumbs")
@@ -2052,6 +2053,78 @@ def export_records(history):
                     "opts": pc_to_phone_opts(rec.get("opts") or {}),
                     "duration": int(hit[1]) if hit and hit[1] else None, "source": "pc"})
     return out
+
+
+def android_tag_build(tag):
+    m = re.fullmatch(r"android-v([\d.]+)-(\d+)", tag or "")
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+def cached_apk_info():
+    """Что из APK для Android уже скачано на ПК."""
+    try:
+        with open(os.path.join(APK_DIR, "info.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        info["assets"] = [a for a in info.get("assets", []) if os.path.isfile(a.get("path", ""))]
+        return info if info["assets"] else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def refresh_android_apk(log=lambda t: None):
+    """Скачивает свежий APK для телефона из релизов GitHub (через вход update.bat — gh).
+    Телефону токен не нужен: он заберёт APK у ПК по Wi-Fi."""
+    gh = find_gh()
+    if not gh:
+        return None
+    try:
+        p = subprocess.run([gh, "api", f"repos/{REPO}/releases?per_page=30"], capture_output=True,
+                           timeout=60, creationflags=NO_WINDOW, env=clean_env())
+        rels = json.loads(p.stdout.decode("utf-8", "replace") or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log(f"APK для телефона: не удалось проверить релизы: {e}")
+        return None
+    best = None
+    for r in rels if isinstance(rels, list) else []:
+        tb = android_tag_build(r.get("tag_name"))
+        if tb and not r.get("draft") and (best is None or tb[1] > best[1][1]):
+            best = (r, tb)
+    if not best:
+        return None
+    rel, (version, build) = best
+    have = cached_apk_info()
+    if have and have.get("build", 0) >= build:
+        return have
+    tmp = os.path.join(APK_DIR, "new")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        p = subprocess.run([gh, "release", "download", rel["tag_name"], "--repo", REPO,
+                            "--pattern", "Downloader-*.apk", "--dir", tmp, "--clobber"],
+                           capture_output=True, timeout=900, creationflags=NO_WINDOW, env=clean_env())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"APK для телефона: не скачался: {e}")
+        return have
+    names = [n for n in os.listdir(tmp) if n.endswith(".apk")]
+    if p.returncode != 0 or not names:
+        log("APK для телефона: не скачался: " + p.stderr.decode("utf-8", "replace").strip()[-200:])
+        return have
+    for n in os.listdir(APK_DIR):                    # старые версии больше не нужны
+        if n.endswith(".apk"):
+            try:
+                os.remove(os.path.join(APK_DIR, n))
+            except OSError:
+                pass
+    assets = []
+    for n in names:
+        dst = os.path.join(APK_DIR, n)
+        os.replace(os.path.join(tmp, n), dst)
+        assets.append({"name": n, "size": os.path.getsize(dst), "path": dst})
+    shutil.rmtree(tmp, ignore_errors=True)
+    info = {"tag": rel["tag_name"], "build": build, "version": version, "assets": assets}
+    write_json(os.path.join(APK_DIR, "info.json"), info)
+    log(f"APK для телефона: скачана версия {version} (сборка {build}) — телефон заберёт её по Wi-Fi")
+    return info
 
 
 def load_remote():
@@ -4439,7 +4512,8 @@ class App(ctk.CTk):
 
         self.sync = sync_server.SyncServer(self.settings["sync_key"], records, file_path, thumb,
                                            on_remote, on_paired,
-                                           log=lambda t: self.events.put(("log", t)))
+                                           log=lambda t: self.events.put(("log", t)),
+                                           apk_info=cached_apk_info)
         if not self.sync.start():
             err = self.sync.error
             self.sync = None
@@ -4447,7 +4521,16 @@ class App(ctk.CTk):
             return False
         self.log(f"Синхронизация с телефоном: адрес {', '.join(sync_server.local_addresses()) or '?'}"
                  f", порт {sync_server.HTTP_PORT}")
+        self.after(15000, self._apk_tick)
         return True
+
+    def _apk_tick(self):
+        """Раз в 6 часов: свежий APK для телефона (пока включена синхронизация)."""
+        if not self.sync:
+            return
+        threading.Thread(target=refresh_android_apk,
+                         args=(lambda t: self.events.put(("log", t)),), daemon=True).start()
+        self.after(6 * 3600 * 1000, self._apk_tick)
 
     def stop_sync(self):
         if self.sync:
@@ -4663,7 +4746,11 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
         srv = sync_server.SyncServer("k" * 64, lambda: export_records(hist), ids.get,
                                      lambda i: None, lambda d, n, it: got.update(items=it),
                                      lambda d, n: got.update(paired=n), port=47714, udp_port=47715,
-                                     log=lambda t: None)
+                                     log=lambda t: None,
+                                     apk_info=lambda: {"tag": "android-v9.9.0-99", "build": 99,
+                                                       "version": "9.9.0", "assets": [
+                                                           {"name": "Downloader-arm64.apk",
+                                                            "size": 300000, "path": fpath}]})
         srv.start()
         base = "http://127.0.0.1:47714"
 
@@ -4690,6 +4777,10 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
         st5 = call("/api/history", {"device": "t1", "name": "Тест", "items": [
             {"url": "https://youtu.be/y", "title": "С телефона", "ext": "mp4", "date": 1,
              "opts": {"mode": "video", "quality": "720", "fmt": "mp4"}}]}, key=key)[0]
+        st6, apk = call("/api/apk", key=key)
+        st7, apk_data = call("/api/apk/Downloader-arm64.apk", key=key)
+        apk_ok = st6 == 200 and json.loads(apk)["build"] == 99 and st7 == 200 and apk_data == original \
+            and call("/api/apk/Downloader-armv7.apk", key=key)[0] == 404
         srv.stop()
         pc = phone_to_pc_opts({"mode": "video", "quality": "720", "fmt": "mkv"}, dict(DEFAULTS))
         ok = (bad == 403 and key == "k" * 64 and noauth == 401 and len(items) == 1 and
@@ -4697,10 +4788,11 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
                                    "playlist": False} and
               data == original and st4 == 206 and part == original[1000:] and st5 == 200 and
               got.get("items", [{}])[0].get("title") == "С телефона" and got.get("paired") == "Тест"
-              and pc["quality"] == "720p" and pc["fmt"] == "MKV" and pc["mode"] == "Видео")
+              and pc["quality"] == "720p" and pc["fmt"] == "MKV" and pc["mode"] == "Видео" and apk_ok)
         failed += 0 if ok else 1
         log(f"{'OK  ' if ok else 'FAIL'} синхронизация с телефоном: код {bad}/{st}, история {st2} "
-            f"({len(items)}), файл {st3} {len(data)} Б, докачка {st4}, с телефона {st5}")
+            f"({len(items)}), файл {st3} {len(data)} Б, докачка {st4}, с телефона {st5}, "
+            f"APK для телефона {st6}/{st7}")
     except Exception as e:
         failed += 1
         log(f"FAIL синхронизация с телефоном: {e!r}")

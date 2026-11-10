@@ -182,6 +182,8 @@ object Sync {
             status.value = "Подключено к ${s.syncName} • " +
                 SimpleDateFormat("HH:mm", Locale.ROOT).format(Date(lastOk))
             if (!quiet) Engine.message.value = "Синхронизировано с ПК: ${pcItems.value.size} файлов"
+            // дома у ПК может быть свежий APK — заодно проверяем обновление приложения
+            if (Engine.settings.value.autoUpdate) Engine.scope.launch { Updater.check(manual = false) }
             true
         } catch (e: Throwable) {
             status.value = "ПК не в сети" + if (lastOk > 0)
