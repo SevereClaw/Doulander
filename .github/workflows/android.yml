@@ -130,8 +130,8 @@ jobs:
             --title "Downloader для Android $VER (сборка ${{ github.run_number }})" \
             --notes "Скачайте **Downloader-arm64.apk** (подходит почти всем телефонам последних лет). Для старых 32-битных телефонов — Downloader-armv7.apk. Начиная с 1.1.0 приложение обновляется само (⚙ Настройки → Обновления приложения)."
 
-      # Копия APK в открытый репозиторий Doulander-Releases — телефон обновляется оттуда без токена.
-      # Нужен секрет RELEASES_TOKEN (токен с правом Contents: write на Doulander-Releases).
+      # Копия APK в открытый репозиторий Doulander-android — телефон обновляется оттуда без токена.
+      # Нужен секрет RELEASES_TOKEN (токен с правом Contents: write на Doulander-android).
       - name: Релиз в открытом репозитории (для автообновления)
         if: inputs.release && steps.selftest.outcome == 'success'
         env:
@@ -141,13 +141,25 @@ jobs:
             echo "::warning title=Открытый репозиторий::Секрет RELEASES_TOKEN не задан — APK выложен только в закрытый репозиторий (телефоны обновятся через ПК или токен)"
             exit 0
           fi
+          # пустой репозиторий — сначала README (без коммита GitHub не даёт создать релиз)
+          if [ -z "$(git ls-remote https://x:$GH_TOKEN@github.com/SevereClaw/Doulander-android.git 2>/dev/null)" ]; then
+            rm -rf pub && mkdir pub && cd pub && git init -q -b main
+            printf '%s\n' "# Downloader для Android" "" \
+              "Готовые APK приложения Downloader (скачивание видео и музыки с YouTube, VK, TikTok и 1000+ сайтов)." "" \
+              "Скачайте **Downloader-arm64.apk** из последнего релиза: https://github.com/SevereClaw/Doulander-android/releases/latest" "" \
+              "Дальше приложение обновляется само." > README.md
+            git add README.md
+            git -c user.name="github-actions" -c user.email="github-actions@users.noreply.github.com" commit -qm "README"
+            git push -q "https://x:$GH_TOKEN@github.com/SevereClaw/Doulander-android.git" main
+            cd ..
+          fi
           VER=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)
           TAG="android-v$VER-${{ github.run_number }}"
           gh release create "$TAG" apk/Downloader-arm64.apk apk/Downloader-armv7.apk \
-            --repo SevereClaw/Doulander-Releases \
+            --repo SevereClaw/Doulander-android \
             --title "Downloader для Android $VER (сборка ${{ github.run_number }})" \
             --notes "Скачайте **Downloader-arm64.apk** (подходит почти всем телефонам). Для старых 32-битных — Downloader-armv7.apk. Дальше приложение обновляется само." \
-            || echo "::warning title=Открытый репозиторий::Не удалось выложить APK в Doulander-Releases — проверьте, что репозиторий создан и у токена есть право Contents: write"
+            || echo "::warning title=Открытый репозиторий::Не удалось выложить APK в Doulander-android — проверьте, что репозиторий создан и у токена есть право Contents: write"
 
       - name: Снимки экрана в ветку screenshots-android
         if: always()

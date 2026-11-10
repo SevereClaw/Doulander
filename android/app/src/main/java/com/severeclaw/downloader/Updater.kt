@@ -20,7 +20,7 @@ import java.net.URL
 object Updater {
     const val REPO = "SevereClaw/Doulander"
     /** Открытый репозиторий только с APK — обновления без токена и без ПК. */
-    const val PUBLIC_REPO = "SevereClaw/Doulander-Releases"
+    const val PUBLIC_REPO = "SevereClaw/Doulander-android"
 
     /** Ссылка на создание токена: имя, срок «без окончания» и право «только чтение» уже заполнены. */
     const val TOKEN_URL = "https://github.com/settings/personal-access-tokens/new" +
