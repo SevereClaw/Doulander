@@ -62,7 +62,7 @@ val Heavy = TextStyle(fontWeight = FontWeight.Black, fontStyle = FontStyle.Itali
 /** Кнопка: красная (главная) или белая. */
 @Composable
 fun PButton(text: String, modifier: Modifier = Modifier, primary: Boolean = true,
-            enabled: Boolean = true, height: Dp = 44.dp, onClick: () -> Unit) {
+            enabled: Boolean = true, height: Dp = 44.dp, hPad: Dp = 18.dp, onClick: () -> Unit) {
     val bg = when {
         !enabled -> P.CARD2
         primary -> P.RED
@@ -74,7 +74,7 @@ fun PButton(text: String, modifier: Modifier = Modifier, primary: Boolean = true
             .clip(slant())
             .background(bg)
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 18.dp),
+            .padding(horizontal = hPad),
         contentAlignment = Alignment.Center,
     ) {
         Text(text.uppercase(), color = if (primary || !enabled) P.WHITE else Color.Black,

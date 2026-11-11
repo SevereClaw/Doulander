@@ -398,12 +398,14 @@ fun EditorScreen(rec: Rec, onClose: () -> Unit) {
             }
 
             // начало и конец — по месту, где сейчас стоит воспроизведение
-            Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                PButton("[ Начало здесь", Modifier.weight(1f), primary = false, height = 42.dp) {
+            Text("Обрезать по текущему месту:", color = P.MUTED, fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp))
+            Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                PButton("[ Отсюда", Modifier.weight(1f), primary = false, height = 42.dp, hPad = 8.dp) {
                     if (pos < end - 100) setStart(pos)
                 }
                 PButton(if (playing) "⏸" else "▶", height = 42.dp) { togglePlay() }
-                PButton("Конец здесь ]", Modifier.weight(1f), primary = false, height = 42.dp) {
+                PButton("Досюда ]", Modifier.weight(1f), primary = false, height = 42.dp, hPad = 8.dp) {
                     if (pos > start + 100) setEnd(pos)
                 }
             }
@@ -415,13 +417,13 @@ fun EditorScreen(rec: Rec, onClose: () -> Unit) {
                 PChip("КОНЕЦ ${Trim.clock(end)}", active == "end") { active = "end"; seek(end) }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                for ((label, step) in listOf("−1 с" to -1000L, "−0.1" to -100L, "+0.1" to 100L, "+1 с" to 1000L)) {
-                    PButton(label, Modifier.weight(1f), primary = false, height = 38.dp) {
+                for ((label, step) in listOf("−1с" to -1000L, "−0.1" to -100L, "+0.1" to 100L, "+1с" to 1000L)) {
+                    PButton(label, Modifier.weight(1f), primary = false, height = 38.dp, hPad = 4.dp) {
                         if (active == "start") { setStart(start + step); seek(start) }
                         else { setEnd(end + step); seek(end) }
                     }
                 }
-                PButton(if (zoomed) "↔" else "🔍", height = 38.dp) { zoom() }
+                PButton(if (zoomed) "↔" else "🔍", height = 38.dp, hPad = 12.dp) { zoom() }
             }
 
             // сохранение
