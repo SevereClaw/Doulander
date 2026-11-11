@@ -324,6 +324,7 @@ fun ItemCard(item: Item) {
                 item.files.firstOrNull()?.let { f ->
                     MenuItem("▶  Открыть") { menu = false; openFile(ctx, f) }
                     MenuItem("↗  Поделиться") { menu = false; shareFile(ctx, f) }
+                    MenuItem("✂  Обрезать") { menu = false; openEditor(ctx, f) }
                 }
                 MenuItem("⟳  Скачать снова как…") { menu = false; kind = "again" }
             }
@@ -354,7 +355,8 @@ fun GalleryScreen() {
             val f = File(r.file)
             val audio = r.file.substringAfterLast('.').lowercase() in AUDIO_EXT
             f.isFile && seen.add(r.file) && filter != "pc" &&
-                (filter == "all" || (filter == "audio") == audio) &&
+                (filter == "all" || (filter == "trim" && "(обрезка " in f.name) ||
+                    (filter != "trim" && (filter == "audio") == audio)) &&
                 (query.isBlank() || r.title.contains(query, true) || f.name.contains(query, true))
         }
     }
@@ -385,6 +387,7 @@ fun GalleryScreen() {
             PChip("Все", filter == "all") { filter = "all" }
             PChip("🎬 Видео", filter == "video") { filter = "video" }
             PChip("🎵 Музыка", filter == "audio") { filter = "audio" }
+            PChip("✂ Обрезки", filter == "trim") { filter = "trim" }
             if (pc.isNotEmpty() || Sync.paired) PChip("💻 С ПК", filter == "pc") { filter = "pc" }
         }
         if (all.isEmpty()) {
@@ -477,6 +480,10 @@ fun Tile(r: Rec, onChanged: () -> Unit) {
                         modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)
                             .background(P.RED).padding(horizontal = 5.dp, vertical = 1.dp))
                 }
+                // ✂ — сразу в редактор
+                Text("✂", color = P.WHITE, fontSize = 16.sp,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).background(Color(0xCC000000))
+                        .clickable { openEditor(ctx, r.file) }.padding(horizontal = 9.dp, vertical = 4.dp))
             }
             Text(r.title, color = P.WHITE, fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 2,
                 overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp))
@@ -487,6 +494,8 @@ fun Tile(r: Rec, onChanged: () -> Unit) {
         DropdownMenu(menu, { menu = false }, Modifier.background(P.CARD)) {
             DropdownMenuItem(text = { Text("▶  Открыть", color = P.WHITE) },
                 onClick = { menu = false; openFile(ctx, r.file) })
+            DropdownMenuItem(text = { Text("✂  Обрезать", color = P.WHITE) },
+                onClick = { menu = false; openEditor(ctx, r.file) })
             DropdownMenuItem(text = { Text("↗  Поделиться", color = P.WHITE) },
                 onClick = { menu = false; shareFile(ctx, r.file) })
             if (r.url.isNotEmpty()) {

@@ -708,6 +708,14 @@ object Engine {
     }
 
     // ------------------------------------------------------------------ файлы
+    /** Новая запись истории не из загрузки (обрезка из редактора). */
+    fun addToHistory(rec: Rec) {
+        synchronized(lock) { history.value = listOf(rec) + history.value }
+        Store.saveHistory(app, history.value)
+        log("Сохранено: ${File(rec.file).name}")
+        if (Sync.paired) scope.launch { Sync.sync(quiet = true) }
+    }
+
     fun deleteFile(path: String): Boolean {
         val f = File(path)
         val ok = !f.exists() || f.delete()
@@ -789,6 +797,25 @@ object Engine {
         if (!pickOk) failed++
         w("${if (pickOk) "OK  " else "FAIL"} обновления: выбор релиза ($r64)")
         YouTubeCookies.file.delete()
+        // редактор: обрезка скачанного MP4 «Быстро», «Точно» и «Только звук», звуковая волна
+        history.value.firstOrNull { it.file.endsWith(".mp4") }?.let { r ->
+            for ((name, exact, snd, ext) in listOf(
+                listOf("быстро", false, "on", "mp4"), listOf("точно", true, "on", "mp4"),
+                listOf("только звук", false, "only", "mp3"))) {
+                val (f, err) = Trim.export(r, 1000, 3000, exact as Boolean, snd as String)
+                val d = f?.let { Trim.durationMs(it) } ?: 0L
+                // «Быстро» режет по ключевым кадрам — допуск больше
+                val okLen = if (exact) d in 1800..2300 else d in 1500..4200
+                val ok = f != null && f.extension == ext && f.name.contains("(обрезка 0'01–0'03)") && okLen
+                if (!ok) failed++
+                w("${if (ok) "OK  " else "FAIL"} редактор, $name: ${f?.name} ${f?.length()} Б, " +
+                        "длительность $d мс ${err ?: ""}")
+            }
+            val wave = Trim.waveform(File(r.file))
+            val wOk = wave != null && wave.width == 1600
+            if (!wOk) failed++
+            w("${if (wOk) "OK  " else "FAIL"} редактор: звуковая волна ${wave?.width}x${wave?.height}")
+        } ?: run { failed++; w("FAIL редактор: нет MP4 для проверки") }
         // пауза и продолжение с места остановки (медленная раздача ~1,3 МБ/с)
         if (slowUrl != null) {
             synchronized(lock) { items.value = emptyList() }

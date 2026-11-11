@@ -32,6 +32,11 @@ adb exec-out screencap -p > "$OUT/android-gallery.png"
 adb shell am start -n $PKG/.MainActivity --es tab settings
 sleep 3
 adb exec-out screencap -p > "$OUT/android-settings.png"
+adb shell am start -n $PKG/.MainActivity --ez edit_latest true
+sleep 10
+adb exec-out screencap -p > "$OUT/android-editor.png"
+adb shell input keyevent KEYCODE_BACK
+sleep 1
 adb shell am start -n $PKG/.MainActivity --ez login true
 sleep 12
 adb exec-out screencap -p > "$OUT/android-login.png"

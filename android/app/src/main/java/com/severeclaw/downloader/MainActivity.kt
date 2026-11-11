@@ -75,6 +75,11 @@ class MainActivity : ComponentActivity() {
             else -> tab.value = t
         }
         if (i.getBooleanExtra("login", false)) openLogin(this)
+        // для снимка экрана на сервере сборки: редактор с последним скачанным видео
+        if (i.getBooleanExtra("edit_latest", false)) {
+            Engine.history.value.firstOrNull { it.file.endsWith(".mp4") && "(обрезка" !in it.file }
+                ?.let { openEditor(this, it.file) }
+        }
         if (i.action == Intent.ACTION_SEND) {
             val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
             tab.value = "main"
