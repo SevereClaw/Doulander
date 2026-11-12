@@ -43,6 +43,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Volatile private var resumed = false
+
+    companion object {
+        /** Приложение сейчас на экране. */
+        @Volatile var visible = false
+    }
     private var updWatch: kotlinx.coroutines.Job? = null
 
     override fun onDestroy() {
@@ -53,11 +58,13 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        visible = true
         Updater.autoInstall(this)
     }
 
     override fun onPause() {
         resumed = false
+        visible = false
         super.onPause()
     }
 

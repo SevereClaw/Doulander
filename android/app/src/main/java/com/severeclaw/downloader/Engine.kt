@@ -271,7 +271,11 @@ object Engine {
     private fun onAllDone() {
         val n = finishedInSession
         finishedInSession = 0
-        DownloadService.notifyDone(app, n, settings.value.sound)
+        val open = settings.value.openFolder
+        DownloadService.notifyDone(app, n, settings.value.sound, open)
+        // приложение на экране — папка открывается сразу; свёрнуто — по нажатию на уведомление
+        // (Android не разрешает открывать окна из фона)
+        if (open && MainActivity.visible) runCatching { app.startActivity(folderIntent()) }
     }
 
     // ------------------------------------------------------------------ yt-dlp

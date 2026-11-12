@@ -135,6 +135,7 @@ data class Settings(
     val lastYtdlpUpdate: Long = 0,
     val githubToken: String = "",        // токен только для чтения — чтобы видеть релизы закрытого репозитория
     val autoUpdate: Boolean = true,
+    val openFolder: Boolean = false,     // когда всё скачано — открыть папку
     val deviceId: String = "",           // код этого телефона для ПК
     val syncHost: String = "",           // адрес ПК, например 192.168.1.5:47614
     val syncKey: String = "",
@@ -143,6 +144,7 @@ data class Settings(
     fun toJson() = JSONObject().put("opts", opts.toJson()).put("proxy", proxy)
         .put("parallel", parallel).put("sound", sound).put("lastYtdlpUpdate", lastYtdlpUpdate)
         .put("githubToken", githubToken).put("autoUpdate", autoUpdate)
+        .put("openFolder", openFolder)
         .put("deviceId", deviceId).put("syncHost", syncHost).put("syncKey", syncKey)
         .put("syncName", syncName)
 
@@ -155,6 +157,7 @@ data class Settings(
             lastYtdlpUpdate = j.optLong("lastYtdlpUpdate"),
             githubToken = j.optString("githubToken"),
             autoUpdate = j.optBoolean("autoUpdate", true),
+            openFolder = j.optBoolean("openFolder", false),
             deviceId = j.optString("deviceId"),
             syncHost = j.optString("syncHost"),
             syncKey = j.optString("syncKey"),

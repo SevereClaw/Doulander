@@ -42,7 +42,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -395,6 +395,7 @@ DEFAULTS = {
     "check_updates": True,  # проверять обновления при запуске
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
+    "open_folder": False,   # когда всё скачано — открыть папку с выделенным файлом
     "anim": True,           # Phantom: вспышка «ГОТОВО!» по окончании
     "autostart": False,     # запускать вместе с Windows (свёрнутой в трей)
     "organize": "Не раскладывать",
@@ -2603,6 +2604,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.switch("Крестик сворачивает в трей", app.v_tray, app._save,
                     None if app.tray else "Значок в трее недоступен на этом компьютере")
         self.switch("Звук и уведомление, когда всё скачано", app.v_sound, app._toggle_sound)
+        self.switch("Открывать папку с файлом, когда всё скачано", app.v_open_folder, app._save)
         self.switch("Вспышка «ГОТОВО!», когда всё скачано", app.v_anim, app._save,
                     None if PHANTOM else "Только в оформлении Phantom")
         self.switch("Запускать вместе с Windows (свёрнутой в трей)", app.v_autostart,
@@ -2911,6 +2913,7 @@ class App(ctk.CTk):
         self.v_clip = B(value=s["clip_watch"])
         self.v_tray = B(value=s["tray"])
         self.v_sound = B(value=s["sound"])
+        self.v_open_folder = B(value=bool(s.get("open_folder")))
         self.v_anim = B(value=s["anim"])
         self.v_autostart = B(value=s["autostart"])
         self.v_check_updates = B(value=s["check_updates"])
@@ -3345,6 +3348,7 @@ class App(ctk.CTk):
                              custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
+                             open_folder=self.v_open_folder.get(),
                              anim=self.v_anim.get(),
                              chapters=self.v_chapters.get(),
                              square_cover=self.v_square.get(),
@@ -4274,6 +4278,13 @@ class App(ctk.CTk):
         self.set_main_status(msg, GREEN if ok and not fail else None)
         if ok:
             self.flash_done(f"скачано: {ok}" + (f"   не удалось: {fail}" if fail else ""))
+            if self.v_open_folder.get() and not NO_SAVE:
+                # папка открывается один раз на всю очередь, выделен последний скачанный файл
+                last = next((h.get("file") for h in self.history if h.get("file")), None)
+                if last and os.path.exists(last):
+                    self.show_in_folder(last)
+                else:
+                    self.open_folder()
         if self.v_sound.get():
             if not play_sound():
                 self.bell()

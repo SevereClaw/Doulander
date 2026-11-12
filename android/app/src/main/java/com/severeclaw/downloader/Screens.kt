@@ -344,6 +344,7 @@ fun ItemCard(item: Item) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GalleryScreen() {
+    val ctx = LocalContext.current
     val history by Engine.history.collectAsState()
     val pc by Sync.pcItems.collectAsState()
     var filter by remember { mutableStateOf("all") }
@@ -377,6 +378,7 @@ fun GalleryScreen() {
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             PTitle(R.drawable.t_gallery)
+            Text("  📂", fontSize = 20.sp, modifier = Modifier.clickable { openFolder(ctx) }.padding(6.dp))
             Spacer(Modifier.weight(1f))
             Text("Файлов: ${files.size}  •  ${humanSize(files.sumOf { File(it.file).length() }) ?: "0 Б"}" +
                     if (fromPc.isNotEmpty()) "\n💻 на ПК: ${fromPc.size}" else "",
@@ -555,6 +557,15 @@ fun SettingsScreen() {
                 colors = SwitchDefaults.colors(checkedTrackColor = P.RED, checkedThumbColor = P.WHITE))
             Text("  Звук из Persona 5, когда всё скачано", color = P.WHITE, fontSize = 13.sp)
         }
+
+        PLabel("После скачивания")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(s.openFolder, { Engine.saveSettings(s.copy(openFolder = it)) },
+                colors = SwitchDefaults.colors(checkedTrackColor = P.RED, checkedThumbColor = P.WHITE))
+            Text("  Открывать папку, когда всё скачано", color = P.WHITE, fontSize = 13.sp)
+        }
+        Text("Если приложение свёрнуто, папка откроется по нажатию на уведомление «ГОТОВО!».",
+            color = P.MUTED, fontSize = 12.sp)
 
         PLabel("Прокси")
         PField(proxy, { proxy = it }, "socks5://127.0.0.1:10808", Modifier.fillMaxWidth(),
@@ -776,6 +787,24 @@ fun MenuItem(text: String, onClick: () -> Unit) {
 }
 
 // =================================================================== файлы
+/** Папка «Загрузки/Downloader» в системном приложении «Файлы». */
+fun folderIntent(): Intent {
+    val rel = Engine.downloadDir.absolutePath.substringAfter("/storage/emulated/0/", "Download/Downloader")
+    val uri = android.provider.DocumentsContract.buildDocumentUri(
+        "com.android.externalstorage.documents", "primary:$rel")
+    return Intent(Intent.ACTION_VIEW).setDataAndType(uri, "vnd.android.document/directory")
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+}
+
+fun openFolder(ctx: Context) {
+    Engine.downloadDir.mkdirs()
+    runCatching { ctx.startActivity(folderIntent()) }.recoverCatching {
+        // на некоторых телефонах «Файлы» не открывают папку по адресу — тогда список загрузок
+        ctx.startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.onFailure { Engine.message.value = "Не нашлось приложения «Файлы»" }
+}
+
 fun mimeOf(path: String): String =
     MimeTypeMap.getSingleton().getMimeTypeFromExtension(path.substringAfterLast('.').lowercase())
         ?: if (path.substringAfterLast('.').lowercase() in AUDIO_EXT) "audio/*" else "video/*"

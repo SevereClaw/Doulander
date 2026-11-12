@@ -152,7 +152,9 @@ class DownloadService : Service() {
             runCatching { NotificationManagerCompat.from(c).notify(ID_UPDATE, nt) }
         }
 
-        fun notifyDone(c: Context, n: Int, sound: Boolean) {
+        fun notifyDone(c: Context, n: Int, sound: Boolean, openFolder: Boolean = false) {
+            val folder = PendingIntent.getActivity(c, 7, folderIntent(),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val nt = NotificationCompat.Builder(c, if (sound) CH_DONE else CH_DONE_SILENT)
                 .setSmallIcon(R.drawable.ic_stat)
                 .setColor(0xFFE60012.toInt())
@@ -160,7 +162,8 @@ class DownloadService : Service() {
                 .setContentText(if (n == 1) "Файл скачан — Загрузки/Downloader"
                                 else "Скачано файлов: $n — Загрузки/Downloader")
                 .setAutoCancel(true)
-                .setContentIntent(openApp(c, "gallery"))
+                .setContentIntent(if (openFolder) folder else openApp(c, "gallery"))
+                .addAction(0, "📂 Папка", folder)
                 .build()
             runCatching { NotificationManagerCompat.from(c).notify(ID_DONE, nt) }
         }
