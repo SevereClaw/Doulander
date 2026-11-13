@@ -43,7 +43,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.19.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -397,7 +397,7 @@ DEFAULTS = {
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
     "search_pick": True,    # название вместо ссылки — показать результаты поиска на выбор
-    "open_folder": False,   # когда всё скачано — открыть папку с выделенным файлом
+    "open_after": True,     # когда всё скачано — открыть папку с выделенным файлом
     "anim": True,           # Phantom: вспышка «ГОТОВО!» по окончании
     "autostart": False,     # запускать вместе с Windows (свёрнутой в трей)
     "organize": "Не раскладывать",
@@ -546,6 +546,39 @@ def load_queue():
         return data if isinstance(data, list) else []
     except (OSError, ValueError):
         return []
+
+
+def reveal_in_explorer(path):
+    """Открывает папку в Проводнике и выделяет в ней файл. Правда — получилось."""
+    path = os.path.normpath(os.path.abspath(path))
+    if os.name != "nt":
+        return False
+    try:
+        # способ самого Проводника: работает с любыми именами (запятые, пробелы, скобки)
+        # и выводит уже открытое окно этой папки вперёд
+        import ctypes
+        shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                       ctypes.c_void_p, ctypes.c_ulong]
+        pidl = shell32.ILCreateFromPathW(path)
+        if pidl:
+            try:
+                if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                    return True
+            finally:
+                shell32.ILFree(pidl)
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(f'explorer /select,"{path}"')
+        return True
+    except OSError:
+        return False
 
 
 def normalize_proxy(text):
@@ -3182,7 +3215,7 @@ class App(ctk.CTk):
         self.v_clip = B(value=s["clip_watch"])
         self.v_tray = B(value=s["tray"])
         self.v_sound = B(value=s["sound"])
-        self.v_open_folder = B(value=bool(s.get("open_folder")))
+        self.v_open_folder = B(value=bool(s.get("open_after", True)))
         self.v_search_pick = B(value=bool(s.get("search_pick", True)))
         self.v_anim = B(value=s["anim"])
         self.v_autostart = B(value=s["autostart"])
@@ -3618,7 +3651,7 @@ class App(ctk.CTk):
                              custom_template=self.v_custom.get(),
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
-                             open_folder=self.v_open_folder.get(),
+                             open_after=self.v_open_folder.get(),
                              search_pick=self.v_search_pick.get(),
                              anim=self.v_anim.get(),
                              chapters=self.v_chapters.get(),
@@ -3669,8 +3702,9 @@ class App(ctk.CTk):
         os.startfile(self.settings["folder"])
 
     def show_in_folder(self, path):
-        if os.path.exists(path):
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        if path and os.path.exists(path):
+            if not reveal_in_explorer(path):
+                self.open_folder()
         else:
             self.open_folder()
 
@@ -5002,6 +5036,14 @@ def selftest(url, out_dir, page_url=None, proxy_url=None):
     log(f"      запуск yt-dlp --version: {time.time() - t0:.2f} с ({ver})")
     log(f"ffmpeg: {FFMPEG or 'НЕТ'}")
     log(f"deno:   {DENO or 'НЕТ'}")
+    try:
+        probe = os.path.join(out_dir, "папка, файл (проверка).txt")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        log("      открытие папки с выделенным файлом: " +
+            ("получилось" if reveal_in_explorer(probe) else "НЕ получилось"))
+    except Exception as e:
+        log(f"      открытие папки с выделенным файлом: ошибка {e}")
     for name, ok in (("yt-dlp", os.path.isfile(YTDLP)), ("ffmpeg", FFMPEG), ("deno", DENO)):
         if not ok:
             failed += 1
