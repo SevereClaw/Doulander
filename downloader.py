@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from tkinter import filedialog, messagebox
+from tkinter import font as tkfont
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw
@@ -42,7 +43,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.19.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -395,6 +396,7 @@ DEFAULTS = {
     "check_updates": True,  # проверять обновления при запуске
     "tray": True,           # крестик сворачивает в трей
     "sound": True,          # звук и уведомление по окончании
+    "search_pick": True,    # название вместо ссылки — показать результаты поиска на выбор
     "open_folder": False,   # когда всё скачано — открыть папку с выделенным файлом
     "anim": True,           # Phantom: вспышка «ГОТОВО!» по окончании
     "autostart": False,     # запускать вместе с Windows (свёрнутой в трей)
@@ -557,6 +559,55 @@ def normalize_proxy(text):
 
 
 SEARCH_PREFIX = "ytsearch1:"          # первый результат поиска на YouTube
+SEARCH_RESULTS = 12                   # сколько результатов показывать на выбор
+
+
+def search_command(query, opts=None, count=SEARCH_RESULTS):
+    """Команда: список результатов поиска на YouTube (быстро, без разбора каждого видео)."""
+    return [YTDLP, f"ytsearch{count}:{query}", "-J", "--flat-playlist", "--no-warnings",
+            "--socket-timeout", "15", "--extractor-retries", "3"] + common_args(opts)
+
+
+def search_entries(info):
+    """Ответ yt-dlp на поиск -> список {url, title, meta, thumb}."""
+    result = []
+    for e in (info or {}).get("entries") or []:
+        if not e or not (e.get("id") or e.get("url")):
+            continue
+        url = e.get("webpage_url") or e.get("url") or ""
+        if not url.startswith("http"):
+            url = f"https://www.youtube.com/watch?v={e.get('id')}"
+        views = e.get("view_count")
+        parts = [e.get("channel") or e.get("uploader"), human_duration(e.get("duration")),
+                 human_views(views) if views else None]
+        thumb = pick_thumbnail(e)
+        if not thumb and e.get("id"):
+            thumb = f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg"
+        result.append({"url": url, "title": e.get("title") or url,
+                       "meta": "   •   ".join(x for x in parts if x), "thumb": thumb})
+    return result
+
+
+def human_views(n):
+    for limit, unit in ((10 ** 9, "млрд"), (10 ** 6, "млн"), (10 ** 3, "тыс.")):
+        if n >= limit:
+            text = f"{n / limit:.1f}".rstrip("0").rstrip(".").replace(".", ",")
+            return f"{text} {unit} просмотров"
+    return f"{n} просмотров"
+
+
+def elide(text, fits):
+    """Самое длинное начало текста (с «…»), для которого fits(строка) — правда."""
+    if fits(text):
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(text[:mid].rstrip() + "…"):
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo].rstrip() + "…"
 
 
 def is_search(url):
@@ -1533,6 +1584,10 @@ class QueueItem(ctk.CTkFrame):
         self.title_lbl = ctk.CTkLabel(self, text=display_url(url), anchor="w",
                                       font=ctk.CTkFont(size=13, weight="bold"))
         self.title_lbl.grid(row=0, column=1, sticky="ew", pady=(8, 0))
+        self.query = url.split(":", 1)[1] if is_search(url) else None   # что искали
+        self._title_text = display_url(url)
+        self._title_fit = None
+        tk.Misc.bind(self.title_lbl, "<Configure>", lambda e: self.fit_title(), add="+")
 
         self.meta_lbl = ctk.CTkLabel(self, text="Получаю информацию…", anchor="w",
                                      text_color=GRAY_TEXT, font=ctk.CTkFont(size=12))
@@ -1569,7 +1624,31 @@ class QueueItem(ctk.CTkFrame):
     def set_title(self, text):
         if text:
             self.full_title = text
-            self.title_lbl.configure(text=text if len(text) < 64 else text[:61] + "…")
+            self._title_text = text
+            self.fit_title()
+
+    def fit_title(self):
+        """Название занимает всю ширину карточки; не влезло — обрезается с «…»."""
+        try:
+            label = self.title_lbl._label
+            width = self.title_lbl.winfo_width()
+            font_name = str(label.cget("font"))
+        except (AttributeError, tk.TclError):
+            return
+        text = self._title_text
+        if width <= 1:                       # карточка ещё не нарисована
+            width = 10 ** 6 if len(text) < 64 else 0
+        key = (text, width, font_name)
+        if key == self._title_fit:
+            return
+        self._title_fit = key
+        if width == 0:
+            shown = text[:61] + "…"
+        else:
+            font = tkfont.Font(root=label, font=font_name)
+            shown = elide(text, lambda t: font.measure(t) <= width - 12)
+        if label.cget("text") != shown:
+            self.title_lbl.configure(text=shown)
 
     def set_meta(self, text, color=None):
         self.meta_lbl.configure(text=text, text_color=color or GRAY_TEXT)
@@ -1693,6 +1772,9 @@ class QueueItem(ctk.CTkFrame):
             add_kind_menu(again, self.opts, self.redownload)
             m.add_cascade(label="⟳  Скачать снова как…", menu=again)
         m.add_command(label="🔗  Копировать ссылку", command=self.copy_url)
+        if self.query:
+            m.add_command(label="🔍  Другие результаты поиска…",
+                          command=lambda: self.app.open_search(self.query, replace=self))
         m.add_separator()
         m.add_command(label="Убрать из списка", state="disabled" if self.st == "run" else "normal",
                       command=lambda: self.app.remove_item(self))
@@ -2520,6 +2602,189 @@ class FormatPicker(ctk.CTkToplevel):
         self.destroy()
 
 
+# ================================================================ окно «Результаты поиска»
+class SearchPicker(ctk.CTkToplevel):
+    """Название вместо ссылки: результаты поиска на YouTube, клик — в очередь."""
+    TW, TH = 112, 63
+
+    def __init__(self, app, query, replace=None, start=False):
+        super().__init__(app)
+        self.app, self.replace, self.start_after = app, replace, start
+        self.gen = 0                     # номер поиска: ответы старых поисков не показываем
+        self.images = []
+        self.title("Результаты поиска")
+        self.geometry("720x600")
+        self.minsize(480, 340)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        title_widget(self, caps("Что скачать?"), 16).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        top.grid_columnconfigure(0, weight=1)
+        self.entry = ctk.CTkEntry(top, height=36, font=ctk.CTkFont(size=14),
+                                  placeholder_text="Название песни или видео")
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.entry.insert(0, query)
+        self.entry.bind("<Return>", lambda e: self.search())
+        ctk.CTkButton(top, text="🔍  Найти", width=110, height=36, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, command=self.search).grid(
+            row=0, column=1, padx=(8, 0))
+        self.list = ctk.CTkScrollableFrame(self, corner_radius=R(12))
+        self.list.grid(row=2, column=0, sticky="nsew", padx=16)
+        self.list.grid_columnconfigure(0, weight=1)
+        self.hint = ctk.CTkLabel(self, anchor="w", text_color=GRAY_TEXT, text="")
+        self.hint.grid(row=3, column=0, sticky="ew", padx=18, pady=10)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.after(150, self.lift)
+        self.after(200, self.entry.focus_set)
+        self.search()
+
+    def message(self, text, color=None):
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.images = []
+        ctk.CTkLabel(self.list, text=text, text_color=color or GRAY_TEXT, wraplength=560,
+                     justify="left", anchor="w").grid(row=0, column=0, sticky="ew",
+                                                      padx=12, pady=16)
+
+    def search(self):
+        query = self.entry.get().strip()
+        if not query:
+            return
+        self.gen += 1
+        self.message("Ищу на YouTube…")
+        self.hint.configure(text="")
+        threading.Thread(target=self._search, args=(query, self.gen), daemon=True).start()
+
+    def _search(self, query, gen):
+        app = self.app
+        while app._tools_busy:                  # yt-dlp как раз обновляется — подождём
+            time.sleep(0.5)
+        proxy = app.proxy_for(SEARCH_PREFIX)
+        opts = {"cookies": app.cookie_args(), "proxy_url": proxy}
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        info, err = None, ""
+        for attempt in range(1, NET_ATTEMPTS + 1):
+            try:
+                p = subprocess.run(search_command(query, opts), capture_output=True,
+                                   cwd=BASE_DIR, env=env, timeout=90, creationflags=NO_WINDOW)
+                info = json.loads(p.stdout.decode("utf-8", "replace") or "null")
+                lines = [ln for ln in ANSI.sub("", p.stderr.decode("utf-8", "replace"))
+                         .splitlines() if ln.startswith("ERROR")]
+                err = lines[-1].replace("ERROR:", "").strip() if lines else ""
+            except subprocess.TimeoutExpired:
+                err = "timed out"
+            except (OSError, ValueError) as e:
+                err = str(e)
+            if info or not is_net_error(err):
+                break
+            time.sleep(2 * attempt)
+        results = search_entries(info)
+        if not results and err:
+            app.events.put(("log", f"Поиск «{query}»: {err}"))
+        app.events.put(("call", lambda: self._show(query, gen, results, err, proxy)))
+
+    def _show(self, query, gen, results, err, proxy):
+        if not self.winfo_exists() or gen != self.gen:
+            return
+        if not results:
+            text = (explain_error(err, 1, SEARCH_PREFIX + query, proxy, None) if err
+                    else "Ничего не найдено по этому запросу")
+            self.message(text, ACCENT)
+            return
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.images = []
+        thumbs = []
+        for n, r in enumerate(results):
+            thumbs.append((self._row(n, r), r["thumb"]))
+        self.hint.configure(text="Клик — добавить в очередь.   Ctrl+клик — добавить и "
+                                 "выбрать ещё.")
+        threading.Thread(target=self._load_thumbs, args=(gen, thumbs, proxy),
+                         daemon=True).start()
+
+    def _row(self, n, r):
+        row = ctk.CTkFrame(self.list, corner_radius=R(8), fg_color=C.CARD,
+                           border_width=2, border_color=C.CARD)
+        row.grid(row=n, column=0, sticky="ew", pady=3, padx=2)
+        row.grid_columnconfigure(1, weight=1)
+        thumb = ctk.CTkLabel(row, text="", width=self.TW, height=self.TH,
+                             corner_radius=R(6), fg_color=C.BADGE)
+        thumb.grid(row=0, column=0, rowspan=2, padx=(8, 12), pady=8)
+        name = ctk.CTkLabel(row, text=r["title"], anchor="w", justify="left", wraplength=480,
+                            font=ctk.CTkFont(size=13, weight="bold"))
+        name.grid(row=0, column=1, sticky="sew", padx=(0, 10), pady=(8, 0))
+        meta = ctk.CTkLabel(row, text=r["meta"] or "—", anchor="w", text_color=GRAY_TEXT,
+                            font=ctk.CTkFont(size=12))
+        meta.grid(row=1, column=1, sticky="new", padx=(0, 10), pady=(0, 8))
+        # длинное название переносится по ширине окна
+        row.bind("<Configure>", lambda e, lbl=name, t=thumb: lbl.configure(
+            wraplength=max(120, int((e.width - t.winfo_width()) / lbl._get_widget_scaling())
+                           - 40)), add="+")
+        stack = [row]
+        while stack:
+            w = stack.pop()
+            try:
+                tk.Misc.bind(w, "<Button-1>", lambda e, r=r, row=row: self.pick(r, row, e),
+                             add="+")
+                tk.Misc.bind(w, "<Enter>", lambda e, row=row: row.winfo_exists() and
+                             row.configure(border_color=ACCENT), add="+")
+                tk.Misc.bind(w, "<Leave>", lambda e, row=row: row.winfo_exists() and
+                             row.configure(border_color=C.CARD), add="+")
+                w.configure(cursor="hand2")
+            except (tk.TclError, ValueError, NotImplementedError):
+                pass
+            stack.extend(w.winfo_children())
+        row.meta = meta
+        return thumb
+
+    def _load_thumbs(self, gen, thumbs, proxy):
+        for label, url in thumbs:
+            if gen != self.gen:
+                return
+            if not url:
+                continue
+            try:
+                img = load_thumbnail(url, self.app.proxy_for(url) or proxy)
+            except Exception:
+                continue
+            self.app.events.put(("call", lambda label=label, img=img: self._set_thumb(
+                gen, label, img)))
+
+    def _set_thumb(self, gen, label, img):
+        if gen != self.gen or not self.winfo_exists() or not label.winfo_exists():
+            return
+        cimg = ctk.CTkImage(light_image=img, dark_image=img, size=(self.TW, self.TH))
+        self.images.append(cimg)
+        label.configure(image=cimg, fg_color="transparent")
+
+    def pick(self, r, row, event=None):
+        app = self.app
+        opts = None
+        old = self.replace
+        if old is not None and old in app.items and old.st in ("wait", "paused", "error"):
+            # заменяем прежний результат в очереди — с теми же настройками загрузки
+            opts = dict(old.opts)
+            opts.pop("format_id", None)
+            opts.pop("format_label", None)
+            app.remove_item(old)
+        self.replace = None
+        item = app.add_item(r["url"], opts)
+        if not item:
+            return
+        keep = bool(event is not None and event.state & 0x4)        # Ctrl — выбрать ещё
+        if self.start_after:
+            self.start_after = False
+            app.start()
+        if keep:
+            row.meta.configure(text="✓ Добавлено в очередь", text_color=GREEN)
+        else:
+            self.destroy()
+
+
 # ================================================================ окно «Список»
 class BulkWindow(ctk.CTkToplevel):
     """Большое поле: сразу много ссылок или названий песен, по одному на строку."""
@@ -2537,7 +2802,8 @@ class BulkWindow(ctk.CTkToplevel):
         ctk.CTkLabel(self, anchor="w", justify="left", text_color=GRAY_TEXT,
                      text="По одной на строку: ссылка или название песни.\n"
                           "Например: «Король и Шут — Лесник». Названия ищутся на YouTube, "
-                          "берётся первый результат.").grid(
+                          "берётся первый результат\n"
+                          "(другой — правой кнопкой по ссылке в очереди).").grid(
             row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
         self.text = ctk.CTkTextbox(self, corner_radius=R(10), font=ctk.CTkFont(size=14))
         self.text.grid(row=1, column=0, sticky="nsew", padx=16)
@@ -2601,6 +2867,9 @@ class SettingsWindow(ctk.CTkToplevel):
         self.switch("Тёмная тема", app.v_theme, app.toggle_theme,
                     "В оформлении Phantom тема всегда тёмная" if PHANTOM else None)
         self.switch("Ловить ссылки из буфера обмена", app.v_clip, app.toggle_clip_watch)
+        self.switch("Поиск по названию: показывать результаты на выбор", app.v_search_pick,
+                    app._save)
+        self.hint("Выключено — сразу берётся первый результат поиска на YouTube")
         self.switch("Крестик сворачивает в трей", app.v_tray, app._save,
                     None if app.tray else "Значок в трее недоступен на этом компьютере")
         self.switch("Звук и уведомление, когда всё скачано", app.v_sound, app._toggle_sound)
@@ -2914,6 +3183,7 @@ class App(ctk.CTk):
         self.v_tray = B(value=s["tray"])
         self.v_sound = B(value=s["sound"])
         self.v_open_folder = B(value=bool(s.get("open_folder")))
+        self.v_search_pick = B(value=bool(s.get("search_pick", True)))
         self.v_anim = B(value=s["anim"])
         self.v_autostart = B(value=s["autostart"])
         self.v_check_updates = B(value=s["check_updates"])
@@ -3349,6 +3619,7 @@ class App(ctk.CTk):
                              exact_cut=self.v_exact.get(), tray=self.v_tray.get(),
                              sound=self.v_sound.get(), sponsorblock=self.v_sponsor.get(),
                              open_folder=self.v_open_folder.get(),
+                             search_pick=self.v_search_pick.get(),
                              anim=self.v_anim.get(),
                              chapters=self.v_chapters.get(),
                              square_cover=self.v_square.get(),
@@ -3418,8 +3689,15 @@ class App(ctk.CTk):
             self.url_entry.delete(0, "end")
             self.url_entry.insert(0, text)
 
-    def add_from_entry(self):
-        added = self.add_many(self.url_entry.get())
+    def add_from_entry(self, start=False):
+        text = self.url_entry.get()
+        items = parse_input(text)
+        if len(items) == 1 and is_search(items[0]) and self.v_search_pick.get():
+            # название вместо ссылки — показываем результаты поиска на выбор
+            self.url_entry.delete(0, "end")
+            self.open_search(items[0].split(":", 1)[1], start=start)
+            return 0
+        added = self.add_many(text)
         if added:
             self.url_entry.delete(0, "end")
             self._last_clip = self._read_clipboard()   # чтобы перехват не добавил её ещё раз
@@ -3499,6 +3777,11 @@ class App(ctk.CTk):
         if getattr(self, "picker_win", None) and self.picker_win.winfo_exists():
             self.picker_win.destroy()
         self.picker_win = FormatPicker(self, item)
+
+    def open_search(self, query, replace=None, start=False):
+        if getattr(self, "search_win", None) and self.search_win.winfo_exists():
+            self.search_win.destroy()
+        self.search_win = SearchPicker(self, query, replace, start)
 
     def open_bulk(self):
         if getattr(self, "bulk_win", None) and self.bulk_win.winfo_exists():
@@ -3701,7 +3984,7 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ скачивание
     def start(self):
-        self.add_from_entry()
+        self.add_from_entry(start=True)
         if self.workers_alive:
             return
         if self._tools_busy:                 # как раз обновляется yt-dlp — подождём
@@ -3718,7 +4001,8 @@ class App(ctk.CTk):
                 item.set_status("В очереди")
         waiting = [i for i in self.items if i.st == "wait"]
         if not waiting:
-            self.set_main_status("Добавьте хотя бы одну ссылку")
+            if not (getattr(self, "search_win", None) and self.search_win.winfo_exists()):
+                self.set_main_status("Добавьте хотя бы одну ссылку")
             return
         for item in self.items:
             item.batch = item.st == "wait"
