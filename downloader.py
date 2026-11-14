@@ -23,6 +23,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import zipfile
 from tkinter import filedialog, messagebox
 from tkinter import font as tkfont
@@ -43,7 +44,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.19.1"
+APP_VERSION = "1.20.0"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -930,6 +931,243 @@ def notify_running_instance(args):
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------- обновление программы
+APP_ZIP = "Downloader-app.zip"                      # файл программы в релизе GitHub
+RELEASES_API = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
+RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
+UPDATE_DIR = os.path.join(BASE_DIR, "_update")      # сюда распаковывается новая версия
+
+
+def version_tuple(text):
+    m = re.match(r"v?(\d+)\.(\d+)(?:\.(\d+))?$", (text or "").strip())
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def release_notes(body):
+    """Раздел «Что нового» из описания релиза."""
+    m = re.search(r"^##\s*Что нового\s*$(.*?)(?=^##\s|\Z)", body or "", re.S | re.M)
+    return m.group(1).strip() if m else ""
+
+
+def pick_release(releases):
+    """Самый новый релиз программы для ПК (релизы для телефона пропускаются)."""
+    best = None
+    for r in releases if isinstance(releases, list) else []:
+        v = version_tuple(r.get("tag_name"))
+        if not v or r.get("draft") or r.get("prerelease"):
+            continue
+        if best is not None and v <= best["v"]:
+            continue
+        asset = next((a for a in r.get("assets") or [] if a.get("name") == APP_ZIP), {})
+        y, mth, d = ((r.get("published_at") or "")[:10].split("-") + ["", ""])[:3]
+        best = {"v": v, "version": ".".join(map(str, v)), "tag": r.get("tag_name"),
+                "date": f"{d}.{mth}.{y}" if d else "", "notes": release_notes(r.get("body")),
+                "url": asset.get("browser_download_url"), "size": asset.get("size") or 0,
+                "page": r.get("html_url") or RELEASES_PAGE}
+    return best
+
+
+def fetch_release(proxy=None):
+    req = urllib.request.Request(RELEASES_API, headers={
+        "User-Agent": "Downloader", "Accept": "application/vnd.github+json"})
+    with url_opener(proxy).open(req, timeout=20) as r:
+        return pick_release(json.loads(r.read().decode("utf-8", "replace")))
+
+
+class UpdateCancelled(Exception):
+    pass
+
+
+def download_update(url, dest, size=0, proxy=None, progress=None, cancelled=lambda: False):
+    """Скачивает архив новой версии; progress(скачано, всего)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Downloader"})
+    with url_opener(proxy).open(req, timeout=30) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0) or size
+        done = 0
+        while True:
+            if cancelled():
+                raise UpdateCancelled()
+            chunk = r.read(1024 * 128)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+    if (total and done != total) or not zipfile.is_zipfile(dest):
+        raise OSError("файл обновления скачался не полностью")
+
+
+def prepare_update(zip_path):
+    """Распаковывает новую версию в _update рядом с программой. Возвращает её папку."""
+    shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(UPDATE_DIR)
+    root = UPDATE_DIR
+    if not os.path.isfile(os.path.join(root, "Downloader.exe")):
+        inner = [os.path.join(root, n) for n in os.listdir(root)]
+        if len(inner) == 1 and os.path.isdir(inner[0]):
+            root = inner[0]
+    if not os.path.isfile(os.path.join(root, "Downloader.exe")) or \
+            not os.path.isdir(os.path.join(root, "_internal")):
+        raise OSError("в архиве обновления нет программы")
+    return root
+
+
+def launch_updater(root, ping=None):
+    """Запускает новую версию из _update: она дождётся закрытия этой копии, поставит себя
+    на её место и откроет программу заново."""
+    args = [os.path.join(root, "Downloader.exe"), "--apply-update", BASE_DIR, str(os.getpid())]
+    subprocess.Popen(args + ([ping] if ping else []), cwd=root, env=clean_env())
+
+
+def _retry(action, tries=40, pause=0.5):
+    for n in range(tries):
+        try:
+            return action()
+        except OSError:
+            if n == tries - 1:
+                raise
+            time.sleep(pause)
+
+
+def wait_unlocked(path, timeout=40, pid=0):
+    """Ждёт, пока старая копия программы закроется и отпустит свой exe."""
+    start = time.time()
+    killed = False
+    while os.path.isfile(path):
+        try:
+            with open(path, "r+b"):
+                return
+        except OSError:
+            pass
+        waited = time.time() - start
+        if waited > timeout:
+            raise OSError("программа не закрылась — закройте Downloader и повторите")
+        if waited > 15 and pid and not killed and os.name == "nt":
+            killed = True                      # зависла при закрытии — завершаем
+            subprocess.run(["taskkill", "/pid", str(pid), "/f"], capture_output=True,
+                           creationflags=NO_WINDOW)
+        time.sleep(0.3)
+
+
+def mirror_dir(src, dst):
+    """Делает dst точной копией src: новые файлы заменяют старые, лишние удаляются."""
+    keep = set()
+    for folder, dirs, files in os.walk(src):
+        rel = os.path.relpath(folder, src)
+        out = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(out, exist_ok=True)
+        keep.add(os.path.normcase(os.path.abspath(out)))
+        for name in files:
+            target = os.path.join(out, name)
+            keep.add(os.path.normcase(os.path.abspath(target)))
+            _retry(lambda s=os.path.join(folder, name), t=target: shutil.copy2(s, t))
+    for folder, dirs, files in os.walk(dst, topdown=False):
+        for name in files:
+            path = os.path.join(folder, name)
+            if os.path.normcase(os.path.abspath(path)) not in keep:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        if os.path.normcase(os.path.abspath(folder)) not in keep:
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+
+
+def copy_update(src, target, pid=0):
+    """Ставит новую версию из src поверх программы в target (настройки и загрузки не трогает)."""
+    wait_unlocked(os.path.join(target, "Downloader.exe"), pid=pid)
+    mirror_dir(os.path.join(src, "_internal"), os.path.join(target, "_internal"))
+    for name in os.listdir(src):
+        path = os.path.join(src, name)
+        if os.path.isfile(path):
+            _retry(lambda p=path, n=name: shutil.copy2(p, os.path.join(target, n)))
+
+
+def apply_update(target, pid=0, ping=None):
+    """Downloader.exe --apply-update ПАПКА PID — работает новая версия, запущенная из _update:
+    показывает маленькое окно, заменяет файлы программы и открывает её заново."""
+    src = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
+    result = {}
+
+    def work():
+        try:
+            copy_update(src, target, pid)
+            result["ok"] = True
+        except Exception as e:
+            result["error"] = str(e)
+
+    try:
+        win = tk.Tk()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        w, h = 460, 120
+        win.geometry(f"{w}x{h}+{(win.winfo_screenwidth() - w) // 2}"
+                     f"+{(win.winfo_screenheight() - h) // 2}")
+        win.configure(bg="#0D0D0D", highlightthickness=2, highlightbackground="#E60012")
+        tk.Label(win, text=f"Устанавливаю Downloader {APP_VERSION}…", bg="#0D0D0D", fg="#FFFFFF",
+                 font=("Segoe UI", 14, "bold")).pack(pady=(24, 4))
+        tk.Label(win, text="Программа откроется сама через несколько секунд", bg="#0D0D0D",
+                 fg="#A0A0A0", font=("Segoe UI", 10)).pack()
+        bar = tk.Canvas(win, height=6, bg="#2A2A2A", highlightthickness=0)
+        bar.pack(fill="x", side="bottom")
+        runner = bar.create_rectangle(0, 0, 110, 6, fill="#E60012", width=0)
+        pos = [0]
+
+        def tick():
+            if result:
+                win.destroy()
+                return
+            pos[0] = (pos[0] + 12) % (w + 110)
+            bar.coords(runner, pos[0] - 110, 0, pos[0], 6)
+            win.after(30, tick)
+
+        threading.Thread(target=work, daemon=True).start()
+        win.after(30, tick)
+        win.mainloop()
+    except tk.TclError:
+        work()
+    if not result:                                   # окно закрыли раньше времени
+        work()
+    exe = os.path.join(target, "Downloader.exe")
+    if result.get("ok"):
+        args = ["--ping", ping] if ping else ["--restart", "--updated"]
+        subprocess.Popen([exe] + args, cwd=target, env=clean_env())
+        return 0
+    if not ping:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Обновление Downloader",
+                "Не получилось установить обновление:\n" + result.get("error", "") +
+                "\n\nСкачайте установщик DownloaderSetup.exe со страницы:\n" + RELEASES_PAGE)
+            root.destroy()
+        except tk.TclError:
+            pass
+        if os.path.isfile(exe):
+            subprocess.Popen([exe, "--restart"], cwd=target, env=clean_env())
+    return 1
+
+
+def cleanup_update_dir():
+    """После обновления убирает папку _update (её ещё может держать установщик — ждём)."""
+    if not os.path.isdir(UPDATE_DIR):
+        return
+
+    def run():
+        for _ in range(20):
+            shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+            if not os.path.isdir(UPDATE_DIR):
+                return
+            time.sleep(1)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def restart_program(app):
@@ -2818,6 +3056,164 @@ class SearchPicker(ctk.CTkToplevel):
             self.destroy()
 
 
+# ================================================================ окно «Обновление»
+class UpdateWindow(ctk.CTkToplevel):
+    """Новая версия: что изменилось, скачивание с полосой и установка — всё в программе."""
+
+    def __init__(self, app, rel):
+        super().__init__(app)
+        self.app, self.rel = app, rel
+        self.busy = False
+        self.stop = False
+        self.title("Обновление Downloader")
+        self.geometry("560x480")
+        self.minsize(460, 380)
+        if os.path.isfile(ICON_ICO):
+            self.after(250, lambda: self.iconbitmap(ICON_ICO))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        title_widget(self, caps("Доступно обновление"), 16).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+        parts = [f"Версия {APP_VERSION}  →  {rel['version']}"]
+        if rel.get("date"):
+            parts.append("от " + rel["date"])
+        if rel.get("size"):
+            parts.append(human_size(rel["size"]))
+        ctk.CTkLabel(self, text="   •   ".join(parts), anchor="w",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
+        self.notes = ctk.CTkTextbox(self, corner_radius=R(10), wrap="word",
+                                    font=ctk.CTkFont(size=13))
+        self.notes.grid(row=2, column=0, sticky="nsew", padx=16)
+        self.notes.insert("1.0", "Что нового\n\n" + (rel.get("notes") or
+                                                      "Исправления и улучшения."))
+        self.notes.configure(state="disabled")
+        self.status = ctk.CTkLabel(self, anchor="w", justify="left", text_color=GRAY_TEXT,
+                                   wraplength=520,
+                                   text="Очередь, история и настройки сохранятся. "
+                                        "Программа закроется на несколько секунд и откроется сама.")
+        self.status.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 4))
+        self.bar = ctk.CTkProgressBar(self, height=10, progress_color=ACCENT)
+        self.bar.set(0)
+        self.bar.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 4))
+        self.bar.grid_remove()
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=5, column=0, sticky="e", padx=16, pady=(6, 14))
+        self.later_btn = ctk.CTkButton(btns, text="Позже", width=110, height=38,
+                                       fg_color=C.BTN2, hover_color=C.BTN2_HOVER,
+                                       text_color=C.BTN2_TEXT, command=self.close)
+        self.later_btn.grid(row=0, column=0, padx=(0, 8))
+        self.go_btn = ctk.CTkButton(btns, text="Обновить сейчас", width=170, height=38,
+                                    fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                    font=ctk.CTkFont(size=14, weight="bold"), command=self.start)
+        self.go_btn.grid(row=0, column=1)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.after(150, self.lift)
+
+    def say(self, text, color=None):
+        self.status.configure(text=text, text_color=color or GRAY_TEXT)
+
+    def close(self):
+        self.stop = True                     # идёт скачивание — оно прервётся
+        self.destroy()
+
+    def start(self):
+        if self.busy:
+            return
+        if not getattr(sys, "frozen", False) or not self.rel.get("url"):
+            webbrowser.open(self.rel.get("page") or RELEASES_PAGE)
+            self.say("Открыл страницу загрузки в браузере — скачайте DownloaderSetup.exe.")
+            return
+        if self.app.workers_alive:
+            self.say("Сейчас идёт скачивание. Дождитесь окончания или поставьте на паузу, "
+                     "затем нажмите «Обновить сейчас».", ACCENT)
+            return
+        self.busy = True
+        self.go_btn.configure(state="disabled", text="Скачиваю…")
+        self.later_btn.configure(text="Отмена")
+        self.bar.grid()
+        self.say("Скачиваю новую версию…")
+        threading.Thread(target=self._download, daemon=True).start()
+
+    def _download(self):
+        app, rel = self.app, self.rel
+        dest = os.path.join(tempfile.gettempdir(), "downloader_update.zip")
+        last = [0.0]
+
+        def progress(done, total):
+            if time.time() - last[0] < 0.1 and done != total:
+                return
+            last[0] = time.time()
+            app.events.put(("call", lambda: self._progress(done, total)))
+
+        proxy = app.settings.get("proxy") if app.settings.get("proxy_mode") != "Нет" else None
+        routes = [proxy, None] if app.settings.get("proxy_mode") == "Все сайты" else \
+            [None] + ([proxy] if proxy else [])
+        error = ""
+        for route in routes:
+            try:
+                download_update(rel["url"], dest, rel.get("size") or 0, route, progress,
+                                lambda: self.stop)
+                root = prepare_update(dest)
+                error = ""
+                break
+            except UpdateCancelled:
+                return
+            except Exception as e:
+                error = str(e)
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        if error:
+            app.events.put(("log", "Обновление программы: " + error))
+            app.events.put(("call", lambda: self._failed(error)))
+        else:
+            app.events.put(("call", lambda: self._install(root)))
+
+    def _progress(self, done, total):
+        if not self.winfo_exists():
+            return
+        if total:
+            self.bar.set(done / total)
+            self.say(f"Скачиваю новую версию…   {human_size(done)} из {human_size(total)}"
+                     f"   •   {done * 100 // total}%")
+        else:
+            self.say(f"Скачиваю новую версию…   {human_size(done)}")
+
+    def _failed(self, error):
+        if not self.winfo_exists():
+            return
+        self.busy = False
+        self.bar.grid_remove()
+        self.go_btn.configure(state="normal", text="Повторить")
+        self.later_btn.configure(text="Позже")
+        self.say("Не получилось скачать обновление: " + error[:200] +
+                 "\nПроверьте интернет или прокси и нажмите «Повторить».", ACCENT)
+
+    def _install(self, root):
+        if self.stop or not self.winfo_exists():
+            return
+        if self.app.workers_alive:               # пока качалось обновление, начали загрузку
+            self.busy = False
+            self.go_btn.configure(state="normal", text="Обновить сейчас")
+            self.later_btn.configure(text="Позже")
+            self.say("Обновление скачано, но сейчас идёт загрузка. Дождитесь её окончания "
+                     "и нажмите «Обновить сейчас».", ACCENT)
+            return
+        self.bar.set(1)
+        self.later_btn.configure(state="disabled")
+        self.go_btn.configure(text="Устанавливаю…")
+        self.say("Устанавливаю… программа сейчас перезапустится.", GREEN)
+        try:
+            launch_updater(root)
+        except OSError as e:
+            self._failed(str(e))
+            return
+        self.after(400, self.app.quit_app)
+
+
 # ================================================================ окно «Список»
 class BulkWindow(ctk.CTkToplevel):
     """Большое поле: сразу много ссылок или названий песен, по одному на строку."""
@@ -3185,6 +3581,12 @@ class App(ctk.CTk):
         self.after(8000, self._auto_ytdlp_tick)
         if self.settings["check_updates"] and getattr(sys, "frozen", False):
             self.after(2000, lambda: self.check_updates(manual=False))
+        if os.path.normcase(UPDATE_DIR) not in os.path.normcase(os.path.abspath(sys.executable)):
+            cleanup_update_dir()
+        if "--updated" in sys.argv:
+            self.after(1500, lambda: (
+                self.set_main_status(f"✓ Программа обновлена до версии {APP_VERSION}", GREEN),
+                self.log(f"Программа обновлена до версии {APP_VERSION}")))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.log(f"Downloader {APP_VERSION}{build}")
@@ -4403,69 +4805,58 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ обновление программы
     def check_updates(self, manual=False):
-        """Спрашивает у GitHub номер последней удачной сборки."""
-        gh = find_gh()
-        if not gh:
-            if manual:
-                self.show_banner("Для проверки обновлений нужен GitHub CLI. "
-                                 "update.bat установит его и поможет войти в GitHub.",
-                                 "Запустить update.bat", self.run_updater)
-            return
+        """Спрашивает у GitHub последний релиз программы."""
         if manual:
             self.app_update_btn.configure(state="disabled", text="Проверяю…")
+        proxy = self.settings.get("proxy") if self.settings.get("proxy_mode") != "Нет" else None
+        routes = [proxy, None] if self.settings.get("proxy_mode") == "Все сайты" else \
+            [None] + ([proxy] if proxy else [])
 
         def run():
-            latest, err = None, ""
-            try:
-                p = subprocess.run(
-                    [gh, "run", "list", "--repo", REPO, "--workflow", "build.yml",
-                     "--status", "success", "--limit", "1",
-                     "--json", "databaseId,createdAt"],
-                    capture_output=True, timeout=30, creationflags=NO_WINDOW)
-                runs = json.loads(p.stdout.decode("utf-8", "replace") or "[]")
-                if runs:
-                    latest = runs[0]
-                err = p.stderr.decode("utf-8", "replace").strip()
-            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-                err = str(e)
-            self.events.put(("update_check", latest, err, manual))
+            rel, err = None, ""
+            for route in routes:
+                try:
+                    rel = fetch_release(route)
+                    err = "" if rel else "релизы не найдены"
+                    break
+                except Exception as e:
+                    err = str(e)
+            self.events.put(("update_check", rel, err, manual))
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_update_check(self, latest, err, manual):
+    def _on_update_check(self, rel, err, manual):
         self.app_update_btn.configure(state="normal", text="Проверить обновления")
-        if latest is None:
+        if rel is None:
             if err:
                 self.log("Проверка обновлений: " + err)
             if manual:
-                need_login = "auth login" in err or "authenticat" in err.lower()
-                text = ("Нужно один раз войти в GitHub — это сделает update.bat."
-                        if need_login else "Не удалось проверить обновления — подробности в журнале.")
-                self.show_banner(text, "Запустить update.bat", self.run_updater)
+                self.show_banner("Не удалось проверить обновления — проверьте интернет "
+                                 "(подробности в журнале).", "Повторить",
+                                 lambda: self.check_updates(manual=True))
             return
-        run_id = latest.get("databaseId", 0)
-        date = (latest.get("createdAt") or "")[:10]
-        if run_id > BUILD_ID:
-            self.show_banner(f"Вышла новая версия Downloader (сборка {run_id} от {date}).",
-                             "Обновить", self.run_updater)
+        if rel["v"] > (version_tuple(APP_VERSION) or (0,)):
+            self.update_info = rel
+            if manual:
+                self.hide_banner()
+                self.open_update()
+            else:
+                self.show_banner(f"Вышла новая версия Downloader — {rel['version']}.",
+                                 "Обновить", self.open_update)
         elif manual:
             self.hide_banner()
-            self.set_main_status(f"✓ У вас последняя версия (сборка {BUILD_ID})", GREEN)
+            self.set_main_status(f"✓ У вас последняя версия ({APP_VERSION})", GREEN)
 
-    def run_updater(self):
-        path = os.path.join(BASE_DIR, "update.bat")
-        if not os.path.isfile(path):
-            self.show_banner("Не найден update.bat рядом с программой. Скачайте его из "
-                             "репозитория на GitHub и положите рядом с Downloader.exe.")
+    def open_update(self):
+        rel = getattr(self, "update_info", None)
+        if not rel:
+            self.check_updates(manual=True)
             return
-        if self.workers_alive:
-            self.show_banner("Сейчас идёт скачивание. Дождитесь окончания или нажмите "
-                             "«Отмена», затем обновите.", "Обновить", self.run_updater)
+        win = getattr(self, "update_win", None)
+        if win and win.winfo_exists():
+            win.lift()
+            win.focus_force()
             return
-        # update.bat закроет программу, заменит exe и запустит новую версию
-        # cmd /c — окно закроется само, когда обновление закончится
-        subprocess.Popen(f'start "Обновление Downloader" cmd /c ""{path}" /auto"',
-                         shell=True, cwd=BASE_DIR, env=clean_env())
-        self.quit_app()
+        self.update_win = UpdateWindow(self, rel)
 
     # ------------------------------------------------------------ события из потоков
     def _poll_events(self):
@@ -5491,6 +5882,14 @@ if __name__ == "__main__":
         sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "--spawn-test":
         subprocess.Popen([sys.executable, "--ping", sys.argv[2]], env=clean_env())
+        sys.exit(0)
+    # установка обновления: эту копию запустила старая версия из папки _update
+    if len(sys.argv) >= 3 and sys.argv[1] == "--apply-update":
+        pid = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
+        sys.exit(apply_update(sys.argv[2], pid, sys.argv[4] if len(sys.argv) > 4 else None))
+    # для автопроверки: поставить обновление из готового архива и запустить --ping
+    if len(sys.argv) >= 4 and sys.argv[1] == "--install-zip":
+        launch_updater(prepare_update(sys.argv[2]), sys.argv[3])
         sys.exit(0)
     if len(sys.argv) >= 4 and sys.argv[1] == "--screenshot":
         sys.exit(screenshot(sys.argv[2], sys.argv[3], sys.argv[4:]))

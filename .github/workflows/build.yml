@@ -76,6 +76,9 @@ jobs:
 
           Get-ChildItem Downloader
           Compress-Archive -Path Downloader -DestinationPath Downloader.zip
+          # только программа (без ffmpeg и yt-dlp) — её скачивает обновление внутри программы
+          Compress-Archive -Path appdir/* -DestinationPath Downloader-app.zip
+          Get-Item Downloader-app.zip | Format-List Name, Length
 
       # Проверка: программа открывается и качает тестовое видео в MP4, MKV, MP3 и FLAC,
       # а для музыки — квадратная обложка, выравнивание громкости и текст песни.
@@ -115,6 +118,19 @@ jobs:
           Get-Process Downloader -ErrorAction SilentlyContinue | Stop-Process -Force
           if ($quit -and $alive) { Add-Content selftest/selftest.log "OK   вторая копия передала окно первой и закрылась" }
           else { Add-Content selftest/selftest.log "FAIL одна копия: вторая закрылась=$quit, первая работает=$alive"; $code = 1 }
+          # обновление внутри программы: «старая» копия ставит архив новой версии поверх себя,
+          # лишние файлы из _internal пропадают, программа запускается заново
+          $upd = Join-Path $env:RUNNER_TEMP 'upd'
+          Copy-Item Downloader $upd -Recurse -Force
+          Set-Content "$upd\_internal\old-junk.txt" 'x'
+          Set-Content "$upd\settings.json" '{"style": "phantom"}'
+          Start-Process "$upd\Downloader.exe" -ArgumentList '--install-zip',"$PWD\Downloader-app.zip","$PWD\update-ok.txt" -Wait
+          for ($i = 0; $i -lt 60 -and -not (Test-Path update-ok.txt); $i++) { Start-Sleep -Seconds 1 }
+          $junk = Test-Path "$upd\_internal\old-junk.txt"
+          $kept = Test-Path "$upd\settings.json"
+          if ((Test-Path update-ok.txt) -and -not $junk -and $kept) { Add-Content selftest/selftest.log "OK   обновление внутри программы: файлы заменены, программа запустилась" }
+          else { Add-Content selftest/selftest.log "FAIL обновление внутри программы: запуск=$(Test-Path update-ok.txt), старый файл остался=$junk, настройки целы=$kept"; $code = 1 }
+          Get-Process Downloader -ErrorAction SilentlyContinue | Stop-Process -Force
           # замер запуска: сборка-папка против сборки одним файлом (по 3 раза, берём лучший)
           function StartTime($exe) {
             $best = 999
@@ -198,6 +214,24 @@ jobs:
         run: |
           $v = (Select-String -Path downloader.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
           "version=$v" >> $env:GITHUB_OUTPUT
+          # «Что нового» этой версии из NEWS.md — показывается в окне обновления программы
+          $news = Get-Content NEWS.md -Raw -Encoding utf8
+          $m = [regex]::Match($news, "(?ms)^## $([regex]::Escape($v))[ \t]*\r?\n(.*?)(?=^## |\z)")
+          $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { '- Исправления и улучшения.' }
+          $body = @(
+            '## Что нового', $notes, '',
+            '## Как установить',
+            'Уже стоит Downloader? Нажмите в нём «Проверить обновления» — он обновится сам.', '',
+            '1. Скачайте **DownloaderSetup.exe** ниже (раздел Assets).',
+            '2. Запустите его — права администратора не нужны.',
+            '3. Ярлык появится в «Пуске» (и на рабочем столе, если отметить).', '',
+            'Windows может предупредить «Windows защитил ваш компьютер» — программа не подписана',
+            'сертификатом. Нажмите «Подробнее» → «Выполнить в любом случае».', '',
+            'Остальные файлы: `Downloader.zip` — то же без установки (распаковать и запустить),',
+            '`Downloader-app.zip` — только программа, его скачивает обновление внутри Downloader.'
+          )
+          $body -join "`n" | Set-Content release-body.md -Encoding utf8
+          Get-Content release-body.md -Encoding utf8
 
       - name: Создать Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.release
@@ -207,20 +241,11 @@ jobs:
           name: Downloader ${{ steps.ver.outputs.version }}
           target_commitish: ${{ github.sha }}
           make_latest: true
-          body: |
-            ## Как установить
-            1. Скачайте **DownloaderSetup.exe** ниже (раздел Assets).
-            2. Запустите его — права администратора не нужны.
-            3. Ярлык появится в «Пуске» (и на рабочем столе, если отметить).
-
-            Windows может предупредить «Windows защитил ваш компьютер» — программа не подписана
-            сертификатом. Нажмите «Подробнее» → «Выполнить в любом случае».
-
-            Остальные файлы: `Downloader.zip` — то же без установки (распаковать и запустить),
-            `Downloader.exe` и `update.bat` — для обновления уже установленной программы.
+          body_path: release-body.md
           files: |
             dist-setup/DownloaderSetup.exe
             Downloader.zip
+            Downloader-app.zip
             appdir/update.bat
           generate_release_notes: true
 
