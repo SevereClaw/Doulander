@@ -44,7 +44,7 @@ try:                                # значок в трее
 except Exception:
     pystray = None
 
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.20.1"
 BUILD_ID = 0                     # номер сборки — подставляет автосборка GitHub
 REPO = "SevereClaw/Doulander"
 
@@ -1408,6 +1408,39 @@ def audio_files(paths):
         elif os.path.isfile(p) and p.lower().endswith(exts):
             result.append(p)
     return result
+
+
+# yt-dlp сначала пишет картинку-обложку рядом с будущим файлом, а после вшивания удаляет.
+# Если сам ролик не скачался (в плейлисте — ошибка, отмена, «войдите в аккаунт»), картинка
+# остаётся лежать в папке. Запоминаем, что он писал, и после запуска убираем то, что осталось.
+THUMB_LINE = re.compile(r"^\[info\] Writing .*?thumbnail.*? to: (.+)$")
+THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def thumbnail_written(line):
+    """Путь картинки из строки журнала yt-dlp «[info] Writing video thumbnail … to: ПУТЬ» или None."""
+    m = THUMB_LINE.match(line or "")
+    return m.group(1).strip() if m else None
+
+
+def remove_leftover_thumbnails(thumbs, folder="", keep=()):
+    """Убирает обложки, которые yt-dlp записал в этом запуске и не убрал сам (в любом формате,
+    в который их успели переделать). keep — готовые файлы, их не трогаем. Возвращает, сколько убрано."""
+    kept = {os.path.normcase(os.path.abspath(k)) for k in keep if k}
+    removed = 0
+    for t in dict.fromkeys(thumbs):
+        path = t if os.path.isabs(t) else os.path.join(folder or "", t)
+        stem = os.path.splitext(path)[0]
+        for ext in THUMB_EXTS:
+            f = stem + ext
+            if os.path.normcase(os.path.abspath(f)) in kept or not os.path.isfile(f):
+                continue
+            try:
+                os.remove(f)
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def tidy_lyrics(files):
@@ -4682,6 +4715,7 @@ class App(ctk.CTk):
 
         last_error = ""
         files = []
+        thumbs = []                          # обложки, которые yt-dlp записал рядом с файлами
         last_shown = 0.0
         for raw in proc.stdout:
             line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
@@ -4713,10 +4747,18 @@ class App(ctk.CTk):
                 ev(("log", line))
                 if line.startswith("ERROR"):
                     last_error = line.replace("ERROR:", "").strip()
+                else:
+                    thumb = thumbnail_written(line)
+                    if thumb:
+                        thumbs.append(thumb)
         code = proc.wait()
         with self.lock:
             self.procs.discard(proc)
             self.item_procs.pop(item, None)
+        # ролик не скачался — его обложка осталась бы лежать в папке картинкой
+        gone = remove_leftover_thumbnails(thumbs, self.settings["folder"], keep=files)
+        if gone:
+            ev(("log", f"Убраны лишние картинки-обложки: {gone}"))
         return code, last_error, files
 
     def update_ytdlp(self):

@@ -30,6 +30,11 @@ jobs:
       - name: Установить библиотеки
         run: pip install customtkinter pillow tkinterdnd2 pystray pysocks pyinstaller
 
+      - name: Лишние картинки-обложки убираются
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_thumbs.py
+
       - name: Вписать номер сборки
         shell: pwsh
         run: |
